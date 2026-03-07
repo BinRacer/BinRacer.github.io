@@ -839,7 +839,7 @@ bk_nextsize: 0x00
 pwndbg> 
 ```
 
-接着，释放chunk[3]进入unsorted bin。
+接着，释放chunks[3]进入unsorted bin。
 
 ```bash
 pwndbg> unsortedbin 
@@ -848,7 +848,7 @@ all: 0x9cf4140 —▸ 0x73724fd8db78 (main_arena+88) ◂— 0x9cf4140
 pwndbg> 
 ```
 
-申请chunk[5]，将0x9cf4140从unsortedbin移动至smallbins。
+申请chunks[5]，将0x9cf4140从unsortedbin移动至smallbins。
 
 ```bash
 pwndbg> smallbins 
@@ -871,7 +871,7 @@ pwndbg> x/4gx 0x9cf4140
 pwndbg> 
 ```
 
-申请chunk[3]内存，第一次进入small bin申请路径。
+申请chunks[3]内存，第一次进入small bin申请路径。
 
 ```bash
 In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3405
@@ -927,7 +927,7 @@ pwndbg> p/x victim
 $4 = 0x9cf4140
 ```
 
-提取0x9cf4140返回用户。这是接着申请chunk[6]，第二次进入small bin申请路径。
+提取0x9cf4140返回用户。这是接着申请chunks[6]，第二次进入small bin申请路径。
 
 ```bash
 In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3405
@@ -1155,7 +1155,7 @@ Size: 0x9c0 (with flag bits: 0x9c1)
 pwndbg> 
 ```
 
-接着申请chunk[5]，将old top释放至unsorted bin里。
+接着申请chunks[5]，将old top释放至unsorted bin里。
 
 ```bash
 pwndbg> top-chunk 
@@ -1215,7 +1215,7 @@ $1 = {
 pwndbg> 
 ```
 
-在chunk[3]里伪造_IO_jump_t结构。
+在chunks[3]里伪造_IO_jump_t结构。
 
 ```bash
 pwndbg> p/x chunks[3]
