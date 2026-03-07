@@ -1141,7 +1141,7 @@ pwndbg>
 
 ### 1-11 large bin attack其二
 
-本方法为large bin attack和fast bin的组合技，large bin attack核心原理参考large bin attack其一，此处不在赘述。
+本方法为large bin attack和fast bin attack的组合技，large bin attack核心原理参考large bin attack其一，此处不在赘述。
 
 测试的二进制源码参考[binary.c](https://github.com/BinRacer/pwn4heap/tree/master/src/2.23/binary/05/binary.c)，相关exoloit.py完整内容可见[exploit.py](https://github.com/BinRacer/pwn4heap/blob/master/src/2.23/large_bin_attack_again/exploit.py)。
 
