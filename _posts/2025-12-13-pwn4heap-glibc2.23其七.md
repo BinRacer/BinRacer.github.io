@@ -19,7 +19,7 @@ keywords: CTF, pwn4heap, glibc2.23
 
 相关glibc完整源码参见[iofopncook.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/libio/iofopncook.c#L54)：
 
-```C
+```c
 struct _IO_cookie_file
 {
   struct _IO_FILE_plus __fp;
@@ -834,7 +834,7 @@ pwndbg>
 
 相关glibc完整源码参见[strops.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/libio/strops.c#L107)：
 
-```C
+```c
 typedef void *(*_IO_alloc_type) (_IO_size_t);
 typedef void (*_IO_free_type) (void*);
 

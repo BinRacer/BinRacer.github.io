@@ -197,7 +197,7 @@ In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3868
 
 步进malloc_printerr函数内，直至进入__libc_message函数。
 
-```C
+```c
 /* Abort with an error message.  */
 void
 __libc_message (int do_abort, const char *fmt, ...)
@@ -244,7 +244,7 @@ backtrace_and_maps (int do_abort, bool written, int fd)
 
 接着进入__backtrace函数内。
 
-```C
+```c
 int
 __backtrace (void **array, int size)
 {
@@ -275,7 +275,7 @@ libc_hidden_def (__backtrace)
 
 接着进入__libc_once，准备运行init函数。
 
-```C
+```c
 static void
 init (void)
 {
@@ -298,7 +298,7 @@ init (void)
 
 可以发现libc此时使用__libc_dlopen打开`libgcc_s.so.1`，进入__libc_dlopen_mode函数内。
 
-```C
+```c
 void *
 __libc_dlopen_mode (const char *name, int mode)
 {
@@ -728,7 +728,7 @@ pwndbg>
 
 退出程序，触发_dl_fini函数调用。
 
-```C
+```c
 void
 internal_function
 _dl_fini (void)
@@ -836,7 +836,7 @@ _dl_fini (void)
 
 本方法利用方式与前面的house of orange类似，都是Heap+IO结合利用。不过，本方法通过伪造stderr->vtable实现利用，而libc的触发点也变为`__malloc_assert 》 _IO_fflush 》 _IO_SYNC`。
 
-```C
+```c
 int
 _IO_fflush (_IO_FILE *fp)
 {
@@ -1282,7 +1282,7 @@ In file: /home/bogon/workSpaces/glibc/libio/iofflush.c:40
 
 本方法利用方式与前面的house of orange类似，都是Heap+IO结合利用。不过，本方法通过伪造stderr->vtable实现利用，而libc的触发点也变为`__malloc_assert 》 __fxprintf 》 outstring`。
 
-```C
+```c
 /* The function itself.  */
 int
 vfprintf (FILE *s, const CHAR_T *format, va_list ap)
@@ -1557,7 +1557,7 @@ pwndbg>
 
 其中outstring宏实际内容如下：
 
-```C
+```c
 #define outstring(String, Len)                                                 \
   do {                                                                         \
     assert((size_t)done <= (size_t)INT_MAX);                                   \

@@ -17,7 +17,7 @@ keywords: CTF, pwn4heap, glibc2.23
 
 本方法利用glibc对于fast bin管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3897)
 
-```C
+```c
 if ((unsigned long)(size) <= (unsigned long)(get_max_fast ())
 
 #if TRIM_FASTBINS
@@ -212,7 +212,7 @@ pwndbg>
 
 本方法利用glibc对于consolidate backward管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L4002)
 
-```C
+```c
 /* consolidate backward */
 if (!prev_inuse(p)) {
   prevsize = p->prev_size;
@@ -425,7 +425,7 @@ pwndbg>
 
 本方法利用glibc对于use_top管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3777)
 
-```C
+```c
 use_top:
   /*
      If large enough, split off the chunk bordering the end of memory
@@ -678,7 +678,7 @@ pwndbg>
 
 本方法利用glibc对于small bin管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3405)
 
-```C
+```c
 if (in_smallbin_range (nb))
   {
     idx = smallbin_index (nb);
@@ -994,7 +994,7 @@ pwndbg>
 
 本方法开创了Heap+IO利用的先河，在此感谢作者**4ngelboy**。主要思想：利用heap技术修改_IO_list_all为已知地址，并在该地址内伪造_IO_FILE_plus和_IO_jump_t结构，然后触发malloc_printerr或者涉及_IO_flush_all_lockp该函数的其它操作，最后触发伪造的函数指针。
 
-```C
+```c
 
 int
 _IO_flush_all_lockp (int do_lock)

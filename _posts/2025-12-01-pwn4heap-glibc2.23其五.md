@@ -17,7 +17,7 @@ keywords: CTF, pwn4heap, glibc2.23
 
 本方法利用glibc对于main_arena->fastbinsY数组管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3925)
 
-```C
+```c
 if ((unsigned long)(size) <= (unsigned long)(get_max_fast ())
 
 #if TRIM_FASTBINS
@@ -654,7 +654,7 @@ In file: /home/bogon/workSpaces/glibc/stdio-common/vfprintf.c:1328
 
 此时，满足__printf_function_table != NULL条件，进入do_positional。
 
-```C
+```c
 /* The function itself.  */
 int
 vfprintf (FILE *s, const CHAR_T *format, va_list ap)
@@ -684,7 +684,7 @@ return done;
 
 接着进入printf_positional函数。
 
-```C
+```c
 static int
 printf_positional (_IO_FILE *s, const CHAR_T *format, int readonly_format,
 		   va_list ap, va_list *ap_savep, int done, int nspecs_done,

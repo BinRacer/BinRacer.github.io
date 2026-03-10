@@ -338,7 +338,7 @@ log.success(f"flag: {format_flag(flag)}")
 
 测试二进制通过手工实现单链表演示此次技术，链表结构如下：
 
-```C
+```c
 // Linked list node structure
 struct chunk_t {
   struct chunk_t *next;
@@ -567,7 +567,7 @@ pwndbg>
 
 本方法利用glibc对于large bin管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3579)
 
-```C
+```c
 for (;; )
   {
     int iters = 0;

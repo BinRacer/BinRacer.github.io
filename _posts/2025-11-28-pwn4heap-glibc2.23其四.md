@@ -17,7 +17,7 @@ keywords: CTF, pwn4heap, glibc2.23
 
 本方法利用glibc对于malloc_consolidate管理缺陷而实现恶意操作。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L4165)
 
-```C
+```c
 /*
   If max_fast is 0, we know that av hasn't
   yet been initialized, in which case do so below
@@ -162,7 +162,7 @@ pwndbg>
 
 在glibc的ptmalloc2分配器中，刻意增大main_arena->system_mem值的主要目的，是为了在合并非 mmap内存块时，绕过一项关键的完整性验证。相关glibc完整源码参见[malloc.c](https://elixir.bootlin.com/glibc/glibc-2.23/source/malloc/malloc.c#L3993)
 
-```C
+```c
 nextsize = chunksize(nextchunk);
 if (__builtin_expect (nextchunk->size <= 2 * SIZE_SZ, 0)
 	|| __builtin_expect (nextsize >= av->system_mem, 0))  <= check
