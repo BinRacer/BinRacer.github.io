@@ -15,13 +15,13 @@ keywords: CTF, pwn4heap, glibc2.23
 
 ### 1-24 house of fun
 
-本方法在技术原理上归属于 Large Bin Attack 的范畴。该技术的核心在于利用 Glibc 堆管理器中 Large Bin 链表在插入或重组 chunk 时的逻辑缺陷。具体而言，当将一个特定大小的 chunk 从 Unsorted Bin 整理至 Large Bin 时，分配器会执行 bk_nextsize 和 bk 指针的更新操作（对应源码中的 `victim->bk_nextsize->fd_nextsize = victim` 与 `bck->fd = victim`）。由于缺乏对这两个指针完整性的充分验证，通过提前篡改目标 chunk 的 bk_nextsize 指针，可以诱使分配器将一个可控的地址值（通常是一个较大的 size 字段）写入任意目标内存地址，从而实现一次任意地址写原语。
+本方法在技术原理上归属于 **Large Bin Attack** 的范畴。该技术的核心在于利用 **Glibc 堆管理器**中 **Large Bin 链表**在插入或重组 **chunk** 时的逻辑缺陷。具体而言，当将一个特定大小的 **chunk** 从 **Unsorted Bin** 整理至 **Large Bin** 时，分配器会执行 ``bk_nextsize`` 和 ``bk`` 指针的更新操作（对应源码中的 `victim->bk_nextsize->fd_nextsize = victim` 与 `bck->fd = victim`）。由于缺乏对这两个指针完整性的充分验证，通过提前篡改目标 **chunk** 的 ``bk_nextsize`` 指针，可以诱使分配器将一个可控的地址值（通常是一个较大的 size 字段）写入任意目标内存地址，从而实现一次 **任意地址写** 原语。
 
-本利用链的创新之处在于，将此次任意地址写的目标设定为 `_dl_open_hook` 全局符号。`_dl_open_hook` 是一个在动态链接器内部使用的函数指针钩子，控制该指针可以劫持库文件加载等关键流程的执行流。通过 Large Bin Attack，成功将 `_dl_open_hook` 的值修改为一个指向精心构造的、包含 one_gadget 地址的内存布局。
+本利用链的创新之处在于，将此次 **任意地址写** 的目标设定为 `_dl_open_hook` 全局符号。`_dl_open_hook` 是一个在动态链接器内部使用的函数指针钩子，控制该指针可以劫持库文件加载等关键流程的执行流。通过 **Large Bin Attack**，成功将 `_dl_open_hook` 的值修改为一个指向精心构造的、包含 **one_gadget** 地址的内存布局。
 
-one_gadget 是 libc 中存在的、一段以 `execve("/bin/sh", ..., ...)` 或类似形式调用 shell 的短指令序列，其执行通常需要满足特定的寄存器约束。通过堆布局，在 `_dl_open_hook` 被调用时，确保这些约束条件得到满足。
+**one_gadget** 是 libc 中存在的、一段以 `execve("/bin/sh", ..., ...)` 或类似形式调用 shell 的短指令序列，其执行通常需要满足特定的寄存器约束。通过堆布局，在 `_dl_open_hook` 被调用时，确保这些约束条件得到满足。
 
-因此，当后续程序执行触发动链接器相关操作（例如加载新库、或某些错误处理路径）时，便会调用被篡改的 `_dl_open_hook`。其实际效果是直接跳转至预设的 one_gadget 地址执行。由于 one_gadget 本身位于 libc 的合法代码段，此举不仅成功获取了 shell 的控制权，而且完全避免了在栈或堆上部署 shellcode 的需求，有效绕过了 NX（不可执行内存）等常见防护机制，体现了在仅有写原语条件下实现稳定代码执行的高级利用思路。
+因此，当后续程序执行触发动链接器相关操作（例如加载新库、或某些错误处理路径）时，便会调用被篡改的 `_dl_open_hook`。其实际效果是直接跳转至预设的 **one_gadget** 地址执行。由于 **one_gadget** 本身位于 libc 的合法代码段，此举不仅成功获取了 shell 的控制权，而且完全避免了在栈或堆上部署 shellcode 的需求，有效绕过了 **NX**（不可执行内存）等常见防护机制，体现了在仅有写原语条件下实现稳定代码执行的高级利用思路。
 
 测试的二进制源码参考[binary.c](https://github.com/BinRacer/pwn4heap/tree/master/src/2.23/binary/13/binary.c)，相关exoloit.py完整内容可见[exploit.py](https://github.com/BinRacer/pwn4heap/blob/master/src/2.23/house_of_fun/exploit.py)。
 
@@ -64,13 +64,13 @@ flag = conn.recvline().decode().strip()
 log.success(f"flag: {format_flag(flag)}")
 ```
 
-在漏洞利用链的初始阶段，连续发起五次内存分配请求，依次申请 chunks[0]、chunks[1]、chunks[2]、chunks[3] 和 chunks[4]。此布局具有明确的技术目的：
+在**漏洞利用链**的初始阶段，连续发起五次**内存分配请求**，依次申请 `chunks[0]`、`chunks[1]`、`chunks[2]`、`chunks[3]` 和 `chunks[4]`。此布局具有明确的技术目的：
 
-1.  **构造大小关系**：精心设置 chunks[1] 和 chunks[3] 的尺寸，确保 chunks[1]->size > chunks[3]->size。
-2.  **确保归属 Large Bin**：两者的大小均被设定在 Large Bin 的范围内（在 glibc 2.23 中，通常指大于 0x400 字节的 chunk）。这是后续利用 Large Bin Attack 技术的先决条件，因为依赖于 Large Bin 在维护有序链表（按 size 降序排列）时的特定逻辑。
-3.  **插入保护性 Chunk**：在 chunks[1] 和 chunks[3] 之后分别申请的 chunks[2] 和 chunks[4]（尺寸较小，如 0x18），其作用是作为“栅栏”（fence）或“保护器”（guard）。它们的主要目的是防止 chunks[1] 和 chunks[3] 在后续被释放时，与 top chunk 发生合并，从而确保它们能够独立进入预期的 bin（unsorted bin 或 large bin）中，为泄露地址和篡改指针创造稳定的内存状态。
+1.  **构造大小关系**：精心设置 `chunks[1]` 和 `chunks[3]` 的尺寸，确保 `chunks[1]->size > chunks[3]->size`。
+2.  **确保归属 Large Bin**：两者的大小均被设定在 **Large Bin** 的范围内（在 **glibc 2.23** 中，通常指大于 `0x400` 字节的 **chunk**）。这是后续利用 **Large Bin Attack** 技术的先决条件，因为依赖于 **Large Bin** 在维护**有序链表**（按 size **降序排列**）时的特定逻辑。
+3.  **插入保护性 Chunk**：在 `chunks[1]` 和 `chunks[3]` 之后分别申请的 `chunks[2]` 和 `chunks[4]`（尺寸较小，如 `0x18`），其作用是作为“**栅栏**”（fence）或“**保护器**”（guard）。它们的主要目的是防止 `chunks[1]` 和 `chunks[3]` 在后续被释放时，与 **top chunk** 发生**合并**，从而确保它们能够独立进入预期的 **bin**（**unsorted bin** 或 **large bin**）中，为**泄露地址**和**篡改指针**创造稳定的**内存状态**。
 
-因此，该操作序列旨在主动塑造堆的布局，制造出两个存在特定大小关系、且均属于 Large Bin 范围的潜在受害者 chunk（victim chunk），为触发 Large Bin 管理代码中的漏洞并实现任意地址写奠定基础。
+因此，该操作序列旨在主动塑造堆的布局，制造出两个存在特定大小关系、且均属于 **Large Bin** 范围的潜在**受害者chunk**（**victim chunk**），为触发 **Large Bin 管理代码**中的**漏洞**并实现**任意地址写**奠定基础。
 
 ```bash
 pwndbg> heap
@@ -101,13 +101,13 @@ Size: 0x20170 (with flag bits: 0x20171)
 pwndbg> 
 ```
 
-随后，释放先前申请的 chunks[3]（通过调用 free 函数）。由于该 chunk 的尺寸较大（大于 fastbin 范围），它不会被放入 fastbin，而是被插入到 unsorted bin 中。
+随后，**释放**先前申请的 `chunks[3]`（通过调用 **`free` 函数**）。由于该 **chunk** 的尺寸较大（大于 **fastbin** 范围），它不会被放入 **fastbin**，而是被插入到 **unsorted bin** 中。
 
-在 glibc 的堆管理机制中，当一个 chunk 被放入 unsorted bin 时，其 fd（前向指针）和 bk（后向指针）会被更新，指向 main_arena（主分配区）内部的一个管理结构地址（通常是 main_arena.top 附近的地址）。main_arena 是 libc 数据段中的一个全局结构体，因此其地址与 libc 库的基址之间存在固定的偏移。
+在 **glibc** 的**堆管理机制**中，当一个 **chunk** 被放入 **unsorted bin** 时，其 **`fd`**（前向指针）和 **`bk`**（后向指针）会被更新，指向 **`main_arena`**（主分配区）内部的一个管理结构地址（通常是 `main_arena.top` 附近的地址）。**`main_arena`** 是 **libc** 数据段中的一个全局结构体，因此其地址与 **libc 库的基址**之间存在固定的偏移。
 
-因此，通过释放 chunks[3] 使其进入 unsorted bin，进而在该 chunk 的 fd 和 bk 位置“植入”了一个指向 libc 内部的指针。随后，可以利用程序提供的“读”功能（例如 show 函数）再次读取 chunks[3] 的用户数据区。由于堆管理器在释放时并未清空旧数据，之前写入的用户数据与 chunk 的元数据（包括 fd 和 bk）可能共存于同一内存区域。通过精心构造读取操作，可以泄露出 bk（或 fd）指针的值。
+因此，通过释放 `chunks[3]` 使其进入 **unsorted bin**，进而在该 **chunk** 的 **`fd`** 和 **`bk`** 位置“植入”了一个指向 **libc** 内部的指针。随后，可以利用程序提供的“**读**”功能（例如 **`show` 函数**）再次读取 `chunks[3]` 的**用户数据区**。由于堆管理器在释放时并未清空旧数据，之前写入的用户数据与 **chunk** 的**元数据**（包括 **`fd`** 和 **`bk`**）可能共存于同一内存区域。通过精心构造读取操作，可以泄露出 **`bk`**（或 **`fd`**）指针的值。
 
-计算 `libc_base = leaked_bk_address - main_arena_offset`，即可得到 libc 在内存中的实际基址。成功泄露 libc 基址是后续整个利用链的关键前提，它为计算目标函数（如 system、__free_hook、_IO_list_all）以及 one_gadget 的运行时地址提供了必不可少的基准。
+计算 `libc_base = leaked_bk_address - main_arena_offset`，即可得到 **libc** 在内存中的实际**基址**。成功泄露 **libc 基址**是后续整个利用链的关键前提，它为计算目标函数（如 **`system`**、**`__free_hook`**、**`_IO_list_all`**）以及 **`one_gadget`** 的运行时地址提供了必不可少的基准。
 
 ```bash
 pwndbg> unsortedbin 
@@ -116,13 +116,13 @@ all: 0x55efba511760 —▸ 0x70cd0eb8db78 (main_arena+88) ◂— 0x55efba511760
 pwndbg> 
 ```
 
-接着，通过 malloc 申请一块新的内存，记为 chunks[5]。关键之处在于，其请求的大小（size）必须大于仍处于 unsorted bin 中的 chunks[3] 的尺寸。
+接着，通过 **`malloc`** 申请一块新的内存，记为 **`chunks[5]`**。关键之处在于，其请求的**大小**（`size`）必须大于仍处于 **unsorted bin** 中的 **`chunks[3]`** 的尺寸。
 
-此操作是驱动 Large Bin Attack 利用链前进的核心步骤。其技术原理在于 glibc 堆管理器 _int_malloc 的函数逻辑：当有一个大小合适的 chunk 存在于 unsorted bin 中，但无法满足当前较小的分配请求时，分配器会遍历 unsorted bin，将其中的 chunk 根据大小重新分类并插入到对应的 small bins 或 large bins 中。
+此操作是驱动 **Large Bin Attack** 利用链前进的核心步骤。其技术原理在于 **glibc 堆管理器** **`_int_malloc`** 的函数逻辑：当有一个大小合适的 **chunk** 存在于 **unsorted bin** 中，但无法满足当前较小的分配请求时，分配器会遍历 **unsorted bin**，将其中的 **chunk** 根据大小重新分类并插入到对应的 **small bins** 或 **large bins** 中。
 
-由于 chunks[3] 的尺寸属于 large bin 范围，且 chunks[5] 的申请尺寸更大，分配器在遍历处理 unsorted bin 时，会将 chunks[3] 从 unsorted bin 链表中摘下，并依据其尺寸将其插入到对应的 large bins 链表中。在此过程中，large bins 为了保持其内部 chunk 按尺寸降序排列的有序性，会执行一系列链表指针的调整操作（涉及 fd_nextsize 和 bk_nextsize 指针）。正是要利用后续对这些指针的恶意篡改，来触发 large bin attack 的任意地址写漏洞。
+由于 **`chunks[3]`** 的尺寸属于 **large bin** 范围，且 **`chunks[5]`** 的申请尺寸更大，分配器在遍历处理 **unsorted bin** 时，会将 **`chunks[3]`** 从 **unsorted bin** 链表中摘下，并依据其尺寸将其插入到对应的 **large bins** 链表中。在此过程中，**large bins** 为了保持其内部 **chunk** 按尺寸**降序排列**的有序性，会执行一系列链表指针的调整操作（涉及 **`fd_nextsize`** 和 **`bk_nextsize`** 指针）。正是要利用后续对这些指针的恶意篡改，来触发 **large bin attack** 的**任意地址写**漏洞。
 
-因此，申请 chunks[5] 的目的并非为了获取该 chunk 本身，而是主动触发一次堆管理器的 bin 整理操作，将 chunks[3] 从过渡区的 unsorted bin 正式移入目标位置——有序的 large bins 结构内，从而为后续篡改其链表指针、实现任意地址写入创造必要的先决条件。
+因此，申请 **`chunks[5]`** 的目的并非为了获取该 **chunk** 本身，而是主动触发一次堆管理器的 **bin 整理操作**，将 **`chunks[3]`** 从过渡区的 **unsorted bin** 正式移入目标位置——有序的 **large bins** 结构内，从而为后续篡改其链表指针、实现任意地址写入创造必要的先决条件。
 
 ```bash
 pwndbg> largebins 
@@ -139,13 +139,13 @@ pwndbg> x/12gx chunks
 pwndbg> 
 ```
 
-在大型堆块（Large Bin Attack）的利用中，通过篡改已释放大型堆块（victim chunk）的 bk（后向指针）和 bk_nextsize（大小链后向指针），可以分别触发两个独立的任意地址写入（Write-What-Where）原语。
+在**大型堆块**（**Large Bin Attack**）的利用中，通过**篡改**已释放**大型堆块**（**victim chunk**）的 **`bk`**（后向指针）和 **`bk_nextsize`**（大小链后向指针），可以分别触发两个独立的**任意地址写入**（**Write-What-Where**）原语。
 
-1.  **修改 bk 指针**：当将 bk 设置为 `libc.sym["_dl_open_hook"] - 0x10` 时，在 large bin 排序逻辑的后续步骤中，执行 `bck->fd = victim` 这一行代码。此时，bck 指向 `_dl_open_hook - 0x10`，因此该操作会将 victim 堆块的地址写入 `bck->fd`，即 `(_dl_open_hook - 0x10) + 0x10 = _dl_open_hook` 这个内存地址。成功用可控的堆地址覆盖了 `_dl_open_hook` 指针。
+1.  **修改 bk 指针**：当将 **`bk`** 设置为 `libc.sym["_dl_open_hook"] - 0x10` 时，在 **large bin** 排序逻辑的后续步骤中，执行 **`bck->fd = victim`** 这一行代码。此时，`bck` 指向 `_dl_open_hook - 0x10`，因此该操作会将 **`victim`** 堆块的地址写入 **`bck->fd`**，即 `(_dl_open_hook - 0x10) + 0x10 = _dl_open_hook` 这个内存地址。成功用可控的堆地址覆盖了 **`_dl_open_hook`** 指针。
 
-2.  **修改 bk_nextsize 指针**：同理，若将 bk_nextsize 修改为 `libc.sym["_dl_open_hook"] - 0x20`，则会触发 `victim->bk_nextsize->fd_nextsize = victim` 这一漏洞点。此时，`victim->bk_nextsize` 指向 `_dl_open_hook - 0x20`，该操作会将 victim 地址写入 `(victim->bk_nextsize)->fd_nextsize`，即 `(_dl_open_hook - 0x20) + 0x20 = _dl_open_hook` 地址。同样实现了对 `_dl_open_hook` 的覆盖。
+2.  **修改 bk_nextsize 指针**：同理，若将 **`bk_nextsize`** 修改为 `libc.sym["_dl_open_hook"] - 0x20`，则会触发 **`victim->bk_nextsize->fd_nextsize = victim`** 这一漏洞点。此时，`victim->bk_nextsize` 指向 `_dl_open_hook - 0x20`，该操作会将 **`victim`** 地址写入 `(victim->bk_nextsize)->fd_nextsize`，即 `(_dl_open_hook - 0x20) + 0x20 = _dl_open_hook` 地址。同样实现了对 **`_dl_open_hook`** 的覆盖。
 
-结论：两种修改方式均能达成将 `_dl_open_hook` 全局指针覆盖为可控的堆地址（即 victim 的地址）这一最终目标。它们利用了同一段排序代码中两个不同的、但性质相似的指针解引用与赋值缺陷。利用路径的差异仅在于触发写入的代码行和所需预设的指针偏移（-0x10 或 -0x20），这提供了适应不同内存布局或约束条件的灵活性。在利用中，选择其中一种方式即可。
+**结论**：两种修改方式均能达成将 **`_dl_open_hook`** 全局指针覆盖为可控的堆地址（即 **`victim`** 的地址）这一最终目标。它们利用了同一段排序代码中两个不同的、但性质相似的**指针解引用与赋值缺陷**。利用路径的差异仅在于触发写入的代码行和所需预设的指针偏移（`-0x10` 或 `-0x20`），这提供了适应不同内存布局或约束条件的灵活性。在利用中，选择其中一种方式即可。
 
 ```bash
 pwndbg> largebins 
@@ -162,16 +162,16 @@ pwndbg> x/1gx &_dl_open_hook
 pwndbg> 
 ```
 
-在完成对 chunks[3] 的元数据（bk 和 bk_nextsize 指针）的恶意篡改后，利用链进入实际的触发阶段。此阶段包含两个紧密衔接、具有因果关系的操作：
+在完成对 **`chunks[3]`** 的**元数据**（**`bk`** 和 **`bk_nextsize`** 指针）的恶意篡改后，利用链进入实际的**触发阶段**。此阶段包含两个紧密衔接、具有因果关系的操作：
 
-1.  **释放 chunks[1] 至 Unsorted Bin**：首先调用 free(chunks[1])。由于 chunks[1] 的尺寸属于 large bin 范围，它被插入到 unsorted bin 的链表中。此时，该 chunk 的 fd 和 bk 指针被堆管理器初始化为指向 main_arena 的相关地址。
+1.  **释放 chunks[1] 至 Unsorted Bin**：首先调用 **`free(chunks[1])`**。由于 **`chunks[1]`** 的尺寸属于 **large bin** 范围，它被插入到 **unsorted bin** 的链表中。此时，该 **chunk** 的 **`fd`** 和 **`bk`** 指针被堆管理器初始化为指向 **`main_arena`** 的相关地址。
 
-2.  **申请 chunks[6] 触发 Large Bin Attack**：紧接着发起一次特定的内存分配请求，例如 `malloc(chunks[6])`。此次申请的尺寸（nb）是关键，它不仅必须大于 chunks[1] 的尺寸，而且必须大于 chunks[3] 的尺寸。这个尺寸选择确保了分配器在 _int_malloc 函数中遍历 unsorted bin 时，不会直接使用 chunks[1] 来满足此次请求（因为它太大），但会因为无法找到精确匹配，而启动将 unsorted bin 中 chunk 整理（排序）到对应 smallbin 或 largebin 的流程。
-     当处理到 chunks[1] 时，由于其尺寸属于 large bin 范围，且对应的 large bin 中已存在其他 chunk（例如之前移入的 chunks[3]），分配器会执行**大型堆块排序插入**逻辑。正是在这段代码中，它会**使用被篡改的 `bk` 和 `bk_nextsize` 指针**。具体来说：
-    *   根据被篡改的 `bk` 指针执行 `bck->fd = victim`，将 `chunks[1]` 的地址写入 `_dl_open_hook`。
-    *   或根据被篡改的 `bk_nextsize` 指针执行 `victim->bk_nextsize->fd_nextsize = victim`，同样将 `chunks[1]` 的地址写入 `_dl_open_hook`。
+2.  **申请 chunks[6] 触发 Large Bin Attack**：紧接着发起一次特定的内存分配请求，例如 **`malloc(chunks[6])`**。此次申请的尺寸（`nb`）是关键，它不仅必须大于 **`chunks[1]`** 的尺寸，而且必须大于 **`chunks[3]`** 的尺寸。这个尺寸选择确保了分配器在 **`_int_malloc`** 函数中遍历 **unsorted bin** 时，不会直接使用 **`chunks[1]`** 来满足此次请求（因为它太大），但会因为无法找到精确匹配，而启动将 **unsorted bin** 中 **chunk** 整理（排序）到对应 **smallbin** 或 **largebin** 的流程。
+     当处理到 **`chunks[1]`** 时，由于其尺寸属于 **large bin** 范围，且对应的 **large bin** 中已存在其他 **chunk**（例如之前移入的 **`chunks[3]`**），分配器会执行**大型堆块排序插入**逻辑。正是在这段代码中，它会**使用被篡改的 `bk` 和 `bk_nextsize` 指针**。具体来说：
+    *   根据被篡改的 **`bk`** 指针执行 **`bck->fd = victim`**，将 **`chunks[1]`** 的地址写入 **`_dl_open_hook`**。
+    *   或根据被篡改的 **`bk_nextsize`** 指针执行 **`victim->bk_nextsize->fd_nextsize = victim`**，同样将 **`chunks[1]`** 的地址写入 **`_dl_open_hook`**。
 
-因此，“释放”是为准备恶意状态的内存块；“申请”则是驱动堆分配器执行预设的、有缺陷的代码路径，将内存破坏转化为一次稳定的任意地址写入（将可控的堆地址写入 _dl_open_hook），从而完成 Large Bin Attack 的核心利用。
+因此，“**释放**”是为准备恶意状态的内存块；“**申请**”则是驱动堆分配器执行预设的、有缺陷的代码路径，将内存破坏转化为一次稳定的**任意地址写入**（将可控的堆地址写入 **`_dl_open_hook`**），从而完成 **Large Bin Attack** 的核心利用。
 
 ```bash
 pwndbg> x/1gx &_dl_open_hook
@@ -179,13 +179,11 @@ pwndbg> x/1gx &_dl_open_hook
 pwndbg> 
 ```
 
-可以发现_dl_open_hook成功修改为chunks[1]地址。通过编辑chunks[0]，修改`dl_open_hook`结构体字段。
+在成功通过 **Large Bin Attack** 将全局指针 **`_dl_open_hook`** 的值篡改为可控堆块 **`chunks[1]`** 的地址后，利用流程进入关键的**内存布局控制**阶段。
 
-在成功通过 Large Bin Attack 将全局指针 `_dl_open_hook` 的值篡改为可控堆块 chunks[1] 的地址后，利用流程进入关键的内存布局控制阶段。
+此时，**`_dl_open_hook`** 不再指向 **libc** 数据段中的合法结构，而是指向可控的堆内存区域（即 **`chunks[1]`** 的**用户数据区**）。在 **glibc** 中，**`_dl_open_hook`** 是一个指向 **`struct dl_open_hook`** 结构的指针，该结构包含一系列在动态链接器加载共享库时调用的函数指针（例如 **`dl_open`**、**`dl_close`** 等钩子）。控制此结构意味着可以**劫持**库加载的关键流程。
 
-此时，`_dl_open_hook` 不再指向 libc 数据段中的合法结构，而是指向可控的堆内存区域（即 chunks[1] 的用户数据区）。在 glibc 中，`_dl_open_hook` 是一个指向 `struct dl_open_hook` 结构的指针，该结构包含一系列在动态链接器加载共享库时调用的函数指针（例如 `dl_open`、`dl_close` 等钩子）。控制此结构意味着可以劫持库加载的关键流程。
-
-随后通过编辑 chunks[0] 来间接修改 `_dl_open_hook` 所指向的“结构体”字段。这种操作之所以可行，是因为 chunks[0] 与 chunks[1] 在内存中物理相邻。通过堆溢出等漏洞，编辑 chunks[0] 的用户数据可以覆盖到 chunks[1] 的起始部分。
+随后通过**编辑** **`chunks[0]`** 来间接修改 **`_dl_open_hook`** 所指向的“结构体”字段。这种操作之所以可行，是因为 **`chunks[0]`** 与 **`chunks[1]`** 在内存中**物理相邻**。通过**堆溢出**等漏洞，编辑 **`chunks[0]`** 的用户数据可以**覆盖**到 **`chunks[1]`** 的起始部分。
 
 ```bash
 pwndbg> p/x *(struct dl_open_hook*)0x55efba511020
@@ -204,9 +202,9 @@ pwndbg> x/6i 0x55efa649f8d5
 pwndbg> 
 ```
 
-在成功将 `dl_open_hook` 结构体中的 `dlopen_mode` 函数指针篡改为 `one_gadget` 的地址后，利用链进入最终的触发执行阶段。通过调用 `free(chunks[3])` 来主动释放该堆块。
+在成功将 **`_dl_open_hook`** 结构体中的 **`dlopen_mode`** 函数指针篡改为 **`one_gadget`** 的地址后，利用链进入最终的**触发执行**阶段。通过调用 **`free(chunks[3])`** 来主动释放该堆块。
 
-此释放操作并非为了回收内存，而是旨在故意触发 `_int_free` 函数内部的错误处理路径。`_int_free` 是 glibc 中实现 free 功能的核心函数，其中包含对堆块元数据（如 size 字段、前后块状态）的严格校验。当校验失败时，程序执行流会跳转至 `_int_free` 函数内的错误处理标签（例如 `errout`）。
+此释放操作并非为了回收内存，而是旨在故意触发 **`_int_free`** 函数内部的**错误处理路径**。**`_int_free`** 是 **glibc** 中实现 **`free`** 功能的核心函数，其中包含对堆块**元数据**（如 **`size`** 字段、前后块状态）的严格校验。当校验失败时，程序执行流会跳转至 **`_int_free`** 函数内的错误处理标签（例如 **`errout`**）。
 
 ```bash
 In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3988
@@ -219,7 +217,7 @@ In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3988
  ► 3988         goto errout;
 ```
 
-当程序执行流因堆块释放错误而进入 `_int_free` 函数的 `errout` 标签后，从 `errout` 开始步进，程序会调用 `malloc_printerr` 函数。此函数是glibc中专门用于处理堆分配器（malloc）相关错误（如double free、内存损坏等）的核心例程。其作用是准备错误信息并决定后续处理方式。
+当程序执行流因堆块释放错误而进入 **`_int_free`** 函数的 **`errout`** 标签后，从 **`errout`** 开始步进，程序会调用 **`malloc_printerr`** 函数。此函数是 **glibc** 中专门用于处理堆分配器（**malloc**）相关错误（如**double free**、**内存损坏**等）的**核心例程**。其作用是准备错误信息并决定后续处理方式。
 
 ```bash
 In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3868
@@ -233,7 +231,7 @@ In file: /home/bogon/workSpaces/glibc/malloc/malloc.c:3868
    3869       return;
 ```
 
-接着，在 `malloc_printerr` 函数内部继续步进，程序逻辑会进一步调用 `__libc_message`函数。这是一个更底层的、用于输出致命错误消息并可能终止进程的库函数。`__libc_message` 内部可能涉及向标准错误流（stderr）输出信息、生成核心转储（core dump）等操作。
+接着，在 **`malloc_printerr`** 函数内部继续步进，程序逻辑会进一步调用 **`__libc_message`** 函数。这是一个更底层的、用于输出**致命错误消息**并可能**终止进程**的库函数。**`__libc_message`** 内部可能涉及向**标准错误流**（**stderr**）输出信息、生成**核心转储**（**core dump**）等操作。
 
 ```c
 /* Abort with an error message.  */
@@ -280,7 +278,7 @@ backtrace_and_maps (int do_abort, bool written, int fd)
 }
 ```
 
-在步进执行至 `__libc_message` 函数后，程序执行流会进一步调用 `__backtrace` 函数。`__backtrace` 是 glibc 提供的库函数，其核心功能是获取当前线程的函数调用堆栈（stack trace）信息。在错误处理场景中，它被用于收集从程序启动到发生错误（此处为堆管理器检测到的严重错误）之间的一系列函数调用地址，旨在为开发者或后续的核心转储（core dump）提供详细的调试上下文，以定位问题根源。
+在步进执行至 **`__libc_message`** 函数后，程序执行流会进一步调用 **`__backtrace`** 函数。**`__backtrace`** 是 **glibc** 提供的库函数，其核心功能是获取当前线程的**函数调用堆栈**（**stack trace**）信息。在错误处理场景中，它被用于收集从程序启动到发生错误（此处为堆管理器检测到的严重错误）之间的一系列函数调用地址，旨在为开发者或后续的**核心转储**（**core dump**）提供详细的**调试上下文**，以定位问题根源。
 
 ```c
 int
@@ -311,7 +309,7 @@ weak_alias (__backtrace, backtrace)
 libc_hidden_def (__backtrace)
 ```
 
-在动态跟踪至 `__backtrace` 函数后，程序执行流继续深入，进入了 `__libc_once` 函数。`__libc_once` 是 glibc 内部用于实现一次性初始化的底层机制。其核心作用是确保某个特定的初始化函数（通常被命名为 init 或类似的函数指针）在整个进程生命周期内仅被精确地执行一次，即使多个线程可能并发尝试触发此初始化。这是通过原子操作和锁机制来实现的线程安全初始化。
+在动态跟踪至 **`__backtrace`** 函数后，程序执行流继续深入，进入了 **`__libc_once`** 函数。**`__libc_once`** 是 **glibc** 内部用于实现**一次性初始化**的**底层机制**。其核心作用是确保某个特定的**初始化函数**（通常被命名为 **`init`** 或类似的函数指针）在整个**进程生命周期**内仅被精确地执行一次，即使多个线程可能并发尝试触发此初始化。这是通过**原子操作**和**锁机制**来实现的**线程安全初始化**。
 
 ```c
 static void
@@ -334,7 +332,7 @@ init (void)
   __libc_dlopen_mode (name, RTLD_LAZY | __RTLD_DLOPEN)
 ```
 
-在控制流进入`__libc_dlopen_mode`函数时，标志着整个利用链已抵达最终触发阶段的核心。此函数是glibc内部用于动态加载共享库的关键例程，其执行通常由错误处理流程（如malloc_printerr报告严重堆错误后）或线程相关异常（如栈保护故障）所间接引发。
+在控制流进入 **`__libc_dlopen_mode`** 函数时，标志着整个利用链已抵达最终触发阶段的**核心**。此函数是 **glibc** 内部用于**动态加载**共享库的**关键例程**，其执行通常由**错误处理流程**（如 **`malloc_printerr`** 报告严重堆错误后）或**线程相关异常**（如栈保护故障）所间接引发。
 
 ```c
 void *
@@ -361,9 +359,9 @@ __libc_dlopen_mode (const char *name, int mode)
 libc_hidden_def (__libc_dlopen_mode)
 ```
 
-在利用链的最后阶段，当动态调试器步进至 `__libc_dlopen_mode` 函数内部时，可以清晰地观察到全局指针 `_dl_open_hook` 的值已不为空（NULL）。此刻，该指针不再指向 libc 数据段中的默认结构，而是已被 Large Bin Attack 成功覆盖为可控的堆地址（即 chunks[1] 的起始地址）。
+在利用链的最后阶段，当动态调试器步进至 **`__libc_dlopen_mode`** 函数内部时，可以清晰地观察到全局指针 **`_dl_open_hook`** 的值已不为空（**NULL**）。此刻，该指针不再指向 **libc** 数据段中的默认结构，而是已被 **Large Bin Attack** 成功覆盖为可控的**堆地址**（即 **`chunks[1]`** 的起始地址）。
 
-程序随后执行关键调用：`_dl_open_hook->dlopen_mode (name, mode)`。由于 `_dl_open_hook` 指向伪造的 `struct dl_open_hook` 结构，其中的 `dlopen_mode` 成员已在前期通过编辑 chunks[0] 被精确地修改为 `one_gadget` 的地址。因此，这次原本用于加载动态库的合法函数调用，其控制流被彻底劫持，直接跳转至 `one_gadget` 的指令序列。
+程序随后执行关键调用：**`_dl_open_hook->dlopen_mode (name, mode)`**。由于 **`_dl_open_hook`** 指向伪造的 **`struct dl_open_hook`** 结构，其中的 **`dlopen_mode`** 成员已在前期通过编辑 **`chunks[0]`** 被精确地修改为 **`one_gadget`** 的地址。因此，这次原本用于加载动态库的合法函数调用，其控制流被彻底**劫持**，直接跳转至 **`one_gadget`** 的指令序列。
 
 
 ### 1-25 house of mind fastbin
