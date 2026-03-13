@@ -756,7 +756,7 @@ libc_hidden_def (_IO_wdoallocbuf)
 
 因此，从触发错误到执行任意代码的完整控制流路径为： **`malloc_printerr` → `_IO_flush_all_lockp` → `_IO_OVERFLOW` (`_IO_wfile_overflow`) → `_IO_wdoallocbuf` → `_IO_WDOALLOCATE` (`_wide_vtable->__doallocate`) → 可控制的函数**。通过将`_wide_vtable->__doallocate`指向预定目标，即可实现最终的代码执行。
 
-测试的二进制源码参考[binary.c](https://github.com/BinRacer/pwn4heap/tree/master/src/2.23/binary/14/binary.c)，相关exoloit.py完整内容可见[exploit.py](https://github.com/BinRacer/pwn4heap/blob/master/src/2.23/house_of_obstack/exploit.py)。
+测试的二进制源码参考[binary.c](https://github.com/BinRacer/pwn4heap/tree/master/src/2.23/binary/14/binary.c)，相关exoloit.py完整内容可见[exploit.py](https://github.com/BinRacer/pwn4heap/blob/master/src/2.23/house_of_apple_one/exploit.py)。
 
 核心利用代码如下：
 
