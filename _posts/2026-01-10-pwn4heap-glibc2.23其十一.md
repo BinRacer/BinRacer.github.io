@@ -1,12 +1,12 @@
 ---
 layout: post
-title: 【pwn4heap】pwn4heap - glibc2.23其十一
+title: 【pwn4heap】glibc2.23其十一
 categories: pwn4heap
 description: 深入解析 glibc2.23 Heap Technique
 keywords: CTF, pwn4heap, glibc2.23
 ---
 
-# pwn4heap - glibc2.23其十一
+# 【pwn4heap】glibc2.23其十一
 
 在CTF竞赛体系中，pwn类题目因其直接关联底层系统安全机制，常被视为核心挑战方向。其中，堆利用技术涉及动态内存管理的复杂交互，是突破现代软件防御体系的关键路径之一。本系列聚焦于glibc 2.23环境下的堆漏洞利用方法，该版本因其广泛存在与典型性，成为相关研究的常见基础。通过系统分析与归纳，本系列整理出约43种利用技术，涵盖从基础结构破坏到高级组合利用的多种场景，旨在为后续学习、教学与实践提供结构化的参考。笔者期望借此推动该领域的技术积累与方法论沉淀，促进安全研究社区的交流与进步。
 
