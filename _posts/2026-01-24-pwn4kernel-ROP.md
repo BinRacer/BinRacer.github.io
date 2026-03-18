@@ -1,6 +1,6 @@
 ---
 layout: post
-title: 【pwn4kernel】pwn4kernel - Kernel ROP技术分析
+title: 【pwn4kernel】Kernel ROP技术分析
 categories: pwn4kernel
 description: 深入解析 Kernel Technique
 keywords: CTF, pwn4kernel, Kernel-Exploit
