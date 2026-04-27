@@ -19,7 +19,7 @@ mindmap: true
 
 **编译选项**：开启`CONFIG_CFI_CLANG`、`CONFIG_SLAB_FREELIST_RANDOM`、`CONFIG_SLAB_FREELIST_HARDENED`、`CONFIG_HARDENED_USERCOPY`、`CONFIG_FUSE_FS`、`CONFIG_MEMCG`、`CONFIG_STATIC_USERMODEHELPER`、`CONFIG_USERFAULTFD`、`CONFIG_SLAB_MERGE_DEFAULT`、`CONFIG_SYSVIPC`、`CONFIG_KEYS`、`CONFIG_STACKPROTECTOR`、`CONFIG_STACKPROTECTOR_STRONG`、`CONFIG_SLUB`、`CONFIG_SLUB_DEBUG`、`CONFIG_E1000`、`CONFIG_E1000E`选项。完整配置参考[.config](https://github.com/BinRacer/pwn4kernel/blob/master/kernels/6.14.8/02/.config)。
 
-**保护机制**：KASLR/SMEP/SMAP/KPTI
+**保护机制**：KASLR/SMEP/SMAP/KPTI/CFI
 
 **测试驱动程序**：本程序源自 **[D^3CTF2025 - d3kshrm](https://github.com/arttnba3/D3CTF2025_d3kshrm)** 内核挑战，其核心是在一个由`SLAB_NO_MERGE|SLAB_ACCOUNT`标志创建的独立Slab缓存中，通过`d3kshrm_vm_fault`函数中的边界检查缺失（使用`>`而非`>=`）导致一个精确的Off-by-Page漏洞，允许越界访问`d3kshrm::pages`数组后的内存，将相邻8字节数据当作`struct page`指针映射到用户空间；利用此漏洞需要采用页面级堆风水技术，在独立缓存中精心布局物理页面，使挑战模块的SLUB页面位于受害者对象（如`pipe_buffer`）之间，再通过`splice()`将只读文件（如`/sbin/poweroff`）页面存入`pipe_buffer`，利用越界映射获取写权限，实现类似CVE-2023-2008的DirtyPage-like利用，最终通过修改系统关机时以root权限执行的`/sbin/poweroff`文件获得代码执行能力，该挑战体现了严格隔离环境下内核漏洞利用的技术难点，如跨缓存利用、页面级内存操作，以及系统配置（如`/etc/inittab`中`::askfirst:/bin/ash`导致的非预期解）对安全的影响，具有重要的教育和研究价值。
 
