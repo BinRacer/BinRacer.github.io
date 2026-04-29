@@ -2768,8 +2768,8 @@ void restore_key_type_user() {
 
 ## 参考
 
-https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc
-https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc3
-https://github.com/BinRacer/pwn4kernel/tree/master/src/ArbitraryAddrAlloc4
+https://github.com/BinRacer/pwn4kernel/tree/master/src/FreelistHijacking
+https://github.com/BinRacer/pwn4kernel/tree/master/src/FreelistHijacking2
+https://github.com/BinRacer/pwn4kernel/tree/master/src/FreelistHijacking3
 https://arttnba3.cn/2021/03/03/PWN-0X00-LINUX-KERNEL-PWN-PART-I/#例题：RWCTF2022高校赛-Digging-into-kernel-1-2
 https://ltfa1l.top/2024/08/01/system/kernel/Linux_kernel4_freelist劫持/#0x03-初探freelist劫持：以RWCTF2022体验赛-Digging-into-kernel2为例
