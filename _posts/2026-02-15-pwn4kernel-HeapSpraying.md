@@ -204,7 +204,7 @@ MODULE_DESCRIPTION("Welcome to the pwn4kernel challenge!");
 flowchart TD
     %% 随机化策略 - 橙色主题
     subgraph B["<font size='4'><b>启用 SLAB_FREELIST_RANDOM（非确定性分配）</b></font>"]
-        direction TB
+        direction TD
         B1["<b>初始状态:</b><br>头部 → 对象A → 对象B → 对象C"]
         B2["<b>步骤1:</b> 分配对象<br>（取走对象A）"]
         B3["<b>分配后:</b><br>头部 → 对象B → 对象C"]
@@ -217,7 +217,7 @@ flowchart TD
 
     %% 传统策略 - 蓝色主题
     subgraph A["<font size='4'><b>传统 LIFO 策略（确定性分配）</b></font>"]
-        direction TB
+        direction TD
         A1["<b>初始状态:</b><br>头部 → 对象A → 对象B → 对象C"]
         A2["<b>步骤1:</b> 分配对象<br>（取走对象A）"]
         A3["<b>分配后:</b><br>头部 → 对象B → 对象C"]
@@ -433,7 +433,7 @@ struct user_key_payload {
 `key_alloc` 函数通过 `add_key` 系统调用创建新密钥，其内核调用流程如下：
 
 ```mermaid
-graph TB
+graph TD
     A[key_alloc用户调用] --> B[__x64_sys_add_key]
     B --> C[__se_sys_add_key]
     C --> D[__do_sys_add_key]
@@ -469,7 +469,7 @@ graph TB
 `key_update` 函数通过 `keyctl` 系统调用更新密钥负载：
 
 ```mermaid
-graph TB
+graph TD
     A[key_update用户调用] --> B[__x64_sys_keyctl]
     B --> C[keyctl_update_key]
 
@@ -523,7 +523,7 @@ graph TB
 `key_read` 函数通过 `keyctl` 系统调用读取密钥负载：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间] --> B[__x64_sys_keyctl]
     B --> C[keyctl_read_key]
     C --> D["kmalloc(buflen, GFP_KERNEL)"]
@@ -584,7 +584,7 @@ graph TB
 `key_revoke` 函数通过 `keyctl` 系统调用撤销密钥：
 
 ```mermaid
-graph TB
+graph TD
     A[key_revoke用户调用] --> B[__x64_sys_keyctl]
     B --> C[keyctl_revoke_key]
     C --> D[key_revoke]
@@ -638,7 +638,7 @@ graph TB
 `key_unlink` 函数通过 `keyctl` 系统调用删除密钥：
 
 ```mermaid
-graph TB
+graph TD
     A[key_unlink用户调用] --> B[__x64_sys_keyctl]
     B --> C[keyctl_keyring_unlink]
     C --> D[key_unlink]
@@ -1024,7 +1024,7 @@ flowchart TD
 4. **触发管道分配**：调用`pipe(pipe_fd)`创建新管道。此系统调用触发内核执行管道创建路径：
 
     ```mermaid
-    graph TB
+    graph TD
         A[用户空间调用 pipe] --> B[系统调用入口 __NR_pipe2]
         B --> C[__x64_sys_pipe2]
         C --> D[__se_sys_pipe2]
@@ -1083,7 +1083,7 @@ flowchart TD
 2. **触发管道释放**：关闭管道的两个文件描述符：`close(pipe_fd[1])`和`close(pipe_fd[0])`。这会触发内核的管道销毁流程，沿着以下路径执行：
 
     ```mermaid
-    graph TB
+    graph TD
         A[用户空间调用 close] --> B[系统调用返回路径]
         B --> C[syscall_exit_to_user_mode]
         C --> D[__syscall_exit_to_user_mode_work]
