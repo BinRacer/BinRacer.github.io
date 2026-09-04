@@ -1581,7 +1581,7 @@ for (i = 0; i < 14; i++) {
 `poll`系统调用采用**两级分配策略**优化性能，这一特性被用于创建跨缓存的内存拓扑。以下是`poll`系统调用的完整内存分配和释放过程：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间调用poll] --> B[系统调用入口: __x64_sys_poll]
     B --> C[参数验证与初始化]
 
@@ -1829,7 +1829,7 @@ $$
 在技术实现中，`setxattr`系统调用不仅用于内存预初始化，其完整的执行路径也为理解内存操作提供了重要的系统视角：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间setxattr调用] --> B[系统调用入口: __x64_sys_setxattr]
     B --> C[参数验证与权限检查]
 
@@ -1974,7 +1974,7 @@ $$
 通过`read`系统调用触发`seq_read`操作，进而执行被设置的`seq_operations->start`函数指针。以下是`read`系统调用的完整执行链：
 
 ```mermaid
-graph TB
+graph TD
     A["用户空间read(fd, buf, count)"] --> B[系统调用入口: __x64_sys_read]
     B --> C[参数验证与权限检查]
 
@@ -2110,7 +2110,7 @@ graph TD
 **key数据读取调用链**：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间keyctl调用] --> B[系统调用分发处理]
     B --> C[权限与参数验证]
     C --> D[临时缓冲区分配]

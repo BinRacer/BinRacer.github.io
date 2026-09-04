@@ -2408,7 +2408,7 @@ $$
 要理解`user_key_payload`结构的操作，需要先了解Linux密钥管理子系统的工作原理。`key_alloc`函数通过`add_key`系统调用创建新密钥，其内核调用流程如下：
 
 ```mermaid
-graph TB
+graph TD
     A[key_alloc用户调用] --> B[__x64_sys_add_key]
     B --> C[__se_sys_add_key]
     C --> D[__do_sys_add_key]
@@ -2431,7 +2431,7 @@ graph TB
 `key_read`函数通过`keyctl`系统调用读取密钥负载，其内核调用流程如下：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间] --> B[__x64_sys_keyctl]
     B --> C[keyctl_read_key]
     C --> D["kmalloc(buflen, GFP_KERNEL)"]

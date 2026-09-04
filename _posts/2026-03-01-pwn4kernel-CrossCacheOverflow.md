@@ -715,7 +715,7 @@ $$
 **Buddy分配器的物理内存管理层次**：
 
 ```mermaid
-graph TB
+graph TD
     A[物理内存] --> B[划分为内存节点Node]
     B --> C[每个节点划分为内存区域Zone]
     C --> D[每个区域维护Buddy分配器]
@@ -1023,7 +1023,7 @@ struct kmem_cache {
 **SLAB分配器的层次结构**：
 
 ```mermaid
-graph TB
+graph TD
     A[kmem_cache] --> B[per-CPU缓存]
     A --> C[节点列表]
     C --> D[SLAB链表]
@@ -1332,7 +1332,7 @@ $$
 **Cross-Cache内存布局图示**：
 
 ```mermaid
-graph TB
+graph TD
     subgraph 物理内存页0x1000
         A0[缓存A对象1: 512B]
         A1[缓存A对象2: 512B]
@@ -1478,7 +1478,7 @@ Linux内核的内存管理系统采用分层架构，从用户空间到物理内
 **内存管理系统的完整层次结构**：
 
 ```mermaid
-graph TB
+graph TD
     A[用户空间] --> B[系统调用接口]
     B --> C[虚拟文件系统VFS]
     C --> D[内存管理子系统]
@@ -4808,10 +4808,10 @@ void heap_fengshui(void) {
 3. **隔离防护加固层**：通过`populate_isolated_slab_page()`分配30个隔离slab页，每页填入8个512B漏洞对象，构建溢出辐射缓冲区。隔离层确保null字节溢出只能影响目标管道页面，防止意外污染其他内核数据结构。
 
 ```mermaid
-graph TB
+graph TD
     %% ==================== 左列：宏观布局 ====================
     subgraph ColumnLeft ["4KB物理页宏观布局"]
-        direction TB
+        direction TD
         A[Buddy空闲页] --> B[管道密集区<br/>kmalloc-512缓存<br/>pipe_buffer×12]
         B --> C["漏洞对象区<br/>(castaway_t×8)个<br/>512B对象密集阵列"]
         C --> D[隔离防护区<br/>30个slab页<br/>溢出辐射缓冲]
@@ -4824,7 +4824,7 @@ graph TB
 
     %% ==================== 右列：微观拓扑（cast优先） ====================
     subgraph ColumnRight ["512B slab槽微观拓扑"]
-        direction TB
+        direction TD
 
         %% 【调整】cast槽位移至链首
         J[槽0: cast#0] --> K[槽1: cast#1]
@@ -4880,7 +4880,7 @@ for (int i = 0; i < MAX_PIPES; i++) {
 flowchart TD
     %% ==================== 左列：战术时序 ====================
     subgraph Col1 ["标记战术时序"]
-        direction TB
+        direction TD
         A[Phase 3-B: 首次检测] --> B[读取前40字节<br/>比照前部标记]
         B --> C{魔数匹配且索引异常?}
         C -->|是| D[定位first_victim/overlap]
@@ -4895,7 +4895,7 @@ flowchart TD
 
     %% ==================== 右列：物理布局 ====================
     subgraph Col2 ["标记物理布局"]
-        direction TB
+        direction TD
         I[管道数据空间] --> J[0-15B: 前部标记<br/>首次检测基准]
         J --> L[易受溢出波及]
         I --> K[192-207B: 后部标记<br/>二次检测基准]
@@ -5049,7 +5049,7 @@ flowchart TD
 flowchart TD
     %% ==================== 左列：读指针状态演变 ====================
     subgraph Col1 ["读指针状态演变"]
-        direction TB
+        direction TD
         J[检测前: 读指针在0字节] --> K[首次读取后: 在40字节]
         K --> L[消耗剩余后: 在192字节]
         L --> M[为二次检测建立基准]
@@ -5057,7 +5057,7 @@ flowchart TD
 
     %% ==================== 右列：内存重叠检测机制 ====================
     subgraph Col2 ["内存重叠检测机制"]
-        direction TB
+        direction TD
         N[管道X pipe_buffer结构体] --> O[与管道Y数据区重叠]
         O --> P[读取时得到管道Y的前部标记]
         P --> Q[魔数验证通过]
@@ -5127,10 +5127,10 @@ void leak_kernel_meta(void) {
     - 此举旨在扩大控制面，为二级控制链铺路
 
 ```mermaid
-flowchart TB
+flowchart TD
     %% ==================== 右列：主动重叠制造 ====================
     subgraph Col2 ["主动重叠制造"]
-        direction TB
+        direction TD
         G[原始page指针<br/>含随机低8位] --> H[&~0xff对齐操作]
         H --> I[4KB页边界对齐指针]
         I --> J[写回内核pipe_buffer.page]
@@ -5142,7 +5142,7 @@ flowchart TB
 
     %% ==================== 左列：一级控制链构造 ====================
     subgraph Col1 ["一级控制链构造"]
-        direction TB
+        direction TD
         A[释放first_victim管道] --> B[物理页回归Buddy order-0]
         B --> C[resize管道→kmalloc-192堆喷]
         C --> D[新pipe_buffer数组入驻释放页]

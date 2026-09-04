@@ -1299,7 +1299,7 @@ void handle_page_fault(uint64_t fault_addr, uint64_t error_code) {
 **权限检查层次模型**：
 
 ```mermaid
-graph TB
+graph TD
     A[内存访问请求] --> B{CPU特权级检查};
     B -->|通过| C[页表权限检查];
     C --> D[用户/内核位验证];
@@ -1607,7 +1607,7 @@ END(syscall_entry)
 **多层次保护模型**：
 
 ```mermaid
-graph TB
+graph TD
     A[内存访问请求] --> B[CPU特权级检查];
     B --> C[页表权限验证];
     C --> D[SMAP/SMEP验证];
@@ -2816,7 +2816,7 @@ void prepare_pgv_system(void) {
 **内存堆喷系统架构**：
 
 ```mermaid
-graph TB
+graph TD
     A[父进程] -->|分配请求| B[请求管道];
     A -->|状态查询| C[响应管道];
 
@@ -2897,9 +2897,9 @@ mindmap
 **管道内存布局示意图**：
 
 ```mermaid
-graph TB
+graph TD
     subgraph "管道阵列内存布局"
-        direction TB
+        direction TD
         I[管道0缓冲区] --> J[管道1缓冲区];
         J --> K[管道2缓冲区];
         K --> L[...];
@@ -2910,7 +2910,7 @@ graph TB
     end
 
     subgraph "标记区域功能"
-        direction TB
+        direction TD
         N[前部标记] --> O[首次溢出检测];
         P[后部标记] --> Q[二次重叠检测];
         O --> R[定位重叠对];
@@ -3130,7 +3130,7 @@ void configure_pipe_buffer_sizes(void) {
 **缓存选择策略分析**：
 
 ```mermaid
-graph TB
+graph TD
     A[管道缓冲区尺寸控制] --> B[尺寸: 0x1000 * 64];
     A --> C[尺寸: 0x1000 * 4];
     A --> D[尺寸: 0x1000 * 2];
@@ -3846,7 +3846,7 @@ void setup_arbitrary_access_chain(void) {
 **拓扑结构图示**：
 
 ```mermaid
-graph TB
+graph TD
     subgraph "三节点闭环拓扑"
         P2[节点2<br/>chain_pipe_2_idx] -->|offset=576| P3[节点3];
         P3 -->|offset=384| P4[节点4];
