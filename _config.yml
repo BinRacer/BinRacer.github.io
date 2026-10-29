@@ -78,6 +78,8 @@ navs:
       label: 归档
       mobile-hidden: true
 
+    - href: /KernLens/
+      label: KernLens
     # -
     #   href: /open-source/
     #   label: 开源
